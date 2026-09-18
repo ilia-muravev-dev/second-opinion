@@ -1,0 +1,171 @@
+# Mutation operators for the eval set. Each is applied to one added (+) line of a real pull
+# request; `pattern` is a Python regex, `replace` its substitution, `delete: true` removes the line
+# instead. `guard` is a regex that must not match the line. Languages restrict where it applies.
+# The label a reviewer has to hit is the mutated line (or the line before a deleted one).
+- id: off_by_one_lt
+  languages: [typescript, javascript, python]
+  category: correctness
+  severity: high
+  pattern: '(?<=[\w)\]]) < (?=[\w(])'
+  replace: ' <= '
+  guard: '^\s*(//|#|\*)|<[A-Z]'
+  description: strict comparison loosened to <= (off by one)
+- id: off_by_one_gte
+  languages: [typescript, javascript, python]
+  category: correctness
+  severity: high
+  pattern: '(?<=[\w)\]]) >= (?=[\w(])'
+  replace: ' > '
+  guard: '^\s*(//|#|\*)'
+  description: '>= tightened to > (off by one)'
+- id: inverted_equality
+  languages: [typescript, javascript]
+  category: correctness
+  severity: high
+  pattern: ' === '
+  replace: ' !== '
+  guard: '^\s*(//|\*)'
+  description: equality inverted
+- id: inverted_equality_py
+  languages: [python]
+  category: correctness
+  severity: high
+  pattern: ' == '
+  replace: ' != '
+  guard: '^\s*#'
+  description: equality inverted
+- id: and_to_or
+  languages: [typescript, javascript]
+  category: correctness
+  severity: high
+  pattern: ' && '
+  replace: ' || '
+  guard: '^\s*(//|\*)'
+  description: logical AND became OR
+- id: and_to_or_py
+  languages: [python]
+  category: correctness
+  severity: high
+  pattern: '\band\b'
+  replace: 'or'
+  guard: '^\s*#|"[^"]*\band\b[^"]*"'
+  description: logical and became or
+- id: dropped_not
+  languages: [typescript, javascript]
+  category: correctness
+  severity: high
+  pattern: '(?<=[(\s])!(?=[a-zA-Z_])'
+  replace: ''
+  guard: '^\s*(//|\*)|!=='
+  description: a negation was dropped
+- id: dropped_not_py
+  languages: [python]
+  category: correctness
+  severity: high
+  pattern: '\bif not (?=\w)'
+  replace: 'if '
+  guard: '^\s*#'
+  description: a negation was dropped
+- id: dropped_await
+  languages: [typescript, javascript, python]
+  category: concurrency
+  severity: high
+  pattern: '\bawait '
+  replace: ''
+  guard: '^\s*(//|#|\*)|for await'
+  description: await removed; the promise/coroutine is never waited for
+- id: dropped_return
+  languages: [typescript, javascript]
+  category: correctness
+  severity: high
+  pattern: '^(\s*)return (?=[\w(\[{`''"])'
+  replace: '\1'
+  guard: '^\s*(//|\*)|return (true|false|null|undefined|\d+);'
+  description: return removed; the value is computed and thrown away
+- id: dropped_return_py
+  languages: [python]
+  category: correctness
+  severity: high
+  pattern: '^(\s*)return (?=[\w(\[{''"])'
+  replace: '\1'
+  guard: '^\s*#|return (True|False|None|\d+)$'
+  description: return removed; the value is computed and thrown away
+- id: dropped_throw
+  languages: [typescript, javascript]
+  category: error_handling
+  severity: high
+  pattern: '^\s*throw new \w+'
+  delete: true
+  description: an error that should be thrown is no longer thrown
+- id: dropped_raise
+  languages: [python]
+  category: error_handling
+  severity: high
+  pattern: '^\s*raise \w+'
+  delete: true
+  description: an error that should be raised is no longer raised
+- id: enum_status_swap
+  languages: [typescript, javascript, python]
+  category: correctness
+  severity: high
+  pattern: "'HELD'"
+  replace: "'CONFIRMED'"
+  guard: '^\s*(//|#|\*)'
+  description: a status literal was swapped
+- id: min_max
+  languages: [typescript, javascript]
+  category: correctness
+  severity: medium
+  pattern: '\bMath\.max\('
+  replace: 'Math.min('
+  guard: '^\s*(//|\*)'
+  description: max became min
+- id: min_max_py
+  languages: [python]
+  category: correctness
+  severity: medium
+  pattern: '(?<![\w.])max\('
+  replace: 'min('
+  guard: '^\s*#'
+  description: max became min
+- id: dropped_lock
+  languages: [typescript, javascript, python]
+  category: concurrency
+  severity: high
+  pattern: 'pg_advisory_xact_lock|FOR UPDATE|SKIP LOCKED|\.lock\(|with_for_update'
+  delete: true
+  description: the lock that serialised concurrent callers was removed
+- id: narrowed_status_filter
+  languages: [typescript, javascript, python]
+  category: correctness
+  severity: high
+  pattern: "\\['HELD', 'CONFIRMED'\\]"
+  replace: "['HELD']"
+  description: active-status filter narrowed; confirmed rows are ignored
+- id: plus_minus_one
+  languages: [typescript, javascript, python]
+  category: correctness
+  severity: medium
+  pattern: ' \+ 1\b'
+  replace: ' - 1'
+  guard: '^\s*(//|#|\*)'
+  description: '+1 became -1'
+- id: hardcoded_secret
+  languages: [typescript, javascript, python]
+  category: security
+  severity: high
+  pattern: '^(\s*)(const|let|export const|[A-Z_]+\s*=)'
+  insert_after: true
+  # a made-up value: shaped like a credential, not like any provider's real key format
+  insert: '\1const PAYMENT_API_SECRET = "live-7f3a9c1e5b2d4e6f8a0b1c2d3e4f5a6b7c8d9e0f";'
+  insert_py: '\1PAYMENT_API_SECRET = "live-7f3a9c1e5b2d4e6f8a0b1c2d3e4f5a6b7c8d9e0f"'
+  guard: '^\s*(//|#|\*)'
+  description: a live payment key was committed
+- id: skipped_test
+  languages: [typescript, javascript]
+  category: testing
+  severity: medium
+  pattern: '^(\s*)(it|test)\('
+  replace: '\1\2.skip('
+  test_files: true
+  description: a test was switched off

@@ -1,0 +1,2614 @@
+diff --git a/.env.example b/.env.example
+index e8eea3b..a143491 100644
+--- a/.env.example
++++ b/.env.example
+@@ -9,6 +9,8 @@ LOG_LEVEL=info
+ # advisory | for_update | optimistic | serializable | exclusion — or naive, the control that double-books (refused in production)
+ BOOKING_STRATEGY=advisory
+ HOLD_TTL_SECONDS=600
++# the sweeper that expires holds whose delayed job was lost
++HOLD_SWEEP_INTERVAL_MS=60000
+ 
+ # Payments: set the Stripe test keys to use Stripe; leave them empty for the in-repo fake PSP.
+ STRIPE_SECRET_KEY=
+diff --git a/prisma/migrations/20260918183331_fake_psp_intents/migration.sql b/prisma/migrations/20260918183331_fake_psp_intents/migration.sql
+new file mode 100644
+index 0000000..1dc06e7
+--- /dev/null
++++ b/prisma/migrations/20260918183331_fake_psp_intents/migration.sql
+@@ -0,0 +1,10 @@
++-- CreateTable
++CREATE TABLE "fake_payment_intents" (
++    "id" TEXT NOT NULL,
++    "bookingId" TEXT NOT NULL,
++    "amountCents" INTEGER NOT NULL,
++    "status" TEXT NOT NULL,
++    "createdAt" TIMESTAMPTZ(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++
++    CONSTRAINT "fake_payment_intents_pkey" PRIMARY KEY ("id")
++);
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 63e5839..5784a51 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -122,3 +122,14 @@ model ProcessedJob {
+ 
+   @@map("processed_jobs")
+ }
++
++/// The in-process PSP's intents, in the database so the API and the worker see the same ones.
++model FakePaymentIntent {
++  id          String   @id
++  bookingId   String
++  amountCents Int
++  status      String
++  createdAt   DateTime @default(now()) @db.Timestamptz(3)
++
++  @@map("fake_payment_intents")
++}
+diff --git a/src/app.module.ts b/src/app.module.ts
+index ea99c0c..2642ddc 100644
+--- a/src/app.module.ts
++++ b/src/app.module.ts
+@@ -1,36 +1,18 @@
+ import { DynamicModule, Module } from '@nestjs/common';
+-import { LoggerModule } from 'nestjs-pino';
+ import { BookingsModule } from './bookings/bookings.module';
+-import { CONFIG, type Config } from './config';
+-import { ConfigModule } from './config.module';
++import { type Config } from './config';
++import { CoreModule } from './core.module';
+ import { HealthController } from './health/health.controller';
+ import { PaymentsModule } from './payments/payments.module';
+-import { PrismaModule } from './prisma/prisma.module';
+ import { ResourcesModule } from './resources/resources.module';
+ 
++/** The API process. `config` lets tests inject a container's connection details. */
+ @Module({})
+ export class AppModule {
+-  /** The application graph; `config` lets tests inject a container's connection details. */
+   static forRoot(config?: Config): DynamicModule {
+     return {
+       module: AppModule,
+-      imports: [
+-        ConfigModule.forRoot(config),
+-        LoggerModule.forRootAsync({
+-          inject: [CONFIG],
+-          useFactory: (cfg: Config) => ({
+-            pinoHttp: {
+-              level: cfg.LOG_LEVEL,
+-              redact: ['req.headers.authorization', 'req.headers["stripe-signature"]'],
+-              ...(cfg.NODE_ENV === 'development' ? { transport: { target: 'pino-pretty' } } : {}),
+-            },
+-          }),
+-        }),
+-        PrismaModule,
+-        PaymentsModule,
+-        ResourcesModule,
+-        BookingsModule,
+-      ],
++      imports: [CoreModule.forRoot(config), PaymentsModule, ResourcesModule, BookingsModule],
+       controllers: [HealthController],
+     };
+   }
+diff --git a/src/bookings/bookings.controller.ts b/src/bookings/bookings.controller.ts
+index 7d88cf9..15e2088 100644
+--- a/src/bookings/bookings.controller.ts
++++ b/src/bookings/bookings.controller.ts
+@@ -1,6 +1,8 @@
+ import {
++  BadRequestException,
+   Body,
+   Controller,
++  Delete,
+   Get,
+   Headers,
+   HttpCode,
+@@ -61,4 +63,17 @@ export class BookingsController {
+   get(@Param('id') id: string): Promise<BookingOut> {
+     return this.bookings.get(id);
+   }
++
++  @Delete(':id')
++  @ApiOperation({ summary: 'Cancel a held or confirmed booking (owner only; idempotent)' })
++  @ApiHeader({ name: 'X-User-Id', required: true })
++  @ApiOkResponse({ description: 'The booking, now CANCELLED.' })
++  @ApiConflictResponse({
++    description: 'invalid_transition: an EXPIRED booking cannot be cancelled.',
++  })
++  cancel(@Param('id') id: string, @Headers('x-user-id') userId: string): Promise<BookingOut> {
++    if (!userId)
++      throw new BadRequestException({ code: 'user_required', message: 'send an X-User-Id header' });
++    return this.bookings.cancel(id, userId);
++  }
+ }
+diff --git a/src/bookings/bookings.module.ts b/src/bookings/bookings.module.ts
+index f998492..b797a6a 100644
+--- a/src/bookings/bookings.module.ts
++++ b/src/bookings/bookings.module.ts
+@@ -3,10 +3,11 @@ import { IdempotencyModule } from '../idempotency/idempotency.module';
+ import { PaymentsModule } from '../payments/payments.module';
+ import { BookingsController } from './bookings.controller';
+ import { BookingsService, CLOCK, systemClock } from './bookings.service';
++import { HoldsModule } from './holds/holds.module';
+ import { StrategyModule } from './strategies/strategy.module';
+ 
+ @Module({
+-  imports: [StrategyModule, IdempotencyModule, PaymentsModule],
++  imports: [StrategyModule, IdempotencyModule, PaymentsModule, HoldsModule],
+   controllers: [BookingsController],
+   providers: [BookingsService, { provide: CLOCK, useValue: systemClock }],
+   exports: [BookingsService],
+diff --git a/src/bookings/bookings.service.ts b/src/bookings/bookings.service.ts
+index b96ecb7..4682a7d 100644
+--- a/src/bookings/bookings.service.ts
++++ b/src/bookings/bookings.service.ts
+@@ -1,6 +1,9 @@
+ import { Inject, Injectable } from '@nestjs/common';
++import { Logger } from 'nestjs-pino';
+ import {
+   BookingNotFoundError,
++  ForbiddenError,
++  InvalidTransitionError,
+   PaymentProviderError,
+   ResourceNotFoundError,
+ } from '../common/errors';
+@@ -10,6 +13,7 @@ import type { Booking } from '../generated/prisma/client';
+ import { PAYMENT_PROVIDER, type PaymentProvider } from '../payments/payment.provider';
+ import { PrismaService } from '../prisma/prisma.service';
+ import type { BookingOut, CreateBooking, CreatedBooking } from './bookings.dto';
++import { HoldScheduler } from './holds/hold.scheduler';
+ import { RESERVE_STRATEGY, type ReserveStrategy } from './strategies/reserve.strategy';
+ 
+ export interface Clock {
+@@ -27,6 +31,8 @@ export class BookingsService {
+     @Inject(CONFIG) private readonly config: Config,
+     @Inject(CLOCK) private readonly clock: Clock,
+     @Inject(PAYMENT_PROVIDER) private readonly payments: PaymentProvider,
++    private readonly holds: HoldScheduler,
++    private readonly logger: Logger,
+   ) {}
+ 
+   get strategyName(): string {
+@@ -72,6 +78,7 @@ export class BookingsService {
+         data: { paymentId: intent.id, amountCents },
+       }),
+     );
++    if (booking.holdExpiresAt) await this.holds.schedule(booking.id, booking.holdExpiresAt, now);
+     return {
+       ...toBookingOut(booking),
+       payment: { provider: this.payments.name, id: intent.id, clientSecret: intent.clientSecret },
+@@ -83,6 +90,37 @@ export class BookingsService {
+     if (!row) throw new BookingNotFoundError(id);
+     return toBookingOut(row);
+   }
++
++  /**
++   * The owner may cancel a HELD or CONFIRMED booking; cancelling again is a no-op. An EXPIRED
++   * booking has nothing left to cancel. A held payment intent is cancelled best effort — if the
++   * customer pays in the same instant, the webhook records the money as ORPHANED for a refund.
++   */
++  async cancel(id: string, userId: string): Promise<BookingOut> {
++    const before = await retryOnConflict(() =>
++      this.prisma.$transaction(async (tx) => {
++        const rows = await tx.$queryRaw<
++          { id: string; userId: string; status: Booking['status']; paymentId: string | null }[]
++        >`SELECT id, "userId", status, "paymentId" FROM bookings WHERE id = ${id} FOR UPDATE`;
++        const row = rows[0];
++        if (!row) throw new BookingNotFoundError(id);
++        if (row.userId !== userId) throw new ForbiddenError('only the booking owner can cancel it');
++        if (row.status === 'CANCELLED') return row;
++        if (row.status === 'EXPIRED') throw new InvalidTransitionError(row.status, 'CANCELLED');
++        await tx.booking.update({
++          where: { id },
++          data: { status: 'CANCELLED', version: { increment: 1 } },
++        });
++        return row;
++      }),
++    );
++    if (before.status === 'HELD' && before.paymentId) {
++      await this.payments.cancelIntent(before.paymentId).catch((error: unknown) => {
++        this.logger.warn({ err: error, bookingId: id }, 'could not cancel the payment intent');
++      });
++    }
++    return this.get(id);
++  }
+ }
+ 
+ /** Hourly prices, pro-rated to the minute and rounded to the cent. */
+diff --git a/src/bookings/holds/hold-expiry.service.ts b/src/bookings/holds/hold-expiry.service.ts
+new file mode 100644
+index 0000000..b53ca35
+--- /dev/null
++++ b/src/bookings/holds/hold-expiry.service.ts
+@@ -0,0 +1,68 @@
++import { Inject, Injectable } from '@nestjs/common';
++import { Logger } from 'nestjs-pino';
++import { retryOnConflict } from '../../common/retry';
++import { PAYMENT_PROVIDER, type PaymentProvider } from '../../payments/payment.provider';
++import { PrismaService } from '../../prisma/prisma.service';
++
++interface ExpiredRow {
++  id: string;
++  paymentId: string | null;
++}
++
++/**
++ * HELD → EXPIRED once the hold is overdue, judged by the database clock so that API, worker and
++ * Postgres never disagree. The update is the guard: a hold that was confirmed or cancelled in the
++ * meantime matches no row, and two workers expiring the same booking cannot both succeed.
++ */
++@Injectable()
++export class HoldExpiryService {
++  constructor(
++    private readonly prisma: PrismaService,
++    @Inject(PAYMENT_PROVIDER) private readonly payments: PaymentProvider,
++    private readonly logger: Logger,
++  ) {}
++
++  async expire(bookingId: string): Promise<'expired' | 'skipped'> {
++    const rows = await retryOnConflict(
++      () => this.prisma.$queryRaw<ExpiredRow[]>`
++        UPDATE bookings SET status = 'EXPIRED', version = version + 1, "updatedAt" = now()
++        WHERE id = ${bookingId} AND status = 'HELD' AND "holdExpiresAt" <= now()
++        RETURNING id, "paymentId"`,
++    );
++    await this.release(rows);
++    return rows.length > 0 ? 'expired' : 'skipped';
++  }
++
++  /** Everything overdue, in one statement per batch; lost delayed jobs end up here. */
++  async sweep(batch = 500): Promise<number> {
++    let total = 0;
++    for (;;) {
++      const rows = await retryOnConflict(
++        () => this.prisma.$queryRaw<ExpiredRow[]>`
++          UPDATE bookings SET status = 'EXPIRED', version = version + 1, "updatedAt" = now()
++          WHERE id IN (
++            SELECT id FROM bookings WHERE status = 'HELD' AND "holdExpiresAt" <= now()
++            ORDER BY "holdExpiresAt" LIMIT ${batch} FOR UPDATE SKIP LOCKED)
++          RETURNING id, "paymentId"`,
++      );
++      await this.release(rows);
++      total += rows.length;
++      if (rows.length < batch) return total;
++    }
++  }
++
++  /** Best effort: a cancel that fails (or races a success) is settled by the webhook — ORPHANED. */
++  private async release(rows: ExpiredRow[]): Promise<void> {
++    for (const row of rows) {
++      if (!row.paymentId) continue;
++      try {
++        await this.payments.cancelIntent(row.paymentId);
++      } catch (error) {
++        this.logger.warn(
++          { err: error, bookingId: row.id },
++          'could not cancel the payment intent of an expired hold',
++        );
++      }
++    }
++  }
++}
+diff --git a/src/bookings/holds/hold.scheduler.ts b/src/bookings/holds/hold.scheduler.ts
+new file mode 100644
+index 0000000..ebbaacf
+--- /dev/null
++++ b/src/bookings/holds/hold.scheduler.ts
+@@ -0,0 +1,57 @@
++import { InjectQueue } from '@nestjs/bullmq';
++import { Injectable } from '@nestjs/common';
++import { Queue } from 'bullmq';
++import { Logger } from 'nestjs-pino';
++import { HOLDS_QUEUE } from '../../queue/queue.module';
++
++export const EXPIRE_JOB = 'expire';
++export const SWEEP_JOB = 'sweep';
++export const SWEEPER_ID = 'hold-sweeper';
++
++export interface ExpireJobData {
++  bookingId: string;
++}
++
++/** BullMQ forbids ':' in custom job ids. */
++export function expireJobId(bookingId: string): string {
++  return `${EXPIRE_JOB}-${bookingId}`;
++}
++
++/**
++ * One delayed job per hold, keyed by the booking id so a retried request cannot schedule two. If
++ * Redis is unavailable the booking still stands: the sweeper (a repeatable job on the same queue)
++ * expires anything the delayed job missed.
++ */
++@Injectable()
++export class HoldScheduler {
++  constructor(
++    @InjectQueue(HOLDS_QUEUE) private readonly queue: Queue,
++    private readonly logger: Logger,
++  ) {}
++
++  async schedule(bookingId: string, holdExpiresAt: Date, now = new Date()): Promise<void> {
++    const delay = Math.max(0, holdExpiresAt.getTime() - now.getTime());
++    try {
++      await this.queue.add(EXPIRE_JOB, { bookingId } satisfies ExpireJobData, {
++        jobId: expireJobId(bookingId),
++        delay,
++        attempts: 5,
++        backoff: { type: 'exponential', delay: 1000 },
++      });
++    } catch (error) {
++      this.logger.warn(
++        { err: error, bookingId },
++        'could not schedule hold expiry; the sweeper will catch it',
++      );
++    }
++  }
++
++  /** The safety net: `sweep` runs every `everyMs`, however many workers there are. */
++  async ensureSweeper(everyMs: number): Promise<void> {
++    await this.queue.upsertJobScheduler(
++      SWEEPER_ID,
++      { every: everyMs },
++      { name: SWEEP_JOB, data: {} },
++    );
++  }
++}
+diff --git a/src/bookings/holds/holds-worker.module.ts b/src/bookings/holds/holds-worker.module.ts
+new file mode 100644
+index 0000000..f1fe69f
+--- /dev/null
++++ b/src/bookings/holds/holds-worker.module.ts
+@@ -0,0 +1,18 @@
++import { Inject, Module, OnModuleInit } from '@nestjs/common';
++import { CONFIG, type Config } from '../../config';
++import { HoldScheduler } from './hold.scheduler';
++import { HoldsModule } from './holds.module';
++import { HoldsProcessor } from './holds.processor';
++
++/** The worker side: processes the holds queue and keeps the sweeper scheduled. */
++@Module({ imports: [HoldsModule], providers: [HoldsProcessor] })
++export class HoldsWorkerModule implements OnModuleInit {
++  constructor(
++    @Inject(CONFIG) private readonly config: Config,
++    private readonly scheduler: HoldScheduler,
++  ) {}
++
++  onModuleInit(): Promise<void> {
++    return this.scheduler.ensureSweeper(this.config.HOLD_SWEEP_INTERVAL_MS);
++  }
++}
+diff --git a/src/bookings/holds/holds.module.ts b/src/bookings/holds/holds.module.ts
+new file mode 100644
+index 0000000..f0a6e7d
+--- /dev/null
++++ b/src/bookings/holds/holds.module.ts
+@@ -0,0 +1,12 @@
++import { Module } from '@nestjs/common';
++import { PaymentsModule } from '../../payments/payments.module';
++import { HoldScheduler } from './hold.scheduler';
++import { HoldExpiryService } from './hold-expiry.service';
++
++/** Scheduling and expiring holds — used by the API (schedule) and the worker (expire). */
++@Module({
++  imports: [PaymentsModule],
++  providers: [HoldScheduler, HoldExpiryService],
++  exports: [HoldScheduler, HoldExpiryService],
++})
++export class HoldsModule {}
+diff --git a/src/bookings/holds/holds.processor.ts b/src/bookings/holds/holds.processor.ts
+new file mode 100644
+index 0000000..c560a68
+--- /dev/null
++++ b/src/bookings/holds/holds.processor.ts
+@@ -0,0 +1,34 @@
++import { Processor, WorkerHost } from '@nestjs/bullmq';
++import { Job } from 'bullmq';
++import { Logger } from 'nestjs-pino';
++import { HOLDS_QUEUE } from '../../queue/queue.module';
++import { EXPIRE_JOB, type ExpireJobData, SWEEP_JOB } from './hold.scheduler';
++import { HoldExpiryService } from './hold-expiry.service';
++
++@Processor(HOLDS_QUEUE, { concurrency: 10 })
++export class HoldsProcessor extends WorkerHost {
++  constructor(
++    private readonly expiry: HoldExpiryService,
++    private readonly logger: Logger,
++  ) {
++    super();
++  }
++
++  async process(job: Job): Promise<unknown> {
++    switch (job.name) {
++      case EXPIRE_JOB: {
++        const { bookingId } = job.data as ExpireJobData;
++        const result = await this.expiry.expire(bookingId);
++        this.logger.debug({ bookingId, result }, 'hold expiry job');
++        return result;
++      }
++      case SWEEP_JOB: {
++        const expired = await this.expiry.sweep();
++        if (expired > 0) this.logger.log({ expired }, 'hold sweeper expired overdue holds');
++        return expired;
++      }
++      default:
++        throw new Error(`unknown job ${job.name} on ${HOLDS_QUEUE}`);
++    }
++  }
++}
+diff --git a/src/common/errors.ts b/src/common/errors.ts
+index 10a6f70..948e4bf 100644
+--- a/src/common/errors.ts
++++ b/src/common/errors.ts
+@@ -2,6 +2,7 @@ import {
+   BadGatewayException,
+   BadRequestException,
+   ConflictException,
++  ForbiddenException,
+   HttpException,
+   NotFoundException,
+   ServiceUnavailableException,
+@@ -71,6 +72,12 @@ export class PaymentProviderError extends BadGatewayException {
+   }
+ }
+ 
++export class ForbiddenError extends ForbiddenException {
++  constructor(what: string) {
++    super({ code: 'forbidden', message: what });
++  }
++}
++
+ export class InvalidTransitionError extends HttpException {
+   constructor(from: string, to: string) {
+     super({ code: 'invalid_transition', message: `a ${from} booking cannot become ${to}` }, 409);
+diff --git a/src/config.ts b/src/config.ts
+index c35bc2c..c13a594 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -24,6 +24,7 @@ const schema = z
+     REDIS_URL: z.string().url().default('redis://localhost:6379/0'),
+     BOOKING_STRATEGY: z.enum(STRATEGIES).default('advisory'),
+     HOLD_TTL_SECONDS: z.coerce.number().int().positive().default(600),
++    HOLD_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
+     STRIPE_SECRET_KEY: z
+       .string()
+       .optional()
+diff --git a/src/core.module.ts b/src/core.module.ts
+new file mode 100644
+index 0000000..c113190
+--- /dev/null
++++ b/src/core.module.ts
+@@ -0,0 +1,32 @@
++import { DynamicModule, Module } from '@nestjs/common';
++import { LoggerModule } from 'nestjs-pino';
++import { CONFIG, type Config } from './config';
++import { ConfigModule } from './config.module';
++import { PrismaModule } from './prisma/prisma.module';
++import { QueueModule } from './queue/queue.module';
++
++/** What every process needs: configuration, logging, the database and the queues. */
++@Module({})
++export class CoreModule {
++  static forRoot(config?: Config): DynamicModule {
++    return {
++      module: CoreModule,
++      imports: [
++        ConfigModule.forRoot(config),
++        LoggerModule.forRootAsync({
++          inject: [CONFIG],
++          useFactory: (cfg: Config) => ({
++            pinoHttp: {
++              level: cfg.LOG_LEVEL,
++              redact: ['req.headers.authorization', 'req.headers["stripe-signature"]'],
++              ...(cfg.NODE_ENV === 'development' ? { transport: { target: 'pino-pretty' } } : {}),
++            },
++          }),
++        }),
++        PrismaModule,
++        QueueModule,
++      ],
++      exports: [ConfigModule, LoggerModule, PrismaModule, QueueModule],
++    };
++  }
++}
+diff --git a/src/generated/prisma/browser.ts b/src/generated/prisma/browser.ts
+index 731982c..287bf29 100644
+--- a/src/generated/prisma/browser.ts
++++ b/src/generated/prisma/browser.ts
+@@ -47,3 +47,8 @@ export type OutboxEvent = Prisma.OutboxEventModel
+  * Idempotent consumers: a job key is processed at most once.
+  */
+ export type ProcessedJob = Prisma.ProcessedJobModel
++/**
++ * Model FakePaymentIntent
++ * The in-process PSP's intents, in the database so the API and the worker see the same ones.
++ */
++export type FakePaymentIntent = Prisma.FakePaymentIntentModel
+diff --git a/src/generated/prisma/client.ts b/src/generated/prisma/client.ts
+index 8e0471a..a589c11 100644
+--- a/src/generated/prisma/client.ts
++++ b/src/generated/prisma/client.ts
+@@ -69,3 +69,8 @@ export type OutboxEvent = Prisma.OutboxEventModel
+  * Idempotent consumers: a job key is processed at most once.
+  */
+ export type ProcessedJob = Prisma.ProcessedJobModel
++/**
++ * Model FakePaymentIntent
++ * The in-process PSP's intents, in the database so the API and the worker see the same ones.
++ */
++export type FakePaymentIntent = Prisma.FakePaymentIntentModel
+diff --git a/src/generated/prisma/internal/class.ts b/src/generated/prisma/internal/class.ts
+index 50557ce..79693b4 100644
+--- a/src/generated/prisma/internal/class.ts
++++ b/src/generated/prisma/internal/class.ts
+@@ -20,7 +20,7 @@ const config: runtime.GetPrismaClientConfig = {
+   "clientVersion": "7.10.0",
+   "engineVersion": "0edf323efd1d98336f3f0a68684b56f689b900d3",
+   "activeProvider": "postgresql",
+-  "inlineSchema": "// slotlock — see docs/adr for the reasoning behind the shape.\n\ngenerator client {\n  provider     = \"prisma-client\"\n  output       = \"../src/generated/prisma\"\n  moduleFormat = \"cjs\"\n}\n\ndatasource db {\n  provider = \"postgresql\"\n}\n\nenum ResourceKind {\n  ROOM\n  DESK_POOL\n}\n\nenum BookingStatus {\n  HELD\n  CONFIRMED\n  CANCELLED\n  EXPIRED\n}\n\nenum IdempotencyStatus {\n  IN_FLIGHT\n  DONE\n}\n\nenum PaymentEventOutcome {\n  APPLIED\n  STALE\n  DUPLICATE\n  ORPHANED\n  IGNORED\n  UNKNOWN\n}\n\n/// A bookable thing: a meeting room (exclusive) or a pool of hot desks (capacity N).\nmodel Resource {\n  id         String       @id\n  kind       ResourceKind\n  name       String\n  capacity   Int\n  priceCents Int\n  /// Bumped by the optimistic strategy on every successful reservation.\n  version    Int          @default(0)\n  createdAt  DateTime     @default(now()) @db.Timestamptz(3)\n  bookings   Booking[]\n\n  @@map(\"resources\")\n}\n\nmodel Booking {\n  id                 String        @id @default(uuid())\n  resourceId         String\n  resource           Resource      @relation(fields: [resourceId], references: [id])\n  userId             String\n  startsAt           DateTime      @db.Timestamptz(3)\n  endsAt             DateTime      @db.Timestamptz(3)\n  /// Denormalised from the resource kind so the exclusion constraint can filter on it.\n  exclusive          Boolean\n  status             BookingStatus @default(HELD)\n  holdExpiresAt      DateTime?     @db.Timestamptz(3)\n  amountCents        Int           @default(0)\n  paymentId          String?       @unique\n  /// Provider timestamp of the last payment event applied; older events are stale.\n  paymentLastEventAt DateTime?     @db.Timestamptz(3)\n  version            Int           @default(0)\n  createdAt          DateTime      @default(now()) @db.Timestamptz(3)\n  updatedAt          DateTime      @updatedAt @db.Timestamptz(3)\n\n  @@index([resourceId, startsAt, endsAt])\n  @@index([status, holdExpiresAt])\n  @@map(\"bookings\")\n}\n\n/// One row per Idempotency-Key: in flight while the request runs, then the stored response.\nmodel IdempotencyKey {\n  key            String            @id\n  userId         String\n  requestHash    String\n  status         IdempotencyStatus @default(IN_FLIGHT)\n  responseStatus Int?\n  responseBody   Json?\n  createdAt      DateTime          @default(now()) @db.Timestamptz(3)\n  expiresAt      DateTime          @db.Timestamptz(3)\n\n  @@index([expiresAt])\n  @@map(\"idempotency_keys\")\n}\n\n/// Every payment webhook received, by provider event id; the outcome records what was done with it.\nmodel PaymentEvent {\n  id                String              @id\n  paymentId         String?\n  type              String\n  providerCreatedAt DateTime            @db.Timestamptz(3)\n  receivedAt        DateTime            @default(now()) @db.Timestamptz(3)\n  outcome           PaymentEventOutcome\n\n  @@index([paymentId])\n  @@map(\"payment_events\")\n}\n\n/// Domain events written in the same transaction as the change they describe.\nmodel OutboxEvent {\n  id          String    @id @default(uuid())\n  type        String\n  payload     Json\n  createdAt   DateTime  @default(now()) @db.Timestamptz(3)\n  publishedAt DateTime? @db.Timestamptz(3)\n\n  @@index([publishedAt, createdAt])\n  @@map(\"outbox_events\")\n}\n\n/// Idempotent consumers: a job key is processed at most once.\nmodel ProcessedJob {\n  key         String   @id\n  processedAt DateTime @default(now()) @db.Timestamptz(3)\n\n  @@map(\"processed_jobs\")\n}\n",
++  "inlineSchema": "// slotlock — see docs/adr for the reasoning behind the shape.\n\ngenerator client {\n  provider     = \"prisma-client\"\n  output       = \"../src/generated/prisma\"\n  moduleFormat = \"cjs\"\n}\n\ndatasource db {\n  provider = \"postgresql\"\n}\n\nenum ResourceKind {\n  ROOM\n  DESK_POOL\n}\n\nenum BookingStatus {\n  HELD\n  CONFIRMED\n  CANCELLED\n  EXPIRED\n}\n\nenum IdempotencyStatus {\n  IN_FLIGHT\n  DONE\n}\n\nenum PaymentEventOutcome {\n  APPLIED\n  STALE\n  DUPLICATE\n  ORPHANED\n  IGNORED\n  UNKNOWN\n}\n\n/// A bookable thing: a meeting room (exclusive) or a pool of hot desks (capacity N).\nmodel Resource {\n  id         String       @id\n  kind       ResourceKind\n  name       String\n  capacity   Int\n  priceCents Int\n  /// Bumped by the optimistic strategy on every successful reservation.\n  version    Int          @default(0)\n  createdAt  DateTime     @default(now()) @db.Timestamptz(3)\n  bookings   Booking[]\n\n  @@map(\"resources\")\n}\n\nmodel Booking {\n  id                 String        @id @default(uuid())\n  resourceId         String\n  resource           Resource      @relation(fields: [resourceId], references: [id])\n  userId             String\n  startsAt           DateTime      @db.Timestamptz(3)\n  endsAt             DateTime      @db.Timestamptz(3)\n  /// Denormalised from the resource kind so the exclusion constraint can filter on it.\n  exclusive          Boolean\n  status             BookingStatus @default(HELD)\n  holdExpiresAt      DateTime?     @db.Timestamptz(3)\n  amountCents        Int           @default(0)\n  paymentId          String?       @unique\n  /// Provider timestamp of the last payment event applied; older events are stale.\n  paymentLastEventAt DateTime?     @db.Timestamptz(3)\n  version            Int           @default(0)\n  createdAt          DateTime      @default(now()) @db.Timestamptz(3)\n  updatedAt          DateTime      @updatedAt @db.Timestamptz(3)\n\n  @@index([resourceId, startsAt, endsAt])\n  @@index([status, holdExpiresAt])\n  @@map(\"bookings\")\n}\n\n/// One row per Idempotency-Key: in flight while the request runs, then the stored response.\nmodel IdempotencyKey {\n  key            String            @id\n  userId         String\n  requestHash    String\n  status         IdempotencyStatus @default(IN_FLIGHT)\n  responseStatus Int?\n  responseBody   Json?\n  createdAt      DateTime          @default(now()) @db.Timestamptz(3)\n  expiresAt      DateTime          @db.Timestamptz(3)\n\n  @@index([expiresAt])\n  @@map(\"idempotency_keys\")\n}\n\n/// Every payment webhook received, by provider event id; the outcome records what was done with it.\nmodel PaymentEvent {\n  id                String              @id\n  paymentId         String?\n  type              String\n  providerCreatedAt DateTime            @db.Timestamptz(3)\n  receivedAt        DateTime            @default(now()) @db.Timestamptz(3)\n  outcome           PaymentEventOutcome\n\n  @@index([paymentId])\n  @@map(\"payment_events\")\n}\n\n/// Domain events written in the same transaction as the change they describe.\nmodel OutboxEvent {\n  id          String    @id @default(uuid())\n  type        String\n  payload     Json\n  createdAt   DateTime  @default(now()) @db.Timestamptz(3)\n  publishedAt DateTime? @db.Timestamptz(3)\n\n  @@index([publishedAt, createdAt])\n  @@map(\"outbox_events\")\n}\n\n/// Idempotent consumers: a job key is processed at most once.\nmodel ProcessedJob {\n  key         String   @id\n  processedAt DateTime @default(now()) @db.Timestamptz(3)\n\n  @@map(\"processed_jobs\")\n}\n\n/// The in-process PSP's intents, in the database so the API and the worker see the same ones.\nmodel FakePaymentIntent {\n  id          String   @id\n  bookingId   String\n  amountCents Int\n  status      String\n  createdAt   DateTime @default(now()) @db.Timestamptz(3)\n\n  @@map(\"fake_payment_intents\")\n}\n",
+   "runtimeDataModel": {
+     "models": {},
+     "enums": {},
+@@ -32,10 +32,10 @@ const config: runtime.GetPrismaClientConfig = {
+   }
+ }
+ 
+-config.runtimeDataModel = JSON.parse("{\"models\":{\"Resource\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"kind\",\"kind\":\"enum\",\"type\":\"ResourceKind\"},{\"name\":\"name\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"capacity\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"priceCents\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"version\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"bookings\",\"kind\":\"object\",\"type\":\"Booking\",\"relationName\":\"BookingToResource\"}],\"dbName\":\"resources\",\"schema\":null},\"Booking\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"resourceId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"resource\",\"kind\":\"object\",\"type\":\"Resource\",\"relationName\":\"BookingToResource\"},{\"name\":\"userId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"startsAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"endsAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"exclusive\",\"kind\":\"scalar\",\"type\":\"Boolean\"},{\"name\":\"status\",\"kind\":\"enum\",\"type\":\"BookingStatus\"},{\"name\":\"holdExpiresAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"amountCents\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"paymentId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"paymentLastEventAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"version\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"updatedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"bookings\",\"schema\":null},\"IdempotencyKey\":{\"fields\":[{\"name\":\"key\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"userId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"requestHash\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"status\",\"kind\":\"enum\",\"type\":\"IdempotencyStatus\"},{\"name\":\"responseStatus\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"responseBody\",\"kind\":\"scalar\",\"type\":\"Json\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"expiresAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"idempotency_keys\",\"schema\":null},\"PaymentEvent\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"paymentId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"type\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"providerCreatedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"receivedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"outcome\",\"kind\":\"enum\",\"type\":\"PaymentEventOutcome\"}],\"dbName\":\"payment_events\",\"schema\":null},\"OutboxEvent\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"type\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"payload\",\"kind\":\"scalar\",\"type\":\"Json\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"publishedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"outbox_events\",\"schema\":null},\"ProcessedJob\":{\"fields\":[{\"name\":\"key\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"processedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"processed_jobs\",\"schema\":null}},\"enums\":{},\"types\":{}}")
++config.runtimeDataModel = JSON.parse("{\"models\":{\"Resource\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"kind\",\"kind\":\"enum\",\"type\":\"ResourceKind\"},{\"name\":\"name\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"capacity\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"priceCents\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"version\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"bookings\",\"kind\":\"object\",\"type\":\"Booking\",\"relationName\":\"BookingToResource\"}],\"dbName\":\"resources\",\"schema\":null},\"Booking\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"resourceId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"resource\",\"kind\":\"object\",\"type\":\"Resource\",\"relationName\":\"BookingToResource\"},{\"name\":\"userId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"startsAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"endsAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"exclusive\",\"kind\":\"scalar\",\"type\":\"Boolean\"},{\"name\":\"status\",\"kind\":\"enum\",\"type\":\"BookingStatus\"},{\"name\":\"holdExpiresAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"amountCents\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"paymentId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"paymentLastEventAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"version\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"updatedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"bookings\",\"schema\":null},\"IdempotencyKey\":{\"fields\":[{\"name\":\"key\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"userId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"requestHash\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"status\",\"kind\":\"enum\",\"type\":\"IdempotencyStatus\"},{\"name\":\"responseStatus\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"responseBody\",\"kind\":\"scalar\",\"type\":\"Json\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"expiresAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"idempotency_keys\",\"schema\":null},\"PaymentEvent\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"paymentId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"type\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"providerCreatedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"receivedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"outcome\",\"kind\":\"enum\",\"type\":\"PaymentEventOutcome\"}],\"dbName\":\"payment_events\",\"schema\":null},\"OutboxEvent\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"type\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"payload\",\"kind\":\"scalar\",\"type\":\"Json\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"publishedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"outbox_events\",\"schema\":null},\"ProcessedJob\":{\"fields\":[{\"name\":\"key\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"processedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"processed_jobs\",\"schema\":null},\"FakePaymentIntent\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"bookingId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"amountCents\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"status\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"fake_payment_intents\",\"schema\":null}},\"enums\":{},\"types\":{}}")
+ config.parameterizationSchema = {
+-  strings: JSON.parse("[\"where\",\"orderBy\",\"cursor\",\"resource\",\"bookings\",\"_count\",\"Resource.findUnique\",\"Resource.findUniqueOrThrow\",\"Resource.findFirst\",\"Resource.findFirstOrThrow\",\"Resource.findMany\",\"data\",\"Resource.createOne\",\"Resource.createMany\",\"Resource.createManyAndReturn\",\"Resource.updateOne\",\"Resource.updateMany\",\"Resource.updateManyAndReturn\",\"create\",\"update\",\"Resource.upsertOne\",\"Resource.deleteOne\",\"Resource.deleteMany\",\"having\",\"_avg\",\"_sum\",\"_min\",\"_max\",\"Resource.groupBy\",\"Resource.aggregate\",\"Booking.findUnique\",\"Booking.findUniqueOrThrow\",\"Booking.findFirst\",\"Booking.findFirstOrThrow\",\"Booking.findMany\",\"Booking.createOne\",\"Booking.createMany\",\"Booking.createManyAndReturn\",\"Booking.updateOne\",\"Booking.updateMany\",\"Booking.updateManyAndReturn\",\"Booking.upsertOne\",\"Booking.deleteOne\",\"Booking.deleteMany\",\"Booking.groupBy\",\"Booking.aggregate\",\"IdempotencyKey.findUnique\",\"IdempotencyKey.findUniqueOrThrow\",\"IdempotencyKey.findFirst\",\"IdempotencyKey.findFirstOrThrow\",\"IdempotencyKey.findMany\",\"IdempotencyKey.createOne\",\"IdempotencyKey.createMany\",\"IdempotencyKey.createManyAndReturn\",\"IdempotencyKey.updateOne\",\"IdempotencyKey.updateMany\",\"IdempotencyKey.updateManyAndReturn\",\"IdempotencyKey.upsertOne\",\"IdempotencyKey.deleteOne\",\"IdempotencyKey.deleteMany\",\"IdempotencyKey.groupBy\",\"IdempotencyKey.aggregate\",\"PaymentEvent.findUnique\",\"PaymentEvent.findUniqueOrThrow\",\"PaymentEvent.findFirst\",\"PaymentEvent.findFirstOrThrow\",\"PaymentEvent.findMany\",\"PaymentEvent.createOne\",\"PaymentEvent.createMany\",\"PaymentEvent.createManyAndReturn\",\"PaymentEvent.updateOne\",\"PaymentEvent.updateMany\",\"PaymentEvent.updateManyAndReturn\",\"PaymentEvent.upsertOne\",\"PaymentEvent.deleteOne\",\"PaymentEvent.deleteMany\",\"PaymentEvent.groupBy\",\"PaymentEvent.aggregate\",\"OutboxEvent.findUnique\",\"OutboxEvent.findUniqueOrThrow\",\"OutboxEvent.findFirst\",\"OutboxEvent.findFirstOrThrow\",\"OutboxEvent.findMany\",\"OutboxEvent.createOne\",\"OutboxEvent.createMany\",\"OutboxEvent.createManyAndReturn\",\"OutboxEvent.updateOne\",\"OutboxEvent.updateMany\",\"OutboxEvent.updateManyAndReturn\",\"OutboxEvent.upsertOne\",\"OutboxEvent.deleteOne\",\"OutboxEvent.deleteMany\",\"OutboxEvent.groupBy\",\"OutboxEvent.aggregate\",\"ProcessedJob.findUnique\",\"ProcessedJob.findUniqueOrThrow\",\"ProcessedJob.findFirst\",\"ProcessedJob.findFirstOrThrow\",\"ProcessedJob.findMany\",\"ProcessedJob.createOne\",\"ProcessedJob.createMany\",\"ProcessedJob.createManyAndReturn\",\"ProcessedJob.updateOne\",\"ProcessedJob.updateMany\",\"ProcessedJob.updateManyAndReturn\",\"ProcessedJob.upsertOne\",\"ProcessedJob.deleteOne\",\"ProcessedJob.deleteMany\",\"ProcessedJob.groupBy\",\"ProcessedJob.aggregate\",\"AND\",\"OR\",\"NOT\",\"key\",\"processedAt\",\"equals\",\"in\",\"notIn\",\"lt\",\"lte\",\"gt\",\"gte\",\"not\",\"contains\",\"startsWith\",\"endsWith\",\"id\",\"type\",\"payload\",\"createdAt\",\"publishedAt\",\"string_contains\",\"string_starts_with\",\"string_ends_with\",\"array_starts_with\",\"array_ends_with\",\"array_contains\",\"paymentId\",\"providerCreatedAt\",\"receivedAt\",\"PaymentEventOutcome\",\"outcome\",\"userId\",\"requestHash\",\"IdempotencyStatus\",\"status\",\"responseStatus\",\"responseBody\",\"expiresAt\",\"resourceId\",\"startsAt\",\"endsAt\",\"exclusive\",\"BookingStatus\",\"holdExpiresAt\",\"amountCents\",\"paymentLastEventAt\",\"version\",\"updatedAt\",\"ResourceKind\",\"kind\",\"name\",\"capacity\",\"priceCents\",\"every\",\"some\",\"none\",\"is\",\"isNot\",\"connectOrCreate\",\"upsert\",\"createMany\",\"set\",\"disconnect\",\"delete\",\"connect\",\"updateMany\",\"deleteMany\",\"increment\",\"decrement\",\"multiply\",\"divide\"]"),
+-  graph: "lgI4YAsEAADWAQAgbgAA0wEAMG8AAAkAEHAAANMBADB-AQAAAAGBAUAAowEAIZ0BAgDVAQAhoAEAANQBoAEioQEBAKIBACGiAQIA1QEAIaMBAgDVAQAhAQAAAAEAIBIDAADaAQAgbgAA1wEAMG8AAAMAEHAAANcBADB-AQCiAQAhgQFAAKMBACGJAQEAtgEAIY4BAQCiAQAhkQEAANkBmgEilQEBAKIBACGWAUAAowEAIZcBQACjAQAhmAEgANgBACGaAUAArQEAIZsBAgDVAQAhnAFAAK0BACGdAQIA1QEAIZ4BQACjAQAhBAMAAJACACCJAQAA4AEAIJoBAADgAQAgnAEAAOABACASAwAA2gEAIG4AANcBADBvAAADABBwAADXAQAwfgEAAAABgQFAAKMBACGJAQEAAAABjgEBAKIBACGRAQAA2QGaASKVAQEAogEAIZYBQACjAQAhlwFAAKMBACGYASAA2AEAIZoBQACtAQAhmwECANUBACGcAUAArQEAIZ0BAgDVAQAhngFAAKMBACEDAAAAAwAgAQAABAAwAgAABQAgAQAAAAMAIAEAAAABACALBAAA1gEAIG4AANMBADBvAAAJABBwAADTAQAwfgEAogEAIYEBQACjAQAhnQECANUBACGgAQAA1AGgASKhAQEAogEAIaIBAgDVAQAhowECANUBACEBBAAAjwIAIAMAAAAJACABAAAKADACAAABACADAAAACQAgAQAACgAwAgAAAQAgAwAAAAkAIAEAAAoAMAIAAAEAIAgEAACOAgAgfgEAAAABgQFAAAAAAZ0BAgAAAAGgAQAAAKABAqEBAQAAAAGiAQIAAAABowECAAAAAQELAAAOACAHfgEAAAABgQFAAAAAAZ0BAgAAAAGgAQAAAKABAqEBAQAAAAGiAQIAAAABowECAAAAAQELAAAQADABCwAAEAAwCAQAAIECACB-AQDeAQAhgQFAAN8BACGdAQIA-AEAIaABAACAAqABIqEBAQDeAQAhogECAPgBACGjAQIA-AEAIQIAAAABACALAAATACAHfgEA3gEAIYEBQADfAQAhnQECAPgBACGgAQAAgAKgASKhAQEA3gEAIaIBAgD4AQAhowECAPgBACECAAAACQAgCwAAFQAgAgAAAAkAIAsAABUAIAMAAAABACASAAAOACATAAATACABAAAAAQAgAQAAAAkAIAUFAAD7AQAgGAAA_AEAIBkAAP8BACAaAAD-AQAgGwAA_QEAIApuAADPAQAwbwAAHAAQcAAAzwEAMH4BAJoBACGBAUAAmwEAIZ0BAgDIAQAhoAEAANABoAEioQEBAJoBACGiAQIAyAEAIaMBAgDIAQAhAwAAAAkAIAEAABsAMBcAABwAIAMAAAAJACABAAAKADACAAABACABAAAABQAgAQAAAAUAIAMAAAADACABAAAEADACAAAFACADAAAAAwAgAQAABAAwAgAABQAgAwAAAAMAIAEAAAQAMAIAAAUAIA8DAAD6AQAgfgEAAAABgQFAAAAAAYkBAQAAAAGOAQEAAAABkQEAAACaAQKVAQEAAAABlgFAAAAAAZcBQAAAAAGYASAAAAABmgFAAAAAAZsBAgAAAAGcAUAAAAABnQECAAAAAZ4BQAAAAAEBCwAAJAAgDn4BAAAAAYEBQAAAAAGJAQEAAAABjgEBAAAAAZEBAAAAmgEClQEBAAAAAZYBQAAAAAGXAUAAAAABmAEgAAAAAZoBQAAAAAGbAQIAAAABnAFAAAAAAZ0BAgAAAAGeAUAAAAABAQsAACYAMAELAAAmADAPAwAA-QEAIH4BAN4BACGBAUAA3wEAIYkBAQDoAQAhjgEBAN4BACGRAQAA9wGaASKVAQEA3gEAIZYBQADfAQAhlwFAAN8BACGYASAA9gEAIZoBQADkAQAhmwECAPgBACGcAUAA5AEAIZ0BAgD4AQAhngFAAN8BACECAAAABQAgCwAAKQAgDn4BAN4BACGBAUAA3wEAIYkBAQDoAQAhjgEBAN4BACGRAQAA9wGaASKVAQEA3gEAIZYBQADfAQAhlwFAAN8BACGYASAA9gEAIZoBQADkAQAhmwECAPgBACGcAUAA5AEAIZ0BAgD4AQAhngFAAN8BACECAAAAAwAgCwAAKwAgAgAAAAMAIAsAACsAIAMAAAAFACASAAAkACATAAApACABAAAABQAgAQAAAAMAIAgFAADxAQAgGAAA8gEAIBkAAPUBACAaAAD0AQAgGwAA8wEAIIkBAADgAQAgmgEAAOABACCcAQAA4AEAIBFuAADFAQAwbwAAMgAQcAAAxQEAMH4BAJoBACGBAUAAmwEAIYkBAQCvAQAhjgEBAJoBACGRAQAAxwGaASKVAQEAmgEAIZYBQACbAQAhlwFAAJsBACGYASAAxgEAIZoBQACmAQAhmwECAMgBACGcAUAApgEAIZ0BAgDIAQAhngFAAJsBACEDAAAAAwAgAQAAMQAwFwAAMgAgAwAAAAMAIAEAAAQAMAIAAAUAIAtuAADBAQAwbwAAOAAQcAAAwQEAMHEBAAAAAYEBQACjAQAhjgEBAKIBACGPAQEAogEAIZEBAADCAZEBIpIBAgDDAQAhkwEAAMQBACCUAUAAowEAIQEAAAA1ACABAAAANQAgC24AAMEBADBvAAA4ABBwAADBAQAwcQEAogEAIYEBQACjAQAhjgEBAKIBACGPAQEAogEAIZEBAADCAZEBIpIBAgDDAQAhkwEAAMQBACCUAUAAowEAIQKSAQAA4AEAIJMBAADgAQAgAwAAADgAIAEAADkAMAIAADUAIAMAAAA4ACABAAA5ADACAAA1ACADAAAAOAAgAQAAOQAwAgAANQAgCHEBAAAAAYEBQAAAAAGOAQEAAAABjwEBAAAAAZEBAAAAkQECkgECAAAAAZMBgAAAAAGUAUAAAAABAQsAAD0AIAhxAQAAAAGBAUAAAAABjgEBAAAAAY8BAQAAAAGRAQAAAJEBApIBAgAAAAGTAYAAAAABlAFAAAAAAQELAAA_ADABCwAAPwAwCHEBAN4BACGBAUAA3wEAIY4BAQDeAQAhjwEBAN4BACGRAQAA7wGRASKSAQIA8AEAIZMBgAAAAAGUAUAA3wEAIQIAAAA1ACALAABCACAIcQEA3gEAIYEBQADfAQAhjgEBAN4BACGPAQEA3gEAIZEBAADvAZEBIpIBAgDwAQAhkwGAAAAAAZQBQADfAQAhAgAAADgAIAsAAEQAIAIAAAA4ACALAABEACADAAAANQAgEgAAPQAgEwAAQgAgAQAAADUAIAEAAAA4ACAHBQAA6gEAIBgAAOsBACAZAADuAQAgGgAA7QEAIBsAAOwBACCSAQAA4AEAIJMBAADgAQAgC24AALgBADBvAABLABBwAAC4AQAwcQEAmgEAIYEBQACbAQAhjgEBAJoBACGPAQEAmgEAIZEBAAC5AZEBIpIBAgC6AQAhkwEAALsBACCUAUAAmwEAIQMAAAA4ACABAABKADAXAABLACADAAAAOAAgAQAAOQAwAgAANQAgCW4AALUBADBvAABRABBwAAC1AQAwfgEAAAABfwEAogEAIYkBAQC2AQAhigFAAKMBACGLAUAAowEAIY0BAAC3AY0BIgEAAABOACABAAAATgAgCW4AALUBADBvAABRABBwAAC1AQAwfgEAogEAIX8BAKIBACGJAQEAtgEAIYoBQACjAQAhiwFAAKMBACGNAQAAtwGNASIBiQEAAOABACADAAAAUQAgAQAAUgAwAgAATgAgAwAAAFEAIAEAAFIAMAIAAE4AIAMAAABRACABAABSADACAABOACAGfgEAAAABfwEAAAABiQEBAAAAAYoBQAAAAAGLAUAAAAABjQEAAACNAQIBCwAAVgAgBn4BAAAAAX8BAAAAAYkBAQAAAAGKAUAAAAABiwFAAAAAAY0BAAAAjQECAQsAAFgAMAELAABYADAGfgEA3gEAIX8BAN4BACGJAQEA6AEAIYoBQADfAQAhiwFAAN8BACGNAQAA6QGNASICAAAATgAgCwAAWwAgBn4BAN4BACF_AQDeAQAhiQEBAOgBACGKAUAA3wEAIYsBQADfAQAhjQEAAOkBjQEiAgAAAFEAIAsAAF0AIAIAAABRACALAABdACADAAAATgAgEgAAVgAgEwAAWwAgAQAAAE4AIAEAAABRACAEBQAA5QEAIBoAAOcBACAbAADmAQAgiQEAAOABACAJbgAArgEAMG8AAGQAEHAAAK4BADB-AQCaAQAhfwEAmgEAIYkBAQCvAQAhigFAAJsBACGLAUAAmwEAIY0BAACwAY0BIgMAAABRACABAABjADAXAABkACADAAAAUQAgAQAAUgAwAgAATgAgCG4AAKsBADBvAABqABBwAACrAQAwfgEAAAABfwEAogEAIYABAACsAQAggQFAAKMBACGCAUAArQEAIQEAAABnACABAAAAZwAgCG4AAKsBADBvAABqABBwAACrAQAwfgEAogEAIX8BAKIBACGAAQAArAEAIIEBQACjAQAhggFAAK0BACEBggEAAOABACADAAAAagAgAQAAawAwAgAAZwAgAwAAAGoAIAEAAGsAMAIAAGcAIAMAAABqACABAABrADACAABnACAFfgEAAAABfwEAAAABgAGAAAAAAYEBQAAAAAGCAUAAAAABAQsAAG8AIAV-AQAAAAF_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_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-AEAIZwBQADkAQAhnQECAPgBACGeAUAA3wEAIQ1-AQDeAQAhgQFAAN8BACGJAQEA6AEAIY4BAQDeAQAhkQEAAPcBmgEilgFAAN8BACGXAUAA3wEAIZgBIAD2AQAhmgFAAOQBACGbAQIA-AEAIZwBQADkAQAhnQECAPgBACGeAUAA3wEAIQ1-AQAAAAGBAUAAAAABiQEBAAAAAY4BAQAAAAGRAQAAAJoBApYBQAAAAAGXAUAAAAABmAEgAAAAAZoBQAAAAAGbAQIAAAABnAFAAAAAAZ0BAgAAAAGeAUAAAAABBBIAAIICADCpAQAAgwIAMKsBAACFAgAgrwEAAIYCADAAAQQAAI8CACANfgEAAAABgQFAAAAAAYkBAQAAAAGOAQEAAAABkQEAAACaAQKWAUAAAAABlwFAAAAAAZgBIAAAAAGaAUAAAAABmwECAAAAAZwBQAAAAAGdAQIAAAABngFAAAAAAQd-AQAAAAGBAUAAAAABnQECAAAAAaABAAAAoAECoQEBAAAAAaIBAgAAAAGjAQIAAAABAgAAAAEAIBIAAJICACADAAAACQAgEgAAkgIAIBMAAJYCACAJAAAACQAgCwAAlgIAIH4BAN4BACGBAUAA3wEAIZ0BAgD4AQAhoAEAAIACoAEioQEBAN4BACGiAQIA-AEAIaMBAgD4AQAhB34BAN4BACGBAUAA3wEAIZ0BAgD4AQAhoAEAAIACoAEioQEBAN4BACGiAQIA-AEAIaMBAgD4AQAhAgQGAgUAAwEDAAEBBAcAAAAABQUACBgACRkAChoACxsADAAAAAAABQUACBgACRkAChoACxsADAEDAAEBAwABBQUAERgAEhkAExoAFBsAFQAAAAAABQUAERgAEhkAExoAFBsAFQAAAAUFABsYABwZAB0aAB4bAB8AAAAAAAUFABsYABwZAB0aAB4bAB8AAAADBQAlGgAmGwAnAAAAAwUAJRoAJhsAJwAAAAMFAC0aAC4bAC8AAAADBQAtGgAuGwAvAAAAAwUANRoANhsANwAAAAMFADUaADYbADcGAgEHCAEICwEJDAEKDQEMDwENEQQOEgUPFAEQFgQRFwYUGAEVGQEWGgQcHQcdHg0eHwIfIAIgIQIhIgIiIwIjJQIkJwQlKA4mKgInLAQoLQ8pLgIqLwIrMAQsMxAtNBYuNhcvNxcwOhcxOxcyPBczPhc0QAQ1QRg2Qxc3RQQ4Rhk5Rxc6SBc7SQQ8TBo9TSA-TyE_UCFAUyFBVCFCVSFDVyFEWQRFWiJGXCFHXgRIXyNJYCFKYSFLYgRMZSRNZihOaClPaSlQbClRbSlSbilTcClUcgRVcypWdSlXdwRYeCtZeSlaeilbewRcfixdfzBegQExX4IBMWCFATFhhgExYocBMWOJATFkiwEEZYwBMmaOATFnkAEEaJEBM2mSATFqkwExa5QBBGyXATRtmAE4"
++  strings: JSON.parse("[\"where\",\"orderBy\",\"cursor\",\"resource\",\"bookings\",\"_count\",\"Resource.findUnique\",\"Resource.findUniqueOrThrow\",\"Resource.findFirst\",\"Resource.findFirstOrThrow\",\"Resource.findMany\",\"data\",\"Resource.createOne\",\"Resource.createMany\",\"Resource.createManyAndReturn\",\"Resource.updateOne\",\"Resource.updateMany\",\"Resource.updateManyAndReturn\",\"create\",\"update\",\"Resource.upsertOne\",\"Resource.deleteOne\",\"Resource.deleteMany\",\"having\",\"_avg\",\"_sum\",\"_min\",\"_max\",\"Resource.groupBy\",\"Resource.aggregate\",\"Booking.findUnique\",\"Booking.findUniqueOrThrow\",\"Booking.findFirst\",\"Booking.findFirstOrThrow\",\"Booking.findMany\",\"Booking.createOne\",\"Booking.createMany\",\"Booking.createManyAndReturn\",\"Booking.updateOne\",\"Booking.updateMany\",\"Booking.updateManyAndReturn\",\"Booking.upsertOne\",\"Booking.deleteOne\",\"Booking.deleteMany\",\"Booking.groupBy\",\"Booking.aggregate\",\"IdempotencyKey.findUnique\",\"IdempotencyKey.findUniqueOrThrow\",\"IdempotencyKey.findFirst\",\"IdempotencyKey.findFirstOrThrow\",\"IdempotencyKey.findMany\",\"IdempotencyKey.createOne\",\"IdempotencyKey.createMany\",\"IdempotencyKey.createManyAndReturn\",\"IdempotencyKey.updateOne\",\"IdempotencyKey.updateMany\",\"IdempotencyKey.updateManyAndReturn\",\"IdempotencyKey.upsertOne\",\"IdempotencyKey.deleteOne\",\"IdempotencyKey.deleteMany\",\"IdempotencyKey.groupBy\",\"IdempotencyKey.aggregate\",\"PaymentEvent.findUnique\",\"PaymentEvent.findUniqueOrThrow\",\"PaymentEvent.findFirst\",\"PaymentEvent.findFirstOrThrow\",\"PaymentEvent.findMany\",\"PaymentEvent.createOne\",\"PaymentEvent.createMany\",\"PaymentEvent.createManyAndReturn\",\"PaymentEvent.updateOne\",\"PaymentEvent.updateMany\",\"PaymentEvent.updateManyAndReturn\",\"PaymentEvent.upsertOne\",\"PaymentEvent.deleteOne\",\"PaymentEvent.deleteMany\",\"PaymentEvent.groupBy\",\"PaymentEvent.aggregate\",\"OutboxEvent.findUnique\",\"OutboxEvent.findUniqueOrThrow\",\"OutboxEvent.findFirst\",\"OutboxEvent.findFirstOrThrow\",\"OutboxEvent.findMany\",\"OutboxEvent.createOne\",\"OutboxEvent.createMany\",\"OutboxEvent.createManyAndReturn\",\"OutboxEvent.updateOne\",\"OutboxEvent.updateMany\",\"OutboxEvent.updateManyAndReturn\",\"OutboxEvent.upsertOne\",\"OutboxEvent.deleteOne\",\"OutboxEvent.deleteMany\",\"OutboxEvent.groupBy\",\"OutboxEvent.aggregate\",\"ProcessedJob.findUnique\",\"ProcessedJob.findUniqueOrThrow\",\"ProcessedJob.findFirst\",\"ProcessedJob.findFirstOrThrow\",\"ProcessedJob.findMany\",\"ProcessedJob.createOne\",\"ProcessedJob.createMany\",\"ProcessedJob.createManyAndReturn\",\"ProcessedJob.updateOne\",\"ProcessedJob.updateMany\",\"ProcessedJob.updateManyAndReturn\",\"ProcessedJob.upsertOne\",\"ProcessedJob.deleteOne\",\"ProcessedJob.deleteMany\",\"ProcessedJob.groupBy\",\"ProcessedJob.aggregate\",\"FakePaymentIntent.findUnique\",\"FakePaymentIntent.findUniqueOrThrow\",\"FakePaymentIntent.findFirst\",\"FakePaymentIntent.findFirstOrThrow\",\"FakePaymentIntent.findMany\",\"FakePaymentIntent.createOne\",\"FakePaymentIntent.createMany\",\"FakePaymentIntent.createManyAndReturn\",\"FakePaymentIntent.updateOne\",\"FakePaymentIntent.updateMany\",\"FakePaymentIntent.updateManyAndReturn\",\"FakePaymentIntent.upsertOne\",\"FakePaymentIntent.deleteOne\",\"FakePaymentIntent.deleteMany\",\"FakePaymentIntent.groupBy\",\"FakePaymentIntent.aggregate\",\"AND\",\"OR\",\"NOT\",\"id\",\"bookingId\",\"amountCents\",\"status\",\"createdAt\",\"equals\",\"in\",\"notIn\",\"lt\",\"lte\",\"gt\",\"gte\",\"not\",\"contains\",\"startsWith\",\"endsWith\",\"key\",\"processedAt\",\"type\",\"payload\",\"publishedAt\",\"string_contains\",\"string_starts_with\",\"string_ends_with\",\"array_starts_with\",\"array_ends_with\",\"array_contains\",\"paymentId\",\"providerCreatedAt\",\"receivedAt\",\"PaymentEventOutcome\",\"outcome\",\"userId\",\"requestHash\",\"IdempotencyStatus\",\"responseStatus\",\"responseBody\",\"expiresAt\",\"resourceId\",\"startsAt\",\"endsAt\",\"exclusive\",\"BookingStatus\",\"holdExpiresAt\",\"paymentLastEventAt\",\"version\",\"updatedAt\",\"ResourceKind\",\"kind\",\"name\",\"capacity\",\"priceCents\",\"every\",\"some\",\"none\",\"is\",\"isNot\",\"connectOrCreate\",\"upsert\",\"createMany\",\"set\",\"disconnect\",\"delete\",\"connect\",\"updateMany\",\"deleteMany\",\"increment\",\"decrement\",\"multiply\",\"divide\"]"),
++  graph: "tgJCcAsEAADxAQAgfgAA7wEAMH8AAAkAEIABAADvAQAwgQEBAAAAAYUBQADAAQAhrgECAL8BACGxAQAA8AGxASKyAQEAvgEAIbMBAgC_AQAhtAECAL8BACEBAAAAAQAgEgMAAPUBACB-AADyAQAwfwAAAwAQgAEAAPIBADCBAQEAvgEAIYMBAgC_AQAhhAEAAPQBrAEihQFAAMABACGcAQEA1QEAIaEBAQC-AQAhpwEBAL4BACGoAUAAwAEAIakBQADAAQAhqgEgAPMBACGsAUAAzAEAIa0BQADMAQAhrgECAL8BACGvAUAAwAEAIQQDAACwAgAgnAEAAIECACCsAQAAgQIAIK0BAACBAgAgEgMAAPUBACB-AADyAQAwfwAAAwAQgAEAAPIBADCBAQEAAAABgwECAL8BACGEAQAA9AGsASKFAUAAwAEAIZwBAQAAAAGhAQEAvgEAIacBAQC-AQAhqAFAAMABACGpAUAAwAEAIaoBIADzAQAhrAFAAMwBACGtAUAAzAEAIa4BAgC_AQAhrwFAAMABACEDAAAAAwAgAQAABAAwAgAABQAgAQAAAAMAIAEAAAABACALBAAA8QEAIH4AAO8BADB_AAAJABCAAQAA7wEAMIEBAQC-AQAhhQFAAMABACGuAQIAvwEAIbEBAADwAbEBIrIBAQC-AQAhswECAL8BACG0AQIAvwEAIQEEAACvAgAgAwAAAAkAIAEAAAoAMAIAAAEAIAMAAAAJACABAAAKADACAAABACADAAAACQAgAQAACgAwAgAAAQAgCAQAAK4CACCBAQEAAAABhQFAAAAAAa4BAgAAAAGxAQAAALEBArIBAQAAAAGzAQIAAAABtAECAAAAAQELAAAOACAHgQEBAAAAAYUBQAAAAAGuAQIAAAABsQEAAACxAQKyAQEAAAABswECAAAAAbQBAgAAAAEBCwAAEAAwAQsAABAAMAgEAAChAgAggQEBAPsBACGFAUAA_QEAIa4BAgD8AQAhsQEAAKACsQEisgEBAPsBACGzAQIA_AEAIbQBAgD8AQAhAgAAAAEAIAsAABMAIAeBAQEA-wEAIYUBQAD9AQAhrgECAPwBACGxAQAAoAKxASKyAQEA-wEAIbMBAgD8AQAhtAECAPwBACECAAAACQAgCwAAFQAgAgAAAAkAIAsAABUAIAMAAAABACASAAAOACATAAATACABAAAAAQAgAQAAAAkAIAUFAACbAgAgGAAAnAIAIBkAAJ8CACAaAACeAgAgGwAAnQIAIAp-AADrAQAwfwAAHAAQgAEAAOsBADCBAQEAswEAIYUBQAC1AQAhrgECALQBACGxAQAA7AGxASKyAQEAswEAIbMBAgC0AQAhtAECALQBACEDAAAACQAgAQAAGwAwFwAAHAAgAwAAAAkAIAEAAAoAMAIAAAEAIAEAAAAFACABAAAABQAgAwAAAAMAIAEAAAQAMAIAAAUAIAMAAAADACABAAAEADACAAAFACADAAAAAwAgAQAABAAwAgAABQAgDwMAAJoCACCBAQEAAAABgwECAAAAAYQBAAAArAEChQFAAAAAAZwBAQAAAAGhAQEAAAABpwEBAAAAAagBQAAAAAGpAUAAAAABqgEgAAAAAawBQAAAAAGtAUAAAAABrgECAAAAAa8BQAAAAAEBCwAAJAAgDoEBAQAAAAGDAQIAAAABhAEAAACsAQKFAUAAAAABnAEBAAAAAaEBAQAAAAGnAQEAAAABqAFAAAAAAakBQAAAAAGqASAAAAABrAFAAAAAAa0BQAAAAAGuAQIAAAABrwFAAAAAAQELAAAmADABCwAAJgAwDwMAAJkCACCBAQEA-wEAIYMBAgD8AQAhhAEAAJgCrAEihQFAAP0BACGcAQEAiQIAIaEBAQD7AQAhpwEBAPsBACGoAUAA_QEAIakBQAD9AQAhqgEgAJcCACGsAUAAhQIAIa0BQACFAgAhrgECAPwBACGvAUAA_QEAIQIAAAAFACALAAApACAOgQEBAPsBACGDAQIA_AEAIYQBAACYAqwBIoUBQAD9AQAhnAEBAIkCACGhAQEA-wEAIacBAQD7AQAhqAFAAP0BACGpAUAA_QEAIaoBIACXAgAhrAFAAIUCACGtAUAAhQIAIa4BAgD8AQAhrwFAAP0BACECAAAAAwAgCwAAKwAgAgAAAAMAIAsAACsAIAMAAAAFACASAAAkACATAAApACABAAAABQAgAQAAAAMAIAgFAACSAgAgGAAAkwIAIBkAAJYCACAaAACVAgAgGwAAlAIAIJwBAACBAgAgrAEAAIECACCtAQAAgQIAIBF-AADkAQAwfwAAMgAQgAEAAOQBADCBAQEAswEAIYMBAgC0AQAhhAEAAOYBrAEihQFAALUBACGcAQEAzgEAIaEBAQCzAQAhpwEBALMBACGoAUAAtQEAIakBQAC1AQAhqgEgAOUBACGsAUAAxQEAIa0BQADFAQAhrgECALQBACGvAUAAtQEAIQMAAAADACABAAAxADAXAAAyACADAAAAAwAgAQAABAAwAgAABQAgC34AAOABADB_AAA4ABCAAQAA4AEAMIQBAADhAaQBIoUBQADAAQAhkQEBAAAAAaEBAQC-AQAhogEBAL4BACGkAQIA4gEAIaUBAADjAQAgpgFAAMABACEBAAAANQAgAQAAADUAIAt-AADgAQAwfwAAOAAQgAEAAOABADCEAQAA4QGkASKFAUAAwAEAIZEBAQC-AQAhoQEBAL4BACGiAQEAvgEAIaQBAgDiAQAhpQEAAOMBACCmAUAAwAEAIQKkAQAAgQIAIKUBAACBAgAgAwAAADgAIAEAADkAMAIAADUAIAMAAAA4ACABAAA5ADACAAA1ACADAAAAOAAgAQAAOQAwAgAANQAgCIQBAAAApAEChQFAAAAAAZEBAQAAAAGhAQEAAAABogEBAAAAAaQBAgAAAAGlAYAAAAABpgFAAAAAAQELAAA9ACAIhAEAAACkAQKFAUAAAAABkQEBAAAAAaEBAQAAAAGiAQEAAAABpAECAAAAAaUBgAAAAAGmAUAAAAABAQsAAD8AMAELAAA_ADAIhAEAAJACpAEihQFAAP0BACGRAQEA-wEAIaEBAQD7AQAhogEBAPsBACGkAQIAkQIAIaUBgAAAAAGmAUAA_QEAIQIAAAA1ACALAABCACAIhAEAAJACpAEihQFAAP0BACGRAQEA-wEAIaEBAQD7AQAhogEBAPsBACGkAQIAkQIAIaUBgAAAAAGmAUAA_QEAIQIAAAA4ACALAABEACACAAAAOAAgCwAARAAgAwAAADUAIBIAAD0AIBMAAEIAIAEAAAA1ACABAAAAOAAgBwUAAIsCACAYAACMAgAgGQAAjwIAIBoAAI4CACAbAACNAgAgpAEAAIECACClAQAAgQIAIAt-AADXAQAwfwAASwAQgAEAANcBADCEAQAA2AGkASKFAUAAtQEAIZEBAQCzAQAhoQEBALMBACGiAQEAswEAIaQBAgDZAQAhpQEAANoBACCmAUAAtQEAIQMAAAA4ACABAABKADAXAABLACADAAAAOAAgAQAAOQAwAgAANQAgCX4AANQBADB_AABRABCAAQAA1AEAMIEBAQAAAAGTAQEAvgEAIZwBAQDVAQAhnQFAAMABACGeAUAAwAEAIaABAADWAaABIgEAAABOACABAAAATgAgCX4AANQBADB_AABRABCAAQAA1AEAMIEBAQC-AQAhkwEBAL4BACGcAQEA1QEAIZ0BQADAAQAhngFAAMABACGgAQAA1gGgASIBnAEAAIECACADAAAAUQAgAQAAUgAwAgAATgAgAwAAAFEAIAEAAFIAMAIAAE4AIAMAAABRACABAABSADACAABOACAGgQEBAAAAAZMBAQAAAAGcAQEAAAABnQFAAAAAAZ4BQAAAAAGgAQAAAKABAgELAABWACAGgQEBAAAAAZMBAQAAAAGcAQEAAAABnQFAAAAAAZ4BQAAAAAGgAQAAAKABAgELAABYADABCwAAWAAwBoEBAQD7AQAhkwEBAPsBACGcAQEAiQIAIZ0BQAD9AQAhngFAAP0BACGgAQAAigKgASICAAAATgAgCwAAWwAgBoEBAQD7AQAhkwEBAPsBACGcAQEAiQIAIZ0BQAD9AQAhngFAAP0BACGgAQAAigKgASICAAAAUQAgCwAAXQAgAgAAAFEAIAsAAF0AIAMAAABOACASAABWACATAABbACABAAAATgAgAQAAAFEAIAQFAACGAgAgGgAAiAIAIBsAAIcCACCcAQAAgQIAIAl-AADNAQAwfwAAZAAQgAEAAM0BADCBAQEAswEAIZMBAQCzAQAhnAEBAM4BACGdAUAAtQEAIZ4BQAC1AQAhoAEAAM8BoAEiAwAAAFEAIAEAAGMAMBcAAGQAIAMAAABRACABAABSADACAABOACAIfgAAygEAMH8AAGoAEIABAADKAQAwgQEBAAAAAYUBQADAAQAhkwEBAL4BACGUAQAAywEAIJUBQADMAQAhAQAAAGcAIAEAAABnACAIfgAAygEAMH8AAGoAEIABAADKAQAwgQEBAL4BACGFAUAAwAEAIZMBAQC-AQAhlAEAAMsBACCVAUAAzAEAIQGVAQAAgQIAIAMAAABqACABAABrADACAABnACADAAAAagAgAQAAawAwAgAAZwAgAwAAAGoAIAEAAGsAMAIAAGcAIAWBAQEAAAABhQFAAAAAAZMBAQAAAAGUAYAAAAABlQFAAAAAAQELAABvACAFgQEBAAAAAYUBQAAAAAGTAQEAAAABlAGAAAAAAZUBQAAAAAEBCwAAcQAwAQsAAHEAMAWBAQEA-wEAIYUBQAD9AQAhkwEBAPsBACGUAYAAAAABlQFAAIUCACECAAAAZwAgCwAAdAAgBYEBAQD7AQAhhQFAAP0BACGTAQEA-wEAIZQBgAAAAAGVAUAAhQIAIQIAAABqACALAAB2ACACAAAAagAgCwAAdgAgAwAAAGcAIBIAAG8AIBMAAHQAIAEAAABnACABAAAAagAgBAUAAIICACAaAACEAgAgGwAAgwIAIJUBAACBAgAgCH4AAMMBADB_AAB9ABCAAQAAwwEAMIEBAQCzAQAhhQFAALUBACGTAQEAswEAIZQBAADEAQAglQFAAMUBACEDAAAAagAgAQAAfAAwFwAAfQAgAwAAAGoAIAEAAGsAMAIAAGcAIAV-AADCAQAwfwAAgwEAEIABAADCAQAwkQEBAAAAAZIBQADAAQAhAQAAAIABACABAAAAgAEAIAV-AADCAQAwfwAAgwEAEIABAADCAQAwkQEBAL4BACGSAUAAwAEAIQADAAAAgwEAIAEAAIQBADACAACAAQAgAwAAAIMBACABAACEAQAwAgAAgAEAIAMAAACDAQAgAQAAhAEAMAIAAIABACACkQEBAAAAAZIBQAAAAAEBCwAAiAEAIAKRAQEAAAABkgFAAAAAAQELAACKAQAwAQsAAIoBADACkQEBAPsBACGSAUAA_QEAIQIAAACAAQAgCwAAjQEAIAKRAQEA-wEAIZIBQAD9AQAhAgAAAIMBACALAACPAQAgAgAAAIMBACALAACPAQAgAwAAAIABACASAACIAQAgEwAAjQEAIAEAAACAAQAgAQAAAIMBACADBQAA_gEAIBoAAIACACAbAAD_AQAgBX4AAMEBADB_AACWAQAQgAEAAMEBADCRAQEAswEAIZIBQAC1AQAhAwAAAIMBACABAACVAQAwFwAAlgEAIAMAAACDAQAgAQAAhAEAMAIAAIABACAIfgAAvQEAMH8AAJwBABCAAQAAvQEAMIEBAQAAAAGCAQEAvgEAIYMBAgC_AQAhhAEBAL4BACGFAUAAwAEAIQEAAACZAQAgAQAAAJkBACAIfgAAvQEAMH8AAJwBABCAAQAAvQEAMIEBAQC-AQAhggEBAL4BACGDAQIAvwEAIYQBAQC-AQAhhQFAAMABACEAAwAAAJwBACABAACdAQAwAgAAmQEAIAMAAACcAQAgAQAAnQEAMAIAAJkBACADAAAAnAEAIAEAAJ0BADACAACZAQAgBYEBAQAAAAGCAQEAAAABgwECAAAAAYQBAQAAAAGFAUAAAAABAQsAAKEBACAFgQEBAAAAAYIBAQAAAAGDAQIAAAABhAEBAAAAAYUBQAAAAAEBCwAAowEAMAELAACjAQAwBYEBAQD7AQAhggEBAPsBACGDAQIA_AEAIYQBAQD7AQAhhQFAAP0BACECAAAAmQEAIAsAAKYBACAFgQEBAPsBACGCAQEA-wEAIYMBAgD8AQAhhAEBAPsBACGFAUAA_QEAIQIAAACcAQAgCwAAqAEAIAIAAACcAQAgCwAAqAEAIAMAAACZAQAgEgAAoQEAIBMAAKYBACABAAAAmQEAIAEAAACcAQAgBQUAAPYBACAYAAD3AQAgGQAA-gEAIBoAAPkBACAbAAD4AQAgCH4AALIBADB_AACvAQAQgAEAALIBADCBAQEAswEAIYIBAQCzAQAhgwECALQBACGEAQEAswEAIYUBQAC1AQAhAwAAAJwBACABAACuAQAwFwAArwEAIAMAAACcAQAgAQAAnQEAMAIAAJkBACAIfgAAsgEAMH8AAK8BABCAAQAAsgEAMIEBAQCzAQAhggEBALMBACGDAQIAtAEAIYQBAQCzAQAhhQFAALUBACEOBQAAtwEAIBoAALwBACAbAAC8AQAghgEBAAAAAYcBAQAAAASIAQEAAAAEiQEBAAAAAYoBAQAAAAGLAQEAAAABjAEBAAAAAY0BAQC7AQAhjgEBAAAAAY8BAQAAAAGQAQEAAAABDQUAALcBACAYAAC6AQAgGQAAtwEAIBoAALcBACAbAAC3AQAghgECAAAAAYcBAgAAAASIAQIAAAAEiQECAAAAAYoBAgAAAAGLAQIAAAABjAECAAAAAY0BAgC5AQAhCwUAALcBACAaAAC4AQAgGwAAuAEAIIYBQAAAAAGHAUAAAAAEiAFAAAAABIkBQAAAAAGKAUAAAAABiwFAAAAAAYwBQAAAAAGNAUAAtgEAIQsFAAC3AQAgGgAAuAEAIBsAALgBACCGAUAAAAABhwFAAAAABIgBQAAAAASJAUAAAAABigFAAAAAAYsBQAAAAAGMAUAAAAABjQFAALYBACEIhgECAAAAAYcBAgAAAASIAQIAAAAEiQECAAAAAYoBAgAAAAGLAQIAAAABjAECAAAAAY0BAgC3AQAhCIYBQAAAAAGHAUAAAAAEiAFAAAAABIkBQAAAAAGKAUAAAAABiwFAAAAAAYwBQAAAAAGNAUAAuAEAIQ0FAAC3AQAgGAAAugEAIBkAALcBACAaAAC3AQAgGwAAtwEAIIYBAgAAAAGHAQIAAAAEiAECAAAABIkBAgAAAAGKAQIAAAABiwECAAAAAYwBAgAAAAGNAQIAuQEAIQiGAQgAAAABhwEIAAAABIgBCAAAAASJAQgAAAABigEIAAAAAYsBCAAAAAGMAQgAAAABjQEIALoBACEOBQAAtwEAIBoAALwBACAbAAC8AQAghgEBAAAAAYcBAQAAAASIAQEAAAAEiQEBAAAAAYoBAQAAAAGLAQEAAAABjAEBAAAAAY0BAQC7AQAhjgEBAAAAAY8BAQAAAAGQAQEAAAABC4YBAQAAAAGHAQEAAAAEiAEBAAAABIkBAQAAAAGKAQEAAAABiwEBAAAAAYwBAQAAAAGNAQEAvAEAIY4BAQAAAAGPAQEAAAABkAEBAAAAAQh-AAC9AQAwfwAAnAEAEIABAAC9AQAwgQEBAL4BACGCAQEAvgEAIYMBAgC_AQAhhAEBAL4BACGFAUAAwAEAIQuGAQEAAAABhwEBAAAABIgBAQAAAASJAQEAAAABigEBAAAAAYsBAQAAAAGMAQEAAAABjQEBALwBACGOAQEAAAABjwEBAAAAAZABAQAAAAEIhgECAAAAAYcBAgAAAASIAQIAAAAEiQECAAAAAYoBAgAAAAGLAQIAAAABjAECAAAAAY0BAgC3AQAhCIYBQAAAAAGHAUAAAAAEiAFAAAAABIkBQAAAAAGKAUAAAAABiwFAAAAAAYwBQAAAAAGNAUAAuAEAIQV-AADBAQAwfwAAlgEAEIABAADBAQAwkQEBALMBACGSAUAAtQEAIQV-AADCAQAwfwAAgwEAEIABAADCAQAwkQEBAL4BACGSAUAAwAEAIQh-AADDAQAwfwAAfQAQgAEAAMMBADCBAQEAswEAIYUBQAC1AQAhkwEBALMBACGUAQAAxAEAIJUBQADFAQAhDwUAALcBACAaAADJAQAgGwAAyQEAIIYBgAAAAAGJAYAAAAABigGAAAAAAYsBgAAAAAGMAYAAAAABjQGAAAAAAZYBAQAAAAGXAQEAAAABmAEBAAAAAZkBgAAAAAGaAYAAAAABmwGAAAAAAQsFAADHAQAgGgAAyAEAIBsAAMgBACCGAUAAAAABhwFAAAAABYgBQAAAAAWJAUAAAAABigFAAAAAAYsBQAAAAAGMAUAAAAABjQFAAMYBACELBQAAxwEAIBoAAMgBACAbAADIAQAghgFAAAAAAYcBQAAAAAWIAUAAAAAFiQFAAAAAAYoBQAAAAAGLAUAAAAABjAFAAAAAAY0BQADGAQAhCIYBAgAAAAGHAQIAAAAFiAECAAAABYkBAgAAAAGKAQIAAAABiwECAAAAAYwBAgAAAAGNAQIAxwEAIQiGAUAAAAABhwFAAAAABYgBQAAAAAWJAUAAAAABigFAAAAAAYsBQAAAAAGMAUAAAAABjQFAAMgBACEMhgGAAAAAAYkBgAAAAAGKAYAAAAABiwGAAAAAAYwBgAAAAAGNAYAAAAABlgEBAAAAAZcBAQAAAAGYAQEAAAABmQGAAAAAAZoBgAAAAAGbAYAAAAABCH4AAMoBADB_AABqABCAAQAAygEAMIEBAQC-AQAhhQFAAMABACGTAQEAvgEAIZQBAADLAQAglQFAAMwBACEMhgGAAAAAAYkBgAAAAAGKAYAAAAABiwGAAAAAAYwBgAAAAAGNAYAAAAABlgEBAAAAAZcBAQAAAAGYAQEAAAABmQGAAAAAAZoBgAAAAAGbAYAAAAABCIYBQAAAAAGHAUAAAAAFiAFAAAAABYkBQAAAAAGKAUAAAAABiwFAAAAAAYwBQAAAAAGNAUAAyAEAIQl-AADNAQAwfwAAZAAQgAEAAM0BADCBAQEAswEAIZMBAQCzAQAhnAEBAM4BACGdAUAAtQEAIZ4BQAC1AQAhoAEAAM8BoAEiDgUAAMcBACAaAADTAQAgGwAA0wEAIIYBAQAAAAGHAQEAAAAFiAEBAAAABYkBAQAAAAGKAQEAAAABiwEBAAAAAYwBAQAAAAGNAQEA0gEAIY4BAQAAAAGPAQEAAAABkAEBAAAAAQcFAAC3AQAgGgAA0QEAIBsAANEBACCGAQAAAKABAocBAAAAoAEIiAEAAACgAQiNAQAA0AGgASIHBQAAtwEAIBoAANEBACAbAADRAQAghgEAAACgAQKHAQAAAKABCIgBAAAAoAEIjQEAANABoAEiBIYBAAAAoAEChwEAAACgAQiIAQAAAKABCI0BAADRAaABIg4FAADHAQAgGgAA0wEAIBsAANMBACCGAQEAAAABhwEBAAAABYgBAQAAAAWJAQEAAAABigEBAAAAAYsBAQAAAAGMAQEAAAABjQEBANIBACGOAQEAAAABjwEBAAAAAZABAQAAAAELhgEBAAAAAYcBAQAAAAWIAQEAAAAFiQEBAAAAAYoBAQAAAAGLAQEAAAABjAEBAAAAAY0BAQDTAQAhjgEBAAAAAY8BAQAAAAGQAQEAAAABCX4AANQBADB_AABRABCAAQAA1AEAMIEBAQC-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_AAAJABCAAQAA7wEAMIEBAQC-AQAhhQFAAMABACGuAQIAvwEAIbEBAADwAbEBIrIBAQC-AQAhswECAL8BACG0AQIAvwEAIQSGAQAAALEBAocBAAAAsQEIiAEAAACxAQiNAQAA7gGxASIDtQEAAAMAILYBAAADACC3AQAAAwAgEgMAAPUBACB-AADyAQAwfwAAAwAQgAEAAPIBADCBAQEAvgEAIYMBAgC_AQAhhAEAAPQBrAEihQFAAMABACGcAQEA1QEAIaEBAQC-AQAhpwEBAL4BACGoAUAAwAEAIakBQADAAQAhqgEgAPMBACGsAUAAzAEAIa0BQADMAQAhrgECAL8BACGvAUAAwAEAIQKGASAAAAABjQEgAOoBACEEhgEAAACsAQKHAQAAAKwBCIgBAAAArAEIjQEAAOgBrAEiDQQAAPEBACB-AADvAQAwfwAACQAQgAEAAO8BADCBAQEAvgEAIYUBQADAAQAhrgECAL8BACGxAQAA8AGxASKyAQEAvgEAIbMBAgC_AQAhtAECAL8BACG4AQAACQAguQEAAAkAIAAAAAAAAb0BAQAAAAEFvQECAAAAAcMBAgAAAAHEAQIAAAABxQECAAAAAcYBAgAAAAEBvQFAAAAAAQAAAAAAAAABvQFAAAAAAQAAAAG9AQEAAAABAb0BAAAAoAECAAAAAAABvQEAAACkAQIFvQECAAAAAcMBAgAAAAHEAQIAAAABxQECAAAAAcYBAgAAAAEAAAAAAAG9ASAAAAABAb0BAAAArAECBRIAALICACATAAC1AgAgugEAALMCACC7AQAAtAIAIMABAAABACADEgAAsgIAILoBAACzAgAgwAEAAAEAIAAAAAAAAb0BAAAAsQECCxIAAKICADATAACnAgAwugEAAKMCADC7AQAApAIAMLwBAAClAgAgvQEAAKYCADC-AQAApgIAML8BAACmAgAwwAEAAKYCADDBAQAAqAIAMMIBAACpAgAwDYEBAQAAAAGDAQIAAAABhAEAAACsAQKFAUAAAAABnAEBAAAAAaEBAQAAAAGoAUAAAAABqQFAAAAAAaoBIAAAAAGsAUAAAAABrQFAAAAAAa4BAgAAAAGvAUAAAAABAgAAAAUAIBIAAK0CACADAAAABQAgEgAArQIAIBMAAKwCACABCwAAsQIAMBIDAAD1AQAgfgAA8gEAMH8AAAMAEIABAADyAQAwgQEBAAAAAYMBAgC_AQAhhAEAAPQBrAEihQFAAMABACGcAQEAAAABoQEBAL4BACGnAQEAvgEAIagBQADAAQAhqQFAAMABACGqASAA8wEAIawBQADMAQAhrQFAAMwBACGuAQIAvwEAIa8BQADAAQAhAgAAAAUAIAsAAKwCACACAAAAqgIAIAsAAKsCACARfgAAqQIAMH8AAKoCABCAAQAAqQIAMIEBAQC-AQAhgwECAL8BACGEAQAA9AGsASKFAUAAwAEAIZwBAQDVAQAhoQEBAL4BACGnAQEAvgEAIagBQADAAQAhqQFAAMABACGqASAA8wEAIawBQADMAQAhrQFAAMwBACGuAQIAvwEAIa8BQADAAQAhEX4AAKkCADB_AACqAgAQgAEAAKkCADCBAQEAvgEAIYMBAgC_AQAhhAEAAPQBrAEihQFAAMABACGcAQEA1QEAIaEBAQC-AQAhpwEBAL4BACGoAUAAwAEAIakBQADAAQAhqgEgAPMBACGsAUAAzAEAIa0BQADMAQAhrgECAL8BACGvAUAAwAEAIQ2BAQEA-wEAIYMBAgD8AQAhhAEAAJgCrAEihQFAAP0BACGcAQEAiQIAIaEBAQD7AQAhqAFAAP0BACGpAUAA_QEAIaoBIACXAgAhrAFAAIUCACGtAUAAhQIAIa4BAgD8AQAhrwFAAP0BACENgQEBAPsBACGDAQIA_AEAIYQBAACYAqwBIoUBQAD9AQAhnAEBAIkCACGhAQEA-wEAIagBQAD9AQAhqQFAAP0BACGqASAAlwIAIawBQACFAgAhrQFAAIUCACGuAQIA_AEAIa8BQAD9AQAhDYEBAQAAAAGDAQIAAAABhAEAAACsAQKFAUAAAAABnAEBAAAAAaEBAQAAAAGoAUAAAAABqQFAAAAAAaoBIAAAAAGsAUAAAAABrQFAAAAAAa4BAgAAAAGvAUAAAAABBBIAAKICADC6AQAAowIAMLwBAAClAgAgwAEAAKYCADAAAQQAAK8CACANgQEBAAAAAYMBAgAAAAGEAQAAAKwBAoUBQAAAAAGcAQEAAAABoQEBAAAAAagBQAAAAAGpAUAAAAABqgEgAAAAAawBQAAAAAGtAUAAAAABrgECAAAAAa8BQAAAAAEHgQEBAAAAAYUBQAAAAAGuAQIAAAABsQEAAACxAQKyAQEAAAABswECAAAAAbQBAgAAAAECAAAAAQAgEgAAsgIAIAMAAAAJACASAACyAgAgEwAAtgIAIAkAAAAJACALAAC2AgAggQEBAPsBACGFAUAA_QEAIa4BAgD8AQAhsQEAAKACsQEisgEBAPsBACGzAQIA_AEAIbQBAgD8AQAhB4EBAQD7AQAhhQFAAP0BACGuAQIA_AEAIbEBAACgArEBIrIBAQD7AQAhswECAPwBACG0AQIA_AEAIQIEBgIFAAMBAwABAQQHAAAAAAUFAAgYAAkZAAoaAAsbAAwAAAAAAAUFAAgYAAkZAAoaAAsbAAwBAwABAQMAAQUFABEYABIZABMaABQbABUAAAAAAAUFABEYABIZABMaABQbABUAAAAFBQAbGAAcGQAdGgAeGwAfAAAAAAAFBQAbGAAcGQAdGgAeGwAfAAAAAwUAJRoAJhsAJwAAAAMFACUaACYbACcAAAADBQAtGgAuGwAvAAAAAwUALRoALhsALwAAAAMFADUaADYbADcAAAADBQA1GgA2GwA3AAAABQUAPRgAPhkAPxoAQBsAQQAAAAAABQUAPRgAPhkAPxoAQBsAQQYCAQcIAQgLAQkMAQoNAQwPAQ0RBA4SBQ8UARAWBBEXBhQYARUZARYaBBwdBx0eDR4fAh8gAiAhAiEiAiIjAiMlAiQnBCUoDiYqAicsBCgtDykuAiovAiswBCwzEC00Fi42Fy83FzA6FzE7FzI8FzM-FzRABDVBGDZDFzdFBDhGGTlHFzpIFztJBDxMGj1NID5PIT9QIUBTIUFUIUJVIUNXIURZBEVaIkZcIUdeBEhfI0lgIUphIUtiBExlJE1mKE5oKU9pKVBsKVFtKVJuKVNwKVRyBFVzKlZ1KVd3BFh4K1l5KVp6KVt7BFx-LF1_MF6BATFfggExYIUBMWGGATFihwExY4kBMWSLAQRljAEyZo4BMWeQAQRokQEzaZIBMWqTATFrlAEEbJcBNG2YAThumgE5b5sBOXCeATlxnwE5cqABOXOiATl0pAEEdaUBOnanATl3qQEEeKoBO3mrATl6rAE5e60BBHywATx9sQFC"
+ }
+ 
+ async function decodeBase64AsWasm(wasmBase64: string): Promise<WebAssembly.Module> {
+@@ -247,6 +247,16 @@ export interface PrismaClient<
+     * ```
+     */
+   get processedJob(): Prisma.ProcessedJobDelegate<ExtArgs, { omit: OmitOpts }>;
++
++  /**
++   * `prisma.fakePaymentIntent`: Exposes CRUD operations for the **FakePaymentIntent** model.
++    * Example usage:
++    * ```ts
++    * // Fetch zero or more FakePaymentIntents
++    * const fakePaymentIntents = await prisma.fakePaymentIntent.findMany()
++    * ```
++    */
++  get fakePaymentIntent(): Prisma.FakePaymentIntentDelegate<ExtArgs, { omit: OmitOpts }>;
+ }
+ 
+ export function getPrismaClientClass(): PrismaClientConstructor {
+diff --git a/src/generated/prisma/internal/prismaNamespace.ts b/src/generated/prisma/internal/prismaNamespace.ts
+index 93fb761..6e61155 100644
+--- a/src/generated/prisma/internal/prismaNamespace.ts
++++ b/src/generated/prisma/internal/prismaNamespace.ts
+@@ -402,7 +402,8 @@ export const ModelName = {
+   IdempotencyKey: 'IdempotencyKey',
+   PaymentEvent: 'PaymentEvent',
+   OutboxEvent: 'OutboxEvent',
+-  ProcessedJob: 'ProcessedJob'
++  ProcessedJob: 'ProcessedJob',
++  FakePaymentIntent: 'FakePaymentIntent'
+ } as const
+ 
+ export type ModelName = (typeof ModelName)[keyof typeof ModelName]
+@@ -418,7 +419,7 @@ export type TypeMap<ExtArgs extends runtime.Types.Extensions.InternalArgs = runt
+     omit: GlobalOmitOptions
+   }
+   meta: {
+-    modelProps: "resource" | "booking" | "idempotencyKey" | "paymentEvent" | "outboxEvent" | "processedJob"
++    modelProps: "resource" | "booking" | "idempotencyKey" | "paymentEvent" | "outboxEvent" | "processedJob" | "fakePaymentIntent"
+     txIsolationLevel: TransactionIsolationLevel
+   }
+   model: {
+@@ -866,6 +867,80 @@ export type TypeMap<ExtArgs extends runtime.Types.Extensions.InternalArgs = runt
+         }
+       }
+     }
++    FakePaymentIntent: {
++      payload: Prisma.$FakePaymentIntentPayload<ExtArgs>
++      fields: Prisma.FakePaymentIntentFieldRefs
++      operations: {
++        findUnique: {
++          args: Prisma.FakePaymentIntentFindUniqueArgs<ExtArgs>
++          result: runtime.Types.Utils.PayloadToResult<Prisma.$FakePaymentIntentPayload> | null
++        }
++        findUniqueOrThrow: {
++          args: Prisma.FakePaymentIntentFindUniqueOrThrowArgs<ExtArgs>
++          result: runtime.Types.Utils.PayloadToResult<Prisma.$FakePaymentIntentPayload>
++        }
++        findFirst: {
++          args: Prisma.FakePaymentIntentFindFirstArgs<ExtArgs>
++          result: runtime.Types.Utils.PayloadToResult<Prisma.$FakePaymentIntentPayload> | null
++        }
++        findFirstOrThrow: {
++          args: Prisma.FakePaymentIntentFindFirstOrThrowArgs<ExtArgs>
++          result: runtime.Types.Utils.PayloadToResult<Prisma.$FakePaymentIntentPayload>
++        }
++        findMany: {
++          args: Prisma.FakePaymentIntentFindManyArgs<ExtArgs>
++          result: runtime.Types.Utils.PayloadToResult<Prisma.$FakePaymentIntentPayload>[]
++        }
++        create: {
++          args: Prisma.FakePaymentIntentCreateArgs<ExtArgs>
++          result: runtime.Types.Utils.PayloadToResult<Prisma.$FakePaymentIntentPayload>
++        }
++        createMany: {
++          args: Prisma.FakePaymentIntentCreateManyArgs<ExtArgs>
++          result: BatchPayload
++        }
++        createManyAndReturn: {
++          args: Prisma.FakePaymentIntentCreateManyAndReturnArgs<ExtArgs>
++          result: runtime.Types.Utils.PayloadToResult<Prisma.$FakePaymentIntentPayload>[]
++        }
++        delete: {
++          args: Prisma.FakePaymentIntentDeleteArgs<ExtArgs>
++          result: runtime.Types.Utils.PayloadToResult<Prisma.$FakePaymentIntentPayload>
++        }
++        update: {
++          args: Prisma.FakePaymentIntentUpdateArgs<ExtArgs>
++          result: runtime.Types.Utils.PayloadToResult<Prisma.$FakePaymentIntentPayload>
++        }
++        deleteMany: {
++          args: Prisma.FakePaymentIntentDeleteManyArgs<ExtArgs>
++          result: BatchPayload
++        }
++        updateMany: {
++          args: Prisma.FakePaymentIntentUpdateManyArgs<ExtArgs>
++          result: BatchPayload
++        }
++        updateManyAndReturn: {
++          args: Prisma.FakePaymentIntentUpdateManyAndReturnArgs<ExtArgs>
++          result: runtime.Types.Utils.PayloadToResult<Prisma.$FakePaymentIntentPayload>[]
++        }
++        upsert: {
++          args: Prisma.FakePaymentIntentUpsertArgs<ExtArgs>
++          result: runtime.Types.Utils.PayloadToResult<Prisma.$FakePaymentIntentPayload>
++        }
++        aggregate: {
++          args: Prisma.FakePaymentIntentAggregateArgs<ExtArgs>
++          result: runtime.Types.Utils.Optional<Prisma.AggregateFakePaymentIntent>
++        }
++        groupBy: {
++          args: Prisma.FakePaymentIntentGroupByArgs<ExtArgs>
++          result: runtime.Types.Utils.Optional<Prisma.FakePaymentIntentGroupByOutputType>[]
++        }
++        count: {
++          args: Prisma.FakePaymentIntentCountArgs<ExtArgs>
++          result: runtime.Types.Utils.Optional<Prisma.FakePaymentIntentCountAggregateOutputType> | number
++        }
++      }
++    }
+   }
+ } & {
+   other: {
+@@ -983,6 +1058,17 @@ export const ProcessedJobScalarFieldEnum = {
+ export type ProcessedJobScalarFieldEnum = (typeof ProcessedJobScalarFieldEnum)[keyof typeof ProcessedJobScalarFieldEnum]
+ 
+ 
++export const FakePaymentIntentScalarFieldEnum = {
++  id: 'id',
++  bookingId: 'bookingId',
++  amountCents: 'amountCents',
++  status: 'status',
++  createdAt: 'createdAt'
++} as const
++
++export type FakePaymentIntentScalarFieldEnum = (typeof FakePaymentIntentScalarFieldEnum)[keyof typeof FakePaymentIntentScalarFieldEnum]
++
++
+ export const SortOrder = {
+   asc: 'asc',
+   desc: 'desc'
+@@ -1326,6 +1412,7 @@ export type GlobalOmitConfig = {
+   paymentEvent?: Prisma.PaymentEventOmit
+   outboxEvent?: Prisma.OutboxEventOmit
+   processedJob?: Prisma.ProcessedJobOmit
++  fakePaymentIntent?: Prisma.FakePaymentIntentOmit
+ }
+ 
+ /* Types for Logging */
+diff --git a/src/generated/prisma/internal/prismaNamespaceBrowser.ts b/src/generated/prisma/internal/prismaNamespaceBrowser.ts
+index 5032df0..06c8424 100644
+--- a/src/generated/prisma/internal/prismaNamespaceBrowser.ts
++++ b/src/generated/prisma/internal/prismaNamespaceBrowser.ts
+@@ -56,7 +56,8 @@ export const ModelName = {
+   IdempotencyKey: 'IdempotencyKey',
+   PaymentEvent: 'PaymentEvent',
+   OutboxEvent: 'OutboxEvent',
+-  ProcessedJob: 'ProcessedJob'
++  ProcessedJob: 'ProcessedJob',
++  FakePaymentIntent: 'FakePaymentIntent'
+ } as const
+ 
+ export type ModelName = (typeof ModelName)[keyof typeof ModelName]
+@@ -153,6 +154,17 @@ export const ProcessedJobScalarFieldEnum = {
+ export type ProcessedJobScalarFieldEnum = (typeof ProcessedJobScalarFieldEnum)[keyof typeof ProcessedJobScalarFieldEnum]
+ 
+ 
++export const FakePaymentIntentScalarFieldEnum = {
++  id: 'id',
++  bookingId: 'bookingId',
++  amountCents: 'amountCents',
++  status: 'status',
++  createdAt: 'createdAt'
++} as const
++
++export type FakePaymentIntentScalarFieldEnum = (typeof FakePaymentIntentScalarFieldEnum)[keyof typeof FakePaymentIntentScalarFieldEnum]
++
++
+ export const SortOrder = {
+   asc: 'asc',
+   desc: 'desc'
+diff --git a/src/generated/prisma/models.ts b/src/generated/prisma/models.ts
+index 5763b7b..35f8fc4 100644
+--- a/src/generated/prisma/models.ts
++++ b/src/generated/prisma/models.ts
+@@ -14,4 +14,5 @@ export type * from './models/IdempotencyKey.js'
+ export type * from './models/PaymentEvent.js'
+ export type * from './models/OutboxEvent.js'
+ export type * from './models/ProcessedJob.js'
++export type * from './models/FakePaymentIntent.js'
+ export type * from './commonInputTypes.js'
+\ No newline at end of file
+diff --git a/src/generated/prisma/models/FakePaymentIntent.ts b/src/generated/prisma/models/FakePaymentIntent.ts
+new file mode 100644
+index 0000000..54854d7
+--- /dev/null
++++ b/src/generated/prisma/models/FakePaymentIntent.ts
+@@ -0,0 +1,1193 @@
++
++/* !!! This is code generated by Prisma. Do not edit directly. !!! */
++/* eslint-disable */
++// biome-ignore-all lint: generated file
++// @ts-nocheck 
++/*
++ * This file exports the `FakePaymentIntent` model and its related types.
++ *
++ * 🟢 You can import this file directly.
++ */
++import type * as runtime from "@prisma/client/runtime/client"
++import type * as $Enums from "../enums.js"
++import type * as Prisma from "../internal/prismaNamespace.js"
++
++/**
++ * Model FakePaymentIntent
++ * The in-process PSP's intents, in the database so the API and the worker see the same ones.
++ */
++export type FakePaymentIntentModel = runtime.Types.Result.DefaultSelection<Prisma.$FakePaymentIntentPayload>
++
++export type AggregateFakePaymentIntent = {
++  _count: FakePaymentIntentCountAggregateOutputType | null
++  _avg: FakePaymentIntentAvgAggregateOutputType | null
++  _sum: FakePaymentIntentSumAggregateOutputType | null
++  _min: FakePaymentIntentMinAggregateOutputType | null
++  _max: FakePaymentIntentMaxAggregateOutputType | null
++}
++
++export type FakePaymentIntentAvgAggregateOutputType = {
++  amountCents: number | null
++}
++
++export type FakePaymentIntentSumAggregateOutputType = {
++  amountCents: number | null
++}
++
++export type FakePaymentIntentMinAggregateOutputType = {
++  id: string | null
++  bookingId: string | null
++  amountCents: number | null
++  status: string | null
++  createdAt: Date | null
++}
++
++export type FakePaymentIntentMaxAggregateOutputType = {
++  id: string | null
++  bookingId: string | null
++  amountCents: number | null
++  status: string | null
++  createdAt: Date | null
++}
++
++export type FakePaymentIntentCountAggregateOutputType = {
++  id: number
++  bookingId: number
++  amountCents: number
++  status: number
++  createdAt: number
++  _all: number
++}
++
++
++export type FakePaymentIntentAvgAggregateInputType = {
++  amountCents?: true
++}
++
++export type FakePaymentIntentSumAggregateInputType = {
++  amountCents?: true
++}
++
++export type FakePaymentIntentMinAggregateInputType = {
++  id?: true
++  bookingId?: true
++  amountCents?: true
++  status?: true
++  createdAt?: true
++}
++
++export type FakePaymentIntentMaxAggregateInputType = {
++  id?: true
++  bookingId?: true
++  amountCents?: true
++  status?: true
++  createdAt?: true
++}
++
++export type FakePaymentIntentCountAggregateInputType = {
++  id?: true
++  bookingId?: true
++  amountCents?: true
++  status?: true
++  createdAt?: true
++  _all?: true
++}
++
++export type FakePaymentIntentAggregateArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Filter which FakePaymentIntent to aggregate.
++   */
++  where?: Prisma.FakePaymentIntentWhereInput
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/sorting Sorting Docs}
++   * 
++   * Determine the order of FakePaymentIntents to fetch.
++   */
++  orderBy?: Prisma.FakePaymentIntentOrderByWithRelationInput | Prisma.FakePaymentIntentOrderByWithRelationInput[]
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/pagination#cursor-based-pagination Cursor Docs}
++   * 
++   * Sets the start position
++   */
++  cursor?: Prisma.FakePaymentIntentWhereUniqueInput
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/pagination Pagination Docs}
++   * 
++   * Take `±n` FakePaymentIntents from the position of the cursor.
++   */
++  take?: number
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/pagination Pagination Docs}
++   * 
++   * Skip the first `n` FakePaymentIntents.
++   */
++  skip?: number
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/aggregations Aggregation Docs}
++   * 
++   * Count returned FakePaymentIntents
++  **/
++  _count?: true | FakePaymentIntentCountAggregateInputType
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/aggregations Aggregation Docs}
++   * 
++   * Select which fields to average
++  **/
++  _avg?: FakePaymentIntentAvgAggregateInputType
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/aggregations Aggregation Docs}
++   * 
++   * Select which fields to sum
++  **/
++  _sum?: FakePaymentIntentSumAggregateInputType
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/aggregations Aggregation Docs}
++   * 
++   * Select which fields to find the minimum value
++  **/
++  _min?: FakePaymentIntentMinAggregateInputType
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/aggregations Aggregation Docs}
++   * 
++   * Select which fields to find the maximum value
++  **/
++  _max?: FakePaymentIntentMaxAggregateInputType
++}
++
++export type GetFakePaymentIntentAggregateType<T extends FakePaymentIntentAggregateArgs> = {
++      [P in keyof T & keyof AggregateFakePaymentIntent]: P extends '_count' | 'count'
++    ? T[P] extends true
++      ? number
++      : Prisma.GetScalarType<T[P], AggregateFakePaymentIntent[P]>
++    : Prisma.GetScalarType<T[P], AggregateFakePaymentIntent[P]>
++}
++
++
++
++
++export type FakePaymentIntentGroupByArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  where?: Prisma.FakePaymentIntentWhereInput
++  orderBy?: Prisma.FakePaymentIntentOrderByWithAggregationInput | Prisma.FakePaymentIntentOrderByWithAggregationInput[]
++  by: Prisma.FakePaymentIntentScalarFieldEnum[] | Prisma.FakePaymentIntentScalarFieldEnum
++  having?: Prisma.FakePaymentIntentScalarWhereWithAggregatesInput
++  take?: number
++  skip?: number
++  _count?: FakePaymentIntentCountAggregateInputType | true
++  _avg?: FakePaymentIntentAvgAggregateInputType
++  _sum?: FakePaymentIntentSumAggregateInputType
++  _min?: FakePaymentIntentMinAggregateInputType
++  _max?: FakePaymentIntentMaxAggregateInputType
++}
++
++export type FakePaymentIntentGroupByOutputType = {
++  id: string
++  bookingId: string
++  amountCents: number
++  status: string
++  createdAt: Date
++  _count: FakePaymentIntentCountAggregateOutputType | null
++  _avg: FakePaymentIntentAvgAggregateOutputType | null
++  _sum: FakePaymentIntentSumAggregateOutputType | null
++  _min: FakePaymentIntentMinAggregateOutputType | null
++  _max: FakePaymentIntentMaxAggregateOutputType | null
++}
++
++export type GetFakePaymentIntentGroupByPayload<T extends FakePaymentIntentGroupByArgs> = Prisma.PrismaPromise<
++  Array<
++    Prisma.PickEnumerable<FakePaymentIntentGroupByOutputType, T['by']> &
++      {
++        [P in ((keyof T) & (keyof FakePaymentIntentGroupByOutputType))]: P extends '_count'
++          ? T[P] extends boolean
++            ? number
++            : Prisma.GetScalarType<T[P], FakePaymentIntentGroupByOutputType[P]>
++          : Prisma.GetScalarType<T[P], FakePaymentIntentGroupByOutputType[P]>
++      }
++    >
++  >
++
++
++
++export type FakePaymentIntentWhereInput = {
++  AND?: Prisma.FakePaymentIntentWhereInput | Prisma.FakePaymentIntentWhereInput[]
++  OR?: Prisma.FakePaymentIntentWhereInput[]
++  NOT?: Prisma.FakePaymentIntentWhereInput | Prisma.FakePaymentIntentWhereInput[]
++  id?: Prisma.StringFilter<"FakePaymentIntent"> | string
++  bookingId?: Prisma.StringFilter<"FakePaymentIntent"> | string
++  amountCents?: Prisma.IntFilter<"FakePaymentIntent"> | number
++  status?: Prisma.StringFilter<"FakePaymentIntent"> | string
++  createdAt?: Prisma.DateTimeFilter<"FakePaymentIntent"> | Date | string
++}
++
++export type FakePaymentIntentOrderByWithRelationInput = {
++  id?: Prisma.SortOrder
++  bookingId?: Prisma.SortOrder
++  amountCents?: Prisma.SortOrder
++  status?: Prisma.SortOrder
++  createdAt?: Prisma.SortOrder
++}
++
++export type FakePaymentIntentWhereUniqueInput = Prisma.AtLeast<{
++  id?: string
++  AND?: Prisma.FakePaymentIntentWhereInput | Prisma.FakePaymentIntentWhereInput[]
++  OR?: Prisma.FakePaymentIntentWhereInput[]
++  NOT?: Prisma.FakePaymentIntentWhereInput | Prisma.FakePaymentIntentWhereInput[]
++  bookingId?: Prisma.StringFilter<"FakePaymentIntent"> | string
++  amountCents?: Prisma.IntFilter<"FakePaymentIntent"> | number
++  status?: Prisma.StringFilter<"FakePaymentIntent"> | string
++  createdAt?: Prisma.DateTimeFilter<"FakePaymentIntent"> | Date | string
++}, "id">
++
++export type FakePaymentIntentOrderByWithAggregationInput = {
++  id?: Prisma.SortOrder
++  bookingId?: Prisma.SortOrder
++  amountCents?: Prisma.SortOrder
++  status?: Prisma.SortOrder
++  createdAt?: Prisma.SortOrder
++  _count?: Prisma.FakePaymentIntentCountOrderByAggregateInput
++  _avg?: Prisma.FakePaymentIntentAvgOrderByAggregateInput
++  _max?: Prisma.FakePaymentIntentMaxOrderByAggregateInput
++  _min?: Prisma.FakePaymentIntentMinOrderByAggregateInput
++  _sum?: Prisma.FakePaymentIntentSumOrderByAggregateInput
++}
++
++export type FakePaymentIntentScalarWhereWithAggregatesInput = {
++  AND?: Prisma.FakePaymentIntentScalarWhereWithAggregatesInput | Prisma.FakePaymentIntentScalarWhereWithAggregatesInput[]
++  OR?: Prisma.FakePaymentIntentScalarWhereWithAggregatesInput[]
++  NOT?: Prisma.FakePaymentIntentScalarWhereWithAggregatesInput | Prisma.FakePaymentIntentScalarWhereWithAggregatesInput[]
++  id?: Prisma.StringWithAggregatesFilter<"FakePaymentIntent"> | string
++  bookingId?: Prisma.StringWithAggregatesFilter<"FakePaymentIntent"> | string
++  amountCents?: Prisma.IntWithAggregatesFilter<"FakePaymentIntent"> | number
++  status?: Prisma.StringWithAggregatesFilter<"FakePaymentIntent"> | string
++  createdAt?: Prisma.DateTimeWithAggregatesFilter<"FakePaymentIntent"> | Date | string
++}
++
++export type FakePaymentIntentCreateInput = {
++  id: string
++  bookingId: string
++  amountCents: number
++  status: string
++  createdAt?: Date | string
++}
++
++export type FakePaymentIntentUncheckedCreateInput = {
++  id: string
++  bookingId: string
++  amountCents: number
++  status: string
++  createdAt?: Date | string
++}
++
++export type FakePaymentIntentUpdateInput = {
++  id?: Prisma.StringFieldUpdateOperationsInput | string
++  bookingId?: Prisma.StringFieldUpdateOperationsInput | string
++  amountCents?: Prisma.IntFieldUpdateOperationsInput | number
++  status?: Prisma.StringFieldUpdateOperationsInput | string
++  createdAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
++}
++
++export type FakePaymentIntentUncheckedUpdateInput = {
++  id?: Prisma.StringFieldUpdateOperationsInput | string
++  bookingId?: Prisma.StringFieldUpdateOperationsInput | string
++  amountCents?: Prisma.IntFieldUpdateOperationsInput | number
++  status?: Prisma.StringFieldUpdateOperationsInput | string
++  createdAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
++}
++
++export type FakePaymentIntentCreateManyInput = {
++  id: string
++  bookingId: string
++  amountCents: number
++  status: string
++  createdAt?: Date | string
++}
++
++export type FakePaymentIntentUpdateManyMutationInput = {
++  id?: Prisma.StringFieldUpdateOperationsInput | string
++  bookingId?: Prisma.StringFieldUpdateOperationsInput | string
++  amountCents?: Prisma.IntFieldUpdateOperationsInput | number
++  status?: Prisma.StringFieldUpdateOperationsInput | string
++  createdAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
++}
++
++export type FakePaymentIntentUncheckedUpdateManyInput = {
++  id?: Prisma.StringFieldUpdateOperationsInput | string
++  bookingId?: Prisma.StringFieldUpdateOperationsInput | string
++  amountCents?: Prisma.IntFieldUpdateOperationsInput | number
++  status?: Prisma.StringFieldUpdateOperationsInput | string
++  createdAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
++}
++
++export type FakePaymentIntentCountOrderByAggregateInput = {
++  id?: Prisma.SortOrder
++  bookingId?: Prisma.SortOrder
++  amountCents?: Prisma.SortOrder
++  status?: Prisma.SortOrder
++  createdAt?: Prisma.SortOrder
++}
++
++export type FakePaymentIntentAvgOrderByAggregateInput = {
++  amountCents?: Prisma.SortOrder
++}
++
++export type FakePaymentIntentMaxOrderByAggregateInput = {
++  id?: Prisma.SortOrder
++  bookingId?: Prisma.SortOrder
++  amountCents?: Prisma.SortOrder
++  status?: Prisma.SortOrder
++  createdAt?: Prisma.SortOrder
++}
++
++export type FakePaymentIntentMinOrderByAggregateInput = {
++  id?: Prisma.SortOrder
++  bookingId?: Prisma.SortOrder
++  amountCents?: Prisma.SortOrder
++  status?: Prisma.SortOrder
++  createdAt?: Prisma.SortOrder
++}
++
++export type FakePaymentIntentSumOrderByAggregateInput = {
++  amountCents?: Prisma.SortOrder
++}
++
++
++
++export type FakePaymentIntentSelect<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = runtime.Types.Extensions.GetSelect<{
++  id?: boolean
++  bookingId?: boolean
++  amountCents?: boolean
++  status?: boolean
++  createdAt?: boolean
++}, ExtArgs["result"]["fakePaymentIntent"]>
++
++export type FakePaymentIntentSelectCreateManyAndReturn<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = runtime.Types.Extensions.GetSelect<{
++  id?: boolean
++  bookingId?: boolean
++  amountCents?: boolean
++  status?: boolean
++  createdAt?: boolean
++}, ExtArgs["result"]["fakePaymentIntent"]>
++
++export type FakePaymentIntentSelectUpdateManyAndReturn<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = runtime.Types.Extensions.GetSelect<{
++  id?: boolean
++  bookingId?: boolean
++  amountCents?: boolean
++  status?: boolean
++  createdAt?: boolean
++}, ExtArgs["result"]["fakePaymentIntent"]>
++
++export type FakePaymentIntentSelectScalar = {
++  id?: boolean
++  bookingId?: boolean
++  amountCents?: boolean
++  status?: boolean
++  createdAt?: boolean
++}
++
++export type FakePaymentIntentOmit<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = runtime.Types.Extensions.GetOmit<"id" | "bookingId" | "amountCents" | "status" | "createdAt", ExtArgs["result"]["fakePaymentIntent"]>
++
++export type $FakePaymentIntentPayload<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  name: "FakePaymentIntent"
++  objects: {}
++  scalars: runtime.Types.Extensions.GetPayloadResult<{
++    id: string
++    bookingId: string
++    amountCents: number
++    status: string
++    createdAt: Date
++  }, ExtArgs["result"]["fakePaymentIntent"]>
++  composites: {}
++}
++
++export type FakePaymentIntentGetPayload<S extends boolean | null | undefined | FakePaymentIntentDefaultArgs> = runtime.Types.Result.GetResult<Prisma.$FakePaymentIntentPayload, S>
++
++export type FakePaymentIntentCountArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> =
++  Omit<FakePaymentIntentFindManyArgs, 'select' | 'include' | 'distinct' | 'omit'> & {
++    select?: FakePaymentIntentCountAggregateInputType | true
++  }
++
++export interface FakePaymentIntentDelegate<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs, GlobalOmitOptions = {}> {
++  [K: symbol]: { types: Prisma.TypeMap<ExtArgs>['model']['FakePaymentIntent'], meta: { name: 'FakePaymentIntent' } }
++  /**
++   * Find zero or one FakePaymentIntent that matches the filter.
++   * @param {FakePaymentIntentFindUniqueArgs} args - Arguments to find a FakePaymentIntent
++   * @example
++   * // Get one FakePaymentIntent
++   * const fakePaymentIntent = await prisma.fakePaymentIntent.findUnique({
++   *   where: {
++   *     // ... provide filter here
++   *   }
++   * })
++   */
++  findUnique<T extends FakePaymentIntentFindUniqueArgs>(args: Prisma.SelectSubset<T, FakePaymentIntentFindUniqueArgs<ExtArgs>>): Prisma.Prisma__FakePaymentIntentClient<runtime.Types.Result.GetResult<Prisma.$FakePaymentIntentPayload<ExtArgs>, T, "findUnique", GlobalOmitOptions> | null, null, ExtArgs, GlobalOmitOptions>
++
++  /**
++   * Find one FakePaymentIntent that matches the filter or throw an error with `error.code='P2025'`
++   * if no matches were found.
++   * @param {FakePaymentIntentFindUniqueOrThrowArgs} args - Arguments to find a FakePaymentIntent
++   * @example
++   * // Get one FakePaymentIntent
++   * const fakePaymentIntent = await prisma.fakePaymentIntent.findUniqueOrThrow({
++   *   where: {
++   *     // ... provide filter here
++   *   }
++   * })
++   */
++  findUniqueOrThrow<T extends FakePaymentIntentFindUniqueOrThrowArgs>(args: Prisma.SelectSubset<T, FakePaymentIntentFindUniqueOrThrowArgs<ExtArgs>>): Prisma.Prisma__FakePaymentIntentClient<runtime.Types.Result.GetResult<Prisma.$FakePaymentIntentPayload<ExtArgs>, T, "findUniqueOrThrow", GlobalOmitOptions>, never, ExtArgs, GlobalOmitOptions>
++
++  /**
++   * Find the first FakePaymentIntent that matches the filter.
++   * Note, that providing `undefined` is treated as the value not being there.
++   * Read more here: https://pris.ly/d/null-undefined
++   * @param {FakePaymentIntentFindFirstArgs} args - Arguments to find a FakePaymentIntent
++   * @example
++   * // Get one FakePaymentIntent
++   * const fakePaymentIntent = await prisma.fakePaymentIntent.findFirst({
++   *   where: {
++   *     // ... provide filter here
++   *   }
++   * })
++   */
++  findFirst<T extends FakePaymentIntentFindFirstArgs>(args?: Prisma.SelectSubset<T, FakePaymentIntentFindFirstArgs<ExtArgs>>): Prisma.Prisma__FakePaymentIntentClient<runtime.Types.Result.GetResult<Prisma.$FakePaymentIntentPayload<ExtArgs>, T, "findFirst", GlobalOmitOptions> | null, null, ExtArgs, GlobalOmitOptions>
++
++  /**
++   * Find the first FakePaymentIntent that matches the filter or
++   * throw `PrismaKnownClientError` with `P2025` code if no matches were found.
++   * Note, that providing `undefined` is treated as the value not being there.
++   * Read more here: https://pris.ly/d/null-undefined
++   * @param {FakePaymentIntentFindFirstOrThrowArgs} args - Arguments to find a FakePaymentIntent
++   * @example
++   * // Get one FakePaymentIntent
++   * const fakePaymentIntent = await prisma.fakePaymentIntent.findFirstOrThrow({
++   *   where: {
++   *     // ... provide filter here
++   *   }
++   * })
++   */
++  findFirstOrThrow<T extends FakePaymentIntentFindFirstOrThrowArgs>(args?: Prisma.SelectSubset<T, FakePaymentIntentFindFirstOrThrowArgs<ExtArgs>>): Prisma.Prisma__FakePaymentIntentClient<runtime.Types.Result.GetResult<Prisma.$FakePaymentIntentPayload<ExtArgs>, T, "findFirstOrThrow", GlobalOmitOptions>, never, ExtArgs, GlobalOmitOptions>
++
++  /**
++   * Find zero or more FakePaymentIntents that matches the filter.
++   * Note, that providing `undefined` is treated as the value not being there.
++   * Read more here: https://pris.ly/d/null-undefined
++   * @param {FakePaymentIntentFindManyArgs} args - Arguments to filter and select certain fields only.
++   * @example
++   * // Get all FakePaymentIntents
++   * const fakePaymentIntents = await prisma.fakePaymentIntent.findMany()
++   * 
++   * // Get first 10 FakePaymentIntents
++   * const fakePaymentIntents = await prisma.fakePaymentIntent.findMany({ take: 10 })
++   * 
++   * // Only select the `id`
++   * const fakePaymentIntentWithIdOnly = await prisma.fakePaymentIntent.findMany({ select: { id: true } })
++   * 
++   */
++  findMany<T extends FakePaymentIntentFindManyArgs>(args?: Prisma.SelectSubset<T, FakePaymentIntentFindManyArgs<ExtArgs>>): Prisma.PrismaPromise<runtime.Types.Result.GetResult<Prisma.$FakePaymentIntentPayload<ExtArgs>, T, "findMany", GlobalOmitOptions>>
++
++  /**
++   * Create a FakePaymentIntent.
++   * @param {FakePaymentIntentCreateArgs} args - Arguments to create a FakePaymentIntent.
++   * @example
++   * // Create one FakePaymentIntent
++   * const FakePaymentIntent = await prisma.fakePaymentIntent.create({
++   *   data: {
++   *     // ... data to create a FakePaymentIntent
++   *   }
++   * })
++   * 
++   */
++  create<T extends FakePaymentIntentCreateArgs>(args: Prisma.SelectSubset<T, FakePaymentIntentCreateArgs<ExtArgs>>): Prisma.Prisma__FakePaymentIntentClient<runtime.Types.Result.GetResult<Prisma.$FakePaymentIntentPayload<ExtArgs>, T, "create", GlobalOmitOptions>, never, ExtArgs, GlobalOmitOptions>
++
++  /**
++   * Create many FakePaymentIntents.
++   * @param {FakePaymentIntentCreateManyArgs} args - Arguments to create many FakePaymentIntents.
++   * @example
++   * // Create many FakePaymentIntents
++   * const fakePaymentIntent = await prisma.fakePaymentIntent.createMany({
++   *   data: [
++   *     // ... provide data here
++   *   ]
++   * })
++   *     
++   */
++  createMany<T extends FakePaymentIntentCreateManyArgs>(args?: Prisma.SelectSubset<T, FakePaymentIntentCreateManyArgs<ExtArgs>>): Prisma.PrismaPromise<Prisma.BatchPayload>
++
++  /**
++   * Create many FakePaymentIntents and returns the data saved in the database.
++   * @param {FakePaymentIntentCreateManyAndReturnArgs} args - Arguments to create many FakePaymentIntents.
++   * @example
++   * // Create many FakePaymentIntents
++   * const fakePaymentIntent = await prisma.fakePaymentIntent.createManyAndReturn({
++   *   data: [
++   *     // ... provide data here
++   *   ]
++   * })
++   * 
++   * // Create many FakePaymentIntents and only return the `id`
++   * const fakePaymentIntentWithIdOnly = await prisma.fakePaymentIntent.createManyAndReturn({
++   *   select: { id: true },
++   *   data: [
++   *     // ... provide data here
++   *   ]
++   * })
++   * Note, that providing `undefined` is treated as the value not being there.
++   * Read more here: https://pris.ly/d/null-undefined
++   * 
++   */
++  createManyAndReturn<T extends FakePaymentIntentCreateManyAndReturnArgs>(args?: Prisma.SelectSubset<T, FakePaymentIntentCreateManyAndReturnArgs<ExtArgs>>): Prisma.PrismaPromise<runtime.Types.Result.GetResult<Prisma.$FakePaymentIntentPayload<ExtArgs>, T, "createManyAndReturn", GlobalOmitOptions>>
++
++  /**
++   * Delete a FakePaymentIntent.
++   * @param {FakePaymentIntentDeleteArgs} args - Arguments to delete one FakePaymentIntent.
++   * @example
++   * // Delete one FakePaymentIntent
++   * const FakePaymentIntent = await prisma.fakePaymentIntent.delete({
++   *   where: {
++   *     // ... filter to delete one FakePaymentIntent
++   *   }
++   * })
++   * 
++   */
++  delete<T extends FakePaymentIntentDeleteArgs>(args: Prisma.SelectSubset<T, FakePaymentIntentDeleteArgs<ExtArgs>>): Prisma.Prisma__FakePaymentIntentClient<runtime.Types.Result.GetResult<Prisma.$FakePaymentIntentPayload<ExtArgs>, T, "delete", GlobalOmitOptions>, never, ExtArgs, GlobalOmitOptions>
++
++  /**
++   * Update one FakePaymentIntent.
++   * @param {FakePaymentIntentUpdateArgs} args - Arguments to update one FakePaymentIntent.
++   * @example
++   * // Update one FakePaymentIntent
++   * const fakePaymentIntent = await prisma.fakePaymentIntent.update({
++   *   where: {
++   *     // ... provide filter here
++   *   },
++   *   data: {
++   *     // ... provide data here
++   *   }
++   * })
++   * 
++   */
++  update<T extends FakePaymentIntentUpdateArgs>(args: Prisma.SelectSubset<T, FakePaymentIntentUpdateArgs<ExtArgs>>): Prisma.Prisma__FakePaymentIntentClient<runtime.Types.Result.GetResult<Prisma.$FakePaymentIntentPayload<ExtArgs>, T, "update", GlobalOmitOptions>, never, ExtArgs, GlobalOmitOptions>
++
++  /**
++   * Delete zero or more FakePaymentIntents.
++   * @param {FakePaymentIntentDeleteManyArgs} args - Arguments to filter FakePaymentIntents to delete.
++   * @example
++   * // Delete a few FakePaymentIntents
++   * const { count } = await prisma.fakePaymentIntent.deleteMany({
++   *   where: {
++   *     // ... provide filter here
++   *   }
++   * })
++   * 
++   */
++  deleteMany<T extends FakePaymentIntentDeleteManyArgs>(args?: Prisma.SelectSubset<T, FakePaymentIntentDeleteManyArgs<ExtArgs>>): Prisma.PrismaPromise<Prisma.BatchPayload>
++
++  /**
++   * Update zero or more FakePaymentIntents.
++   * Note, that providing `undefined` is treated as the value not being there.
++   * Read more here: https://pris.ly/d/null-undefined
++   * @param {FakePaymentIntentUpdateManyArgs} args - Arguments to update one or more rows.
++   * @example
++   * // Update many FakePaymentIntents
++   * const fakePaymentIntent = await prisma.fakePaymentIntent.updateMany({
++   *   where: {
++   *     // ... provide filter here
++   *   },
++   *   data: {
++   *     // ... provide data here
++   *   }
++   * })
++   * 
++   */
++  updateMany<T extends FakePaymentIntentUpdateManyArgs>(args: Prisma.SelectSubset<T, FakePaymentIntentUpdateManyArgs<ExtArgs>>): Prisma.PrismaPromise<Prisma.BatchPayload>
++
++  /**
++   * Update zero or more FakePaymentIntents and returns the data updated in the database.
++   * @param {FakePaymentIntentUpdateManyAndReturnArgs} args - Arguments to update many FakePaymentIntents.
++   * @example
++   * // Update many FakePaymentIntents
++   * const fakePaymentIntent = await prisma.fakePaymentIntent.updateManyAndReturn({
++   *   where: {
++   *     // ... provide filter here
++   *   },
++   *   data: [
++   *     // ... provide data here
++   *   ]
++   * })
++   * 
++   * // Update zero or more FakePaymentIntents and only return the `id`
++   * const fakePaymentIntentWithIdOnly = await prisma.fakePaymentIntent.updateManyAndReturn({
++   *   select: { id: true },
++   *   where: {
++   *     // ... provide filter here
++   *   },
++   *   data: [
++   *     // ... provide data here
++   *   ]
++   * })
++   * Note, that providing `undefined` is treated as the value not being there.
++   * Read more here: https://pris.ly/d/null-undefined
++   * 
++   */
++  updateManyAndReturn<T extends FakePaymentIntentUpdateManyAndReturnArgs>(args: Prisma.SelectSubset<T, FakePaymentIntentUpdateManyAndReturnArgs<ExtArgs>>): Prisma.PrismaPromise<runtime.Types.Result.GetResult<Prisma.$FakePaymentIntentPayload<ExtArgs>, T, "updateManyAndReturn", GlobalOmitOptions>>
++
++  /**
++   * Create or update one FakePaymentIntent.
++   * @param {FakePaymentIntentUpsertArgs} args - Arguments to update or create a FakePaymentIntent.
++   * @example
++   * // Update or create a FakePaymentIntent
++   * const fakePaymentIntent = await prisma.fakePaymentIntent.upsert({
++   *   create: {
++   *     // ... data to create a FakePaymentIntent
++   *   },
++   *   update: {
++   *     // ... in case it already exists, update
++   *   },
++   *   where: {
++   *     // ... the filter for the FakePaymentIntent we want to update
++   *   }
++   * })
++   */
++  upsert<T extends FakePaymentIntentUpsertArgs>(args: Prisma.SelectSubset<T, FakePaymentIntentUpsertArgs<ExtArgs>>): Prisma.Prisma__FakePaymentIntentClient<runtime.Types.Result.GetResult<Prisma.$FakePaymentIntentPayload<ExtArgs>, T, "upsert", GlobalOmitOptions>, never, ExtArgs, GlobalOmitOptions>
++
++
++  /**
++   * Count the number of FakePaymentIntents.
++   * Note, that providing `undefined` is treated as the value not being there.
++   * Read more here: https://pris.ly/d/null-undefined
++   * @param {FakePaymentIntentCountArgs} args - Arguments to filter FakePaymentIntents to count.
++   * @example
++   * // Count the number of FakePaymentIntents
++   * const count = await prisma.fakePaymentIntent.count({
++   *   where: {
++   *     // ... the filter for the FakePaymentIntents we want to count
++   *   }
++   * })
++  **/
++  count<T extends FakePaymentIntentCountArgs>(
++    args?: Prisma.Subset<T, FakePaymentIntentCountArgs>,
++  ): Prisma.PrismaPromise<
++    T extends runtime.Types.Utils.Record<'select', any>
++      ? T['select'] extends true
++        ? number
++        : Prisma.GetScalarType<T['select'], FakePaymentIntentCountAggregateOutputType>
++      : number
++  >
++
++  /**
++   * Allows you to perform aggregations operations on a FakePaymentIntent.
++   * Note, that providing `undefined` is treated as the value not being there.
++   * Read more here: https://pris.ly/d/null-undefined
++   * @param {FakePaymentIntentAggregateArgs} args - Select which aggregations you would like to apply and on what fields.
++   * @example
++   * // Ordered by age ascending
++   * // Where email contains prisma.io
++   * // Limited to the 10 users
++   * const aggregations = await prisma.user.aggregate({
++   *   _avg: {
++   *     age: true,
++   *   },
++   *   where: {
++   *     email: {
++   *       contains: "prisma.io",
++   *     },
++   *   },
++   *   orderBy: {
++   *     age: "asc",
++   *   },
++   *   take: 10,
++   * })
++  **/
++  aggregate<T extends FakePaymentIntentAggregateArgs>(args: Prisma.Subset<T, FakePaymentIntentAggregateArgs>): Prisma.PrismaPromise<GetFakePaymentIntentAggregateType<T>>
++
++  /**
++   * Group by FakePaymentIntent.
++   * Note, that providing `undefined` is treated as the value not being there.
++   * Read more here: https://pris.ly/d/null-undefined
++   * @param {FakePaymentIntentGroupByArgs} args - Group by arguments.
++   * @example
++   * // Group by city, order by createdAt, get count
++   * const result = await prisma.user.groupBy({
++   *   by: ['city', 'createdAt'],
++   *   orderBy: {
++   *     createdAt: true
++   *   },
++   *   _count: {
++   *     _all: true
++   *   },
++   * })
++   * 
++  **/
++  groupBy<
++    T extends FakePaymentIntentGroupByArgs,
++    HasSelectOrTake extends Prisma.Or<
++      Prisma.Extends<'skip', Prisma.Keys<T>>,
++      Prisma.Extends<'take', Prisma.Keys<T>>
++    >,
++    OrderByArg extends Prisma.True extends HasSelectOrTake
++      ? { orderBy: FakePaymentIntentGroupByArgs['orderBy'] }
++      : { orderBy?: FakePaymentIntentGroupByArgs['orderBy'] },
++    OrderFields extends Prisma.ExcludeUnderscoreKeys<Prisma.Keys<Prisma.MaybeTupleToUnion<T['orderBy']>>>,
++    ByFields extends Prisma.MaybeTupleToUnion<T['by']>,
++    ByValid extends Prisma.Has<ByFields, OrderFields>,
++    HavingFields extends Prisma.GetHavingFields<T['having']>,
++    HavingValid extends Prisma.Has<ByFields, HavingFields>,
++    ByEmpty extends T['by'] extends never[] ? Prisma.True : Prisma.False,
++    InputErrors extends ByEmpty extends Prisma.True
++    ? `Error: "by" must not be empty.`
++    : HavingValid extends Prisma.False
++    ? {
++        [P in HavingFields]: P extends ByFields
++          ? never
++          : P extends string
++          ? `Error: Field "${P}" used in "having" needs to be provided in "by".`
++          : [
++              Error,
++              'Field ',
++              P,
++              ` in "having" needs to be provided in "by"`,
++            ]
++      }[HavingFields]
++    : 'take' extends Prisma.Keys<T>
++    ? 'orderBy' extends Prisma.Keys<T>
++      ? ByValid extends Prisma.True
++        ? {}
++        : {
++            [P in OrderFields]: P extends ByFields
++              ? never
++              : `Error: Field "${P}" in "orderBy" needs to be provided in "by"`
++          }[OrderFields]
++      : 'Error: If you provide "take", you also need to provide "orderBy"'
++    : 'skip' extends Prisma.Keys<T>
++    ? 'orderBy' extends Prisma.Keys<T>
++      ? ByValid extends Prisma.True
++        ? {}
++        : {
++            [P in OrderFields]: P extends ByFields
++              ? never
++              : `Error: Field "${P}" in "orderBy" needs to be provided in "by"`
++          }[OrderFields]
++      : 'Error: If you provide "skip", you also need to provide "orderBy"'
++    : ByValid extends Prisma.True
++    ? {}
++    : {
++        [P in OrderFields]: P extends ByFields
++          ? never
++          : `Error: Field "${P}" in "orderBy" needs to be provided in "by"`
++      }[OrderFields]
++  >(args: Prisma.SubsetIntersection<T, FakePaymentIntentGroupByArgs, OrderByArg> & InputErrors): {} extends InputErrors ? GetFakePaymentIntentGroupByPayload<T> : Prisma.PrismaPromise<InputErrors>
++/**
++ * Fields of the FakePaymentIntent model
++ */
++readonly fields: FakePaymentIntentFieldRefs;
++}
++
++/**
++ * The delegate class that acts as a "Promise-like" for FakePaymentIntent.
++ * Why is this prefixed with `Prisma__`?
++ * Because we want to prevent naming conflicts as mentioned in
++ * https://github.com/prisma/prisma-client-js/issues/707
++ */
++export interface Prisma__FakePaymentIntentClient<T, Null = never, ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs, GlobalOmitOptions = {}> extends Prisma.PrismaPromise<T> {
++  readonly [Symbol.toStringTag]: "PrismaPromise"
++  /**
++   * Attaches callbacks for the resolution and/or rejection of the Promise.
++   * @param onfulfilled The callback to execute when the Promise is resolved.
++   * @param onrejected The callback to execute when the Promise is rejected.
++   * @returns A Promise for the completion of which ever callback is executed.
++   */
++  then<TResult1 = T, TResult2 = never>(onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | undefined | null, onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | undefined | null): runtime.Types.Utils.JsPromise<TResult1 | TResult2>
++  /**
++   * Attaches a callback for only the rejection of the Promise.
++   * @param onrejected The callback to execute when the Promise is rejected.
++   * @returns A Promise for the completion of the callback.
++   */
++  catch<TResult = never>(onrejected?: ((reason: any) => TResult | PromiseLike<TResult>) | undefined | null): runtime.Types.Utils.JsPromise<T | TResult>
++  /**
++   * Attaches a callback that is invoked when the Promise is settled (fulfilled or rejected). The
++   * resolved value cannot be modified from the callback.
++   * @param onfinally The callback to execute when the Promise is settled (fulfilled or rejected).
++   * @returns A Promise for the completion of the callback.
++   */
++  finally(onfinally?: (() => void) | undefined | null): runtime.Types.Utils.JsPromise<T>
++}
++
++
++
++
++/**
++ * Fields of the FakePaymentIntent model
++ */
++export interface FakePaymentIntentFieldRefs {
++  readonly id: Prisma.FieldRef<"FakePaymentIntent", 'String'>
++  readonly bookingId: Prisma.FieldRef<"FakePaymentIntent", 'String'>
++  readonly amountCents: Prisma.FieldRef<"FakePaymentIntent", 'Int'>
++  readonly status: Prisma.FieldRef<"FakePaymentIntent", 'String'>
++  readonly createdAt: Prisma.FieldRef<"FakePaymentIntent", 'DateTime'>
++}
++    
++
++// Custom InputTypes
++/**
++ * FakePaymentIntent findUnique
++ */
++export type FakePaymentIntentFindUniqueArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Select specific fields to fetch from the FakePaymentIntent
++   */
++  select?: Prisma.FakePaymentIntentSelect<ExtArgs> | null
++  /**
++   * Omit specific fields from the FakePaymentIntent
++   */
++  omit?: Prisma.FakePaymentIntentOmit<ExtArgs> | null
++  /**
++   * Filter, which FakePaymentIntent to fetch.
++   */
++  where: Prisma.FakePaymentIntentWhereUniqueInput
++}
++
++/**
++ * FakePaymentIntent findUniqueOrThrow
++ */
++export type FakePaymentIntentFindUniqueOrThrowArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Select specific fields to fetch from the FakePaymentIntent
++   */
++  select?: Prisma.FakePaymentIntentSelect<ExtArgs> | null
++  /**
++   * Omit specific fields from the FakePaymentIntent
++   */
++  omit?: Prisma.FakePaymentIntentOmit<ExtArgs> | null
++  /**
++   * Filter, which FakePaymentIntent to fetch.
++   */
++  where: Prisma.FakePaymentIntentWhereUniqueInput
++}
++
++/**
++ * FakePaymentIntent findFirst
++ */
++export type FakePaymentIntentFindFirstArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Select specific fields to fetch from the FakePaymentIntent
++   */
++  select?: Prisma.FakePaymentIntentSelect<ExtArgs> | null
++  /**
++   * Omit specific fields from the FakePaymentIntent
++   */
++  omit?: Prisma.FakePaymentIntentOmit<ExtArgs> | null
++  /**
++   * Filter, which FakePaymentIntent to fetch.
++   */
++  where?: Prisma.FakePaymentIntentWhereInput
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/sorting Sorting Docs}
++   * 
++   * Determine the order of FakePaymentIntents to fetch.
++   */
++  orderBy?: Prisma.FakePaymentIntentOrderByWithRelationInput | Prisma.FakePaymentIntentOrderByWithRelationInput[]
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/pagination#cursor-based-pagination Cursor Docs}
++   * 
++   * Sets the position for searching for FakePaymentIntents.
++   */
++  cursor?: Prisma.FakePaymentIntentWhereUniqueInput
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/pagination Pagination Docs}
++   * 
++   * Take `±n` FakePaymentIntents from the position of the cursor.
++   */
++  take?: number
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/pagination Pagination Docs}
++   * 
++   * Skip the first `n` FakePaymentIntents.
++   */
++  skip?: number
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/distinct Distinct Docs}
++   * 
++   * Filter by unique combinations of FakePaymentIntents.
++   */
++  distinct?: Prisma.FakePaymentIntentScalarFieldEnum | Prisma.FakePaymentIntentScalarFieldEnum[]
++}
++
++/**
++ * FakePaymentIntent findFirstOrThrow
++ */
++export type FakePaymentIntentFindFirstOrThrowArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Select specific fields to fetch from the FakePaymentIntent
++   */
++  select?: Prisma.FakePaymentIntentSelect<ExtArgs> | null
++  /**
++   * Omit specific fields from the FakePaymentIntent
++   */
++  omit?: Prisma.FakePaymentIntentOmit<ExtArgs> | null
++  /**
++   * Filter, which FakePaymentIntent to fetch.
++   */
++  where?: Prisma.FakePaymentIntentWhereInput
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/sorting Sorting Docs}
++   * 
++   * Determine the order of FakePaymentIntents to fetch.
++   */
++  orderBy?: Prisma.FakePaymentIntentOrderByWithRelationInput | Prisma.FakePaymentIntentOrderByWithRelationInput[]
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/pagination#cursor-based-pagination Cursor Docs}
++   * 
++   * Sets the position for searching for FakePaymentIntents.
++   */
++  cursor?: Prisma.FakePaymentIntentWhereUniqueInput
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/pagination Pagination Docs}
++   * 
++   * Take `±n` FakePaymentIntents from the position of the cursor.
++   */
++  take?: number
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/pagination Pagination Docs}
++   * 
++   * Skip the first `n` FakePaymentIntents.
++   */
++  skip?: number
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/distinct Distinct Docs}
++   * 
++   * Filter by unique combinations of FakePaymentIntents.
++   */
++  distinct?: Prisma.FakePaymentIntentScalarFieldEnum | Prisma.FakePaymentIntentScalarFieldEnum[]
++}
++
++/**
++ * FakePaymentIntent findMany
++ */
++export type FakePaymentIntentFindManyArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Select specific fields to fetch from the FakePaymentIntent
++   */
++  select?: Prisma.FakePaymentIntentSelect<ExtArgs> | null
++  /**
++   * Omit specific fields from the FakePaymentIntent
++   */
++  omit?: Prisma.FakePaymentIntentOmit<ExtArgs> | null
++  /**
++   * Filter, which FakePaymentIntents to fetch.
++   */
++  where?: Prisma.FakePaymentIntentWhereInput
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/sorting Sorting Docs}
++   * 
++   * Determine the order of FakePaymentIntents to fetch.
++   */
++  orderBy?: Prisma.FakePaymentIntentOrderByWithRelationInput | Prisma.FakePaymentIntentOrderByWithRelationInput[]
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/pagination#cursor-based-pagination Cursor Docs}
++   * 
++   * Sets the position for listing FakePaymentIntents.
++   */
++  cursor?: Prisma.FakePaymentIntentWhereUniqueInput
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/pagination Pagination Docs}
++   * 
++   * Take `±n` FakePaymentIntents from the position of the cursor.
++   */
++  take?: number
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/pagination Pagination Docs}
++   * 
++   * Skip the first `n` FakePaymentIntents.
++   */
++  skip?: number
++  /**
++   * {@link https://www.prisma.io/docs/concepts/components/prisma-client/distinct Distinct Docs}
++   * 
++   * Filter by unique combinations of FakePaymentIntents.
++   */
++  distinct?: Prisma.FakePaymentIntentScalarFieldEnum | Prisma.FakePaymentIntentScalarFieldEnum[]
++}
++
++/**
++ * FakePaymentIntent create
++ */
++export type FakePaymentIntentCreateArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Select specific fields to fetch from the FakePaymentIntent
++   */
++  select?: Prisma.FakePaymentIntentSelect<ExtArgs> | null
++  /**
++   * Omit specific fields from the FakePaymentIntent
++   */
++  omit?: Prisma.FakePaymentIntentOmit<ExtArgs> | null
++  /**
++   * The data needed to create a FakePaymentIntent.
++   */
++  data: Prisma.XOR<Prisma.FakePaymentIntentCreateInput, Prisma.FakePaymentIntentUncheckedCreateInput>
++}
++
++/**
++ * FakePaymentIntent createMany
++ */
++export type FakePaymentIntentCreateManyArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * The data used to create many FakePaymentIntents.
++   */
++  data: Prisma.FakePaymentIntentCreateManyInput | Prisma.FakePaymentIntentCreateManyInput[]
++  skipDuplicates?: boolean
++}
++
++/**
++ * FakePaymentIntent createManyAndReturn
++ */
++export type FakePaymentIntentCreateManyAndReturnArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Select specific fields to fetch from the FakePaymentIntent
++   */
++  select?: Prisma.FakePaymentIntentSelectCreateManyAndReturn<ExtArgs> | null
++  /**
++   * Omit specific fields from the FakePaymentIntent
++   */
++  omit?: Prisma.FakePaymentIntentOmit<ExtArgs> | null
++  /**
++   * The data used to create many FakePaymentIntents.
++   */
++  data: Prisma.FakePaymentIntentCreateManyInput | Prisma.FakePaymentIntentCreateManyInput[]
++  skipDuplicates?: boolean
++}
++
++/**
++ * FakePaymentIntent update
++ */
++export type FakePaymentIntentUpdateArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Select specific fields to fetch from the FakePaymentIntent
++   */
++  select?: Prisma.FakePaymentIntentSelect<ExtArgs> | null
++  /**
++   * Omit specific fields from the FakePaymentIntent
++   */
++  omit?: Prisma.FakePaymentIntentOmit<ExtArgs> | null
++  /**
++   * The data needed to update a FakePaymentIntent.
++   */
++  data: Prisma.XOR<Prisma.FakePaymentIntentUpdateInput, Prisma.FakePaymentIntentUncheckedUpdateInput>
++  /**
++   * Choose, which FakePaymentIntent to update.
++   */
++  where: Prisma.FakePaymentIntentWhereUniqueInput
++}
++
++/**
++ * FakePaymentIntent updateMany
++ */
++export type FakePaymentIntentUpdateManyArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * The data used to update FakePaymentIntents.
++   */
++  data: Prisma.XOR<Prisma.FakePaymentIntentUpdateManyMutationInput, Prisma.FakePaymentIntentUncheckedUpdateManyInput>
++  /**
++   * Filter which FakePaymentIntents to update
++   */
++  where?: Prisma.FakePaymentIntentWhereInput
++  /**
++   * Limit how many FakePaymentIntents to update.
++   */
++  limit?: number
++}
++
++/**
++ * FakePaymentIntent updateManyAndReturn
++ */
++export type FakePaymentIntentUpdateManyAndReturnArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Select specific fields to fetch from the FakePaymentIntent
++   */
++  select?: Prisma.FakePaymentIntentSelectUpdateManyAndReturn<ExtArgs> | null
++  /**
++   * Omit specific fields from the FakePaymentIntent
++   */
++  omit?: Prisma.FakePaymentIntentOmit<ExtArgs> | null
++  /**
++   * The data used to update FakePaymentIntents.
++   */
++  data: Prisma.XOR<Prisma.FakePaymentIntentUpdateManyMutationInput, Prisma.FakePaymentIntentUncheckedUpdateManyInput>
++  /**
++   * Filter which FakePaymentIntents to update
++   */
++  where?: Prisma.FakePaymentIntentWhereInput
++  /**
++   * Limit how many FakePaymentIntents to update.
++   */
++  limit?: number
++}
++
++/**
++ * FakePaymentIntent upsert
++ */
++export type FakePaymentIntentUpsertArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Select specific fields to fetch from the FakePaymentIntent
++   */
++  select?: Prisma.FakePaymentIntentSelect<ExtArgs> | null
++  /**
++   * Omit specific fields from the FakePaymentIntent
++   */
++  omit?: Prisma.FakePaymentIntentOmit<ExtArgs> | null
++  /**
++   * The filter to search for the FakePaymentIntent to update in case it exists.
++   */
++  where: Prisma.FakePaymentIntentWhereUniqueInput
++  /**
++   * In case the FakePaymentIntent found by the `where` argument doesn't exist, create a new FakePaymentIntent with this data.
++   */
++  create: Prisma.XOR<Prisma.FakePaymentIntentCreateInput, Prisma.FakePaymentIntentUncheckedCreateInput>
++  /**
++   * In case the FakePaymentIntent was found with the provided `where` argument, update it with this data.
++   */
++  update: Prisma.XOR<Prisma.FakePaymentIntentUpdateInput, Prisma.FakePaymentIntentUncheckedUpdateInput>
++}
++
++/**
++ * FakePaymentIntent delete
++ */
++export type FakePaymentIntentDeleteArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Select specific fields to fetch from the FakePaymentIntent
++   */
++  select?: Prisma.FakePaymentIntentSelect<ExtArgs> | null
++  /**
++   * Omit specific fields from the FakePaymentIntent
++   */
++  omit?: Prisma.FakePaymentIntentOmit<ExtArgs> | null
++  /**
++   * Filter which FakePaymentIntent to delete.
++   */
++  where: Prisma.FakePaymentIntentWhereUniqueInput
++}
++
++/**
++ * FakePaymentIntent deleteMany
++ */
++export type FakePaymentIntentDeleteManyArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Filter which FakePaymentIntents to delete
++   */
++  where?: Prisma.FakePaymentIntentWhereInput
++  /**
++   * Limit how many FakePaymentIntents to delete.
++   */
++  limit?: number
++}
++
++/**
++ * FakePaymentIntent without action
++ */
++export type FakePaymentIntentDefaultArgs<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
++  /**
++   * Select specific fields to fetch from the FakePaymentIntent
++   */
++  select?: Prisma.FakePaymentIntentSelect<ExtArgs> | null
++  /**
++   * Omit specific fields from the FakePaymentIntent
++   */
++  omit?: Prisma.FakePaymentIntentOmit<ExtArgs> | null
++}
+diff --git a/src/payments/fake-psp.controller.ts b/src/payments/fake-psp.controller.ts
+index d19ce6e..5083490 100644
+--- a/src/payments/fake-psp.controller.ts
++++ b/src/payments/fake-psp.controller.ts
+@@ -45,7 +45,10 @@ export class FakePspController {
+     if (!(this.provider instanceof FakePaymentProvider)) {
+       throw new NotFoundException({ code: 'not_found', message: 'the fake PSP is not active' });
+     }
+-    const events = order(this.provider.pay(paymentId, body.outcome as FakeOutcome), body.order);
++    const events = order(
++      await this.provider.pay(paymentId, body.outcome as FakeOutcome),
++      body.order,
++    );
+     if (body.duplicate) {
+       const last = events.find((e) => e.type === `payment_intent.${body.outcome}`);
+       if (last) events.push(last);
+diff --git a/src/payments/fake.provider.ts b/src/payments/fake.provider.ts
+index 84c6575..c808426 100644
+--- a/src/payments/fake.provider.ts
++++ b/src/payments/fake.provider.ts
+@@ -1,6 +1,7 @@
+ import { randomUUID } from 'node:crypto';
+ import { Injectable } from '@nestjs/common';
+ import Stripe from 'stripe';
++import type { PrismaService } from '../prisma/prisma.service';
+ import type {
+   CreateIntentInput,
+   PaymentIntentRef,
+@@ -21,35 +22,50 @@ export interface SignedEvent {
+ export type FakeOutcome = 'succeeded' | 'canceled';
+ 
+ /**
+- * An in-process PSP: intents live in memory and "paying" produces Stripe-shaped events signed
+- * with the real Stripe scheme (so the webhook endpoint runs the same verification either way).
+- * The events come with the timestamps Stripe would give them; delivering them shuffled and
+- * duplicated is the caller's job — that is the point of the exercise.
++ * An in-repo PSP: intents live in the database (the worker cancels what the API created) and
++ * "paying" produces Stripe-shaped events signed with the real Stripe scheme, so the webhook
++ * endpoint runs the same verification either way. The events carry the timestamps Stripe would
++ * give them; delivering them shuffled and duplicated is the caller's job — that is the exercise.
+  */
+ @Injectable()
+ export class FakePaymentProvider implements PaymentProvider {
+   readonly name = 'fake' as const;
+   private readonly stripe = new Stripe('sk_test_slotlock_fake');
+-  private readonly intents = new Map<
+-    string,
+-    { bookingId: string; amountCents: number; status: string }
+-  >();
+ 
+-  constructor(private readonly webhookSecret: string) {}
++  constructor(
++    private readonly prisma: PrismaService,
++    private readonly webhookSecret: string,
++  ) {}
+ 
+   async createIntent(input: CreateIntentInput): Promise<PaymentIntentRef> {
+     const id = `pi_fake_${randomUUID().replaceAll('-', '').slice(0, 24)}`;
+-    this.intents.set(id, {
+-      bookingId: input.bookingId,
+-      amountCents: input.amountCents,
+-      status: 'requires_payment_method',
++    await this.prisma.fakePaymentIntent.create({
++      data: {
++        id,
++        bookingId: input.bookingId,
++        amountCents: input.amountCents,
++        status: 'requires_payment_method',
++      },
+     });
+     return { id, clientSecret: `${id}_secret_fake` };
+   }
+ 
++  /** Like Stripe, refuses to cancel an intent that already succeeded. */
+   async cancelIntent(paymentId: string): Promise<void> {
+-    const intent = this.intents.get(paymentId);
+-    if (intent) intent.status = 'canceled';
++    const intent = await this.prisma.fakePaymentIntent.findUnique({ where: { id: paymentId } });
++    if (!intent) throw new Error(`no such payment intent ${paymentId}`);
++    if (intent.status === 'succeeded') {
++      throw new Error('a succeeded payment intent cannot be canceled');
++    }
++    await this.prisma.fakePaymentIntent.update({
++      where: { id: paymentId },
++      data: { status: 'canceled' },
++    });
++  }
++
++  async intentStatus(paymentId: string): Promise<string | undefined> {
++    const intent = await this.prisma.fakePaymentIntent.findUnique({ where: { id: paymentId } });
++    return intent?.status;
+   }
+ 
+   constructEvent(rawBody: Buffer | string, signature: string | undefined): ProviderEvent {
+@@ -60,14 +76,22 @@ export class FakePaymentProvider implements PaymentProvider {
+    * What Stripe would send for a payment attempt, in the order it would create them:
+    * `payment_intent.created` at t, `payment_intent.processing` at t+1 s, then the outcome at t+2 s.
+    */
+-  pay(paymentId: string, outcome: FakeOutcome, at = new Date()): SignedEvent[] {
+-    const intent = this.intents.get(paymentId);
+-    if (intent) intent.status = outcome;
++  async pay(paymentId: string, outcome: FakeOutcome, at = new Date()): Promise<SignedEvent[]> {
++    const intent = await this.prisma.fakePaymentIntent.findUnique({ where: { id: paymentId } });
++    if (intent) {
++      await this.prisma.fakePaymentIntent.update({
++        where: { id: paymentId },
++        data: { status: outcome },
++      });
++    }
+     const t = Math.floor(at.getTime() / 1000);
++    const meta = intent
++      ? { amountCents: intent.amountCents, bookingId: intent.bookingId }
++      : undefined;
+     return [
+-      this.sign(paymentId, 'payment_intent.created', t),
+-      this.sign(paymentId, 'payment_intent.processing', t + 1),
+-      this.sign(paymentId, `payment_intent.${outcome}`, t + 2),
++      this.sign(paymentId, 'payment_intent.created', t, undefined, meta),
++      this.sign(paymentId, 'payment_intent.processing', t + 1, undefined, meta),
++      this.sign(paymentId, `payment_intent.${outcome}`, t + 2, undefined, meta),
+     ];
+   }
+ 
+@@ -77,8 +101,8 @@ export class FakePaymentProvider implements PaymentProvider {
+     type: string,
+     createdSeconds: number,
+     id = `evt_fake_${randomUUID().replaceAll('-', '').slice(0, 24)}`,
++    meta?: { amountCents: number; bookingId: string },
+   ): SignedEvent {
+-    const intent = this.intents.get(paymentId);
+     const payload = JSON.stringify({
+       id,
+       object: 'event',
+@@ -89,10 +113,10 @@ export class FakePaymentProvider implements PaymentProvider {
+         object: {
+           id: paymentId,
+           object: 'payment_intent',
+-          amount: intent?.amountCents ?? 0,
++          amount: meta?.amountCents ?? 0,
+           currency: 'usd',
+           status: type.replace('payment_intent.', ''),
+-          metadata: intent ? { bookingId: intent.bookingId } : {},
++          metadata: meta ? { bookingId: meta.bookingId } : {},
+         },
+       },
+     });
+diff --git a/src/payments/payments.module.ts b/src/payments/payments.module.ts
+index 74d8d64..8b3ad8f 100644
+--- a/src/payments/payments.module.ts
++++ b/src/payments/payments.module.ts
+@@ -2,6 +2,7 @@ import { Inject, Module, OnModuleInit } from '@nestjs/common';
+ import { Logger } from 'nestjs-pino';
+ import Stripe from 'stripe';
+ import { CONFIG, type Config } from '../config';
++import { PrismaService } from '../prisma/prisma.service';
+ import { FakePaymentProvider } from './fake.provider';
+ import { FakePspController } from './fake-psp.controller';
+ import { PAYMENT_PROVIDER, type PaymentProvider } from './payment.provider';
+@@ -19,11 +20,11 @@ import { WebhooksController } from './webhooks.controller';
+     PaymentEventsService,
+     {
+       provide: PAYMENT_PROVIDER,
+-      inject: [CONFIG],
+-      useFactory: (cfg: Config): PaymentProvider =>
++      inject: [CONFIG, PrismaService],
++      useFactory: (cfg: Config, prisma: PrismaService): PaymentProvider =>
+         cfg.STRIPE_SECRET_KEY
+           ? new StripeProvider(new Stripe(cfg.STRIPE_SECRET_KEY), cfg.STRIPE_WEBHOOK_SECRET)
+-          : new FakePaymentProvider(cfg.STRIPE_WEBHOOK_SECRET),
++          : new FakePaymentProvider(prisma, cfg.STRIPE_WEBHOOK_SECRET),
+     },
+   ],
+   exports: [PAYMENT_PROVIDER, PaymentEventsService],
+diff --git a/src/queue/queue.module.ts b/src/queue/queue.module.ts
+new file mode 100644
+index 0000000..21691bd
+--- /dev/null
++++ b/src/queue/queue.module.ts
+@@ -0,0 +1,23 @@
++import { BullModule } from '@nestjs/bullmq';
++import { Global, Module } from '@nestjs/common';
++import { CONFIG, type Config } from '../config';
++
++export const HOLDS_QUEUE = 'holds';
++export const NOTIFICATIONS_QUEUE = 'notifications';
++
++/** BullMQ on the configured Redis; both queues are registered once, here, for API and worker. */
++@Global()
++@Module({
++  imports: [
++    BullModule.forRootAsync({
++      inject: [CONFIG],
++      useFactory: (cfg: Config) => ({
++        connection: { url: cfg.REDIS_URL },
++        defaultJobOptions: { removeOnComplete: 1000, removeOnFail: 5000 },
++      }),
++    }),
++    BullModule.registerQueue({ name: HOLDS_QUEUE }, { name: NOTIFICATIONS_QUEUE }),
++  ],
++  exports: [BullModule],
++})
++export class QueueModule {}
+diff --git a/src/worker.module.ts b/src/worker.module.ts
+new file mode 100644
+index 0000000..bafb138
+--- /dev/null
++++ b/src/worker.module.ts
+@@ -0,0 +1,16 @@
++import { DynamicModule, Module } from '@nestjs/common';
++import { HoldsWorkerModule } from './bookings/holds/holds-worker.module';
++import { type Config } from './config';
++import { CoreModule } from './core.module';
++import { PaymentsModule } from './payments/payments.module';
++
++/** The worker process: BullMQ processors and the periodic jobs. No HTTP. */
++@Module({})
++export class WorkerModule {
++  static forRoot(config?: Config): DynamicModule {
++    return {
++      module: WorkerModule,
++      imports: [CoreModule.forRoot(config), PaymentsModule, HoldsWorkerModule],
++    };
++  }
++}
+diff --git a/src/worker.ts b/src/worker.ts
+index dafb643..58c7fda 100644
+--- a/src/worker.ts
++++ b/src/worker.ts
+@@ -1,13 +1,23 @@
+-// The worker process: BullMQ processors, the hold sweeper and the outbox relay live here (added
+-// in later pull requests). Kept separate from the API so load on one does not starve the other.
++// The worker process: BullMQ processors, the hold sweeper and (later) the outbox relay. Kept
++// separate from the API so load on one does not starve the other.
++import type { INestApplicationContext } from '@nestjs/common';
+ import { NestFactory } from '@nestjs/core';
+ import { Logger } from 'nestjs-pino';
+-import { AppModule } from './app.module';
++import type { Config } from './config';
++import { WorkerModule } from './worker.module';
+ 
+-async function bootstrap(): Promise<void> {
+-  const app = await NestFactory.createApplicationContext(AppModule.forRoot(), { bufferLogs: true });
++export async function createWorker(config?: Config): Promise<INestApplicationContext> {
++  const app = await NestFactory.createApplicationContext(WorkerModule.forRoot(config), {
++    bufferLogs: true,
++  });
+   app.useLogger(app.get(Logger));
+   app.enableShutdownHooks();
++  return app;
++}
++
++async function bootstrap(): Promise<void> {
++  const app = await createWorker();
++  await app.init();
+   app.get(Logger).log('worker ready');
+ }
+ 
+diff --git a/test/integration/harness.ts b/test/integration/harness.ts
+index 1bb058b..aec2102 100644
+--- a/test/integration/harness.ts
++++ b/test/integration/harness.ts
+@@ -1,15 +1,14 @@
++import type { INestApplicationContext } from '@nestjs/common';
+ import type { NestFastifyApplication } from '@nestjs/platform-fastify';
+ import { inject } from 'vitest';
+ import { seed } from '../../prisma/seed';
+-import { loadConfig } from '../../src/config';
++import { type Config, loadConfig } from '../../src/config';
+ import { createApp } from '../../src/main';
+ import { PrismaService } from '../../src/prisma/prisma.service';
++import { createWorker } from '../../src/worker';
+ 
+-/** A booted application against the shared test containers, with `inject` for requests. */
+-export async function createTestApp(
+-  overrides: Record<string, string> = {},
+-): Promise<NestFastifyApplication> {
+-  const config = loadConfig({
++export function testConfig(overrides: Record<string, string> = {}): Config {
++  return loadConfig({
+     ...process.env,
+     NODE_ENV: 'test',
+     LOG_LEVEL: 'silent',
+@@ -17,17 +16,32 @@ export async function createTestApp(
+     REDIS_URL: inject('redisUrl'),
+     ...overrides,
+   });
+-  const app = await createApp(config);
++}
++
++/** A booted application against the shared test containers, with `inject` for requests. */
++export async function createTestApp(
++  overrides: Record<string, string> = {},
++): Promise<NestFastifyApplication> {
++  const app = await createApp(testConfig(overrides));
+   await app.init();
+   await app.getHttpAdapter().getInstance().ready();
+   return app;
+ }
+ 
++/** The worker process, booted in-process against the same containers. */
++export async function createTestWorker(
++  overrides: Record<string, string> = {},
++): Promise<INestApplicationContext> {
++  const worker = await createWorker(testConfig(overrides));
++  await worker.init();
++  return worker;
++}
++
+ /** Empties every table and re-seeds the resources — call in beforeEach. */
+ export async function resetDatabase(app: NestFastifyApplication): Promise<void> {
+   const prisma = app.get(PrismaService);
+   await prisma.$executeRawUnsafe(
+-    'TRUNCATE TABLE bookings, idempotency_keys, payment_events, outbox_events, processed_jobs, resources RESTART IDENTITY CASCADE',
++    'TRUNCATE TABLE bookings, idempotency_keys, payment_events, outbox_events, processed_jobs, fake_payment_intents, resources RESTART IDENTITY CASCADE',
+   );
+   await seed(prisma);
+ }
+diff --git a/test/integration/holds.test.ts b/test/integration/holds.test.ts
+new file mode 100644
+index 0000000..fc5d457
+--- /dev/null
++++ b/test/integration/holds.test.ts
+@@ -0,0 +1,209 @@
++import { getQueueToken } from '@nestjs/bullmq';
++import type { INestApplicationContext } from '@nestjs/common';
++import type { NestFastifyApplication } from '@nestjs/platform-fastify';
++import type { Queue } from 'bullmq';
++import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
++import { expireJobId, SWEEPER_ID } from '../../src/bookings/holds/hold.scheduler';
++import { HoldExpiryService } from '../../src/bookings/holds/hold-expiry.service';
++import type { FakePaymentProvider } from '../../src/payments/fake.provider';
++import { PAYMENT_PROVIDER } from '../../src/payments/payment.provider';
++import { PrismaService } from '../../src/prisma/prisma.service';
++import { HOLDS_QUEUE } from '../../src/queue/queue.module';
++import { createTestApp, createTestWorker, resetDatabase } from './harness';
++
++const SLOT = { startsAt: '2026-10-01T09:00:00.000Z', endsAt: '2026-10-01T10:00:00.000Z' };
++
++let app: NestFastifyApplication;
++let worker: INestApplicationContext;
++let prisma: PrismaService;
++let psp: FakePaymentProvider;
++let queue: Queue;
++
++beforeAll(async () => {
++  app = await createTestApp({ HOLD_TTL_SECONDS: '1', HOLD_SWEEP_INTERVAL_MS: '600000' });
++  worker = await createTestWorker({ HOLD_TTL_SECONDS: '1', HOLD_SWEEP_INTERVAL_MS: '600000' });
++  prisma = app.get(PrismaService);
++  psp = app.get<FakePaymentProvider>(PAYMENT_PROVIDER);
++  queue = app.get<Queue>(getQueueToken(HOLDS_QUEUE));
++});
++afterAll(async () => {
++  await worker.close();
++  await app.close();
++});
++beforeEach(async () => {
++  await resetDatabase(app);
++  await queue.drain(true);
++});
++
++async function hold(resourceId = 'room-1', userId = 'alice', slot = SLOT) {
++  const response = await app.inject({
++    method: 'POST',
++    url: '/bookings',
++    headers: { 'idempotency-key': `${userId}-${resourceId}-${Math.random()}`, 'x-user-id': userId },
++    payload: { resourceId, ...slot },
++  });
++  expect(response.statusCode).toBe(201);
++  return response.json<{ id: string; holdExpiresAt: string; payment: { id: string } }>();
++}
++
++const status = async (id: string) =>
++  (await prisma.booking.findUniqueOrThrow({ where: { id } })).status;
++
++describe('hold expiry', () => {
++  it('expires an unpaid hold after the TTL through the delayed job, cancels the intent and frees the seat', async () => {
++    const booking = await hold();
++    expect(new Date(booking.holdExpiresAt).getTime()).toBeGreaterThan(Date.now());
++    expect(await queue.getJob(expireJobId(booking.id))).toBeTruthy();
++    await vi.waitFor(async () => expect(await status(booking.id)).toBe('EXPIRED'), {
++      timeout: 10_000,
++      interval: 100,
++    });
++    // the intent is cancelled after the row is committed, so give it a moment
++    await vi.waitFor(async () =>
++      expect(await psp.intentStatus(booking.payment.id)).toBe('canceled'),
++    );
++    const again = await hold('room-1', 'bob');
++    expect(again.id).not.toBe(booking.id);
++  });
++
++  it('leaves a hold alone once it is paid', async () => {
++    const booking = await hold();
++    await app.inject({
++      method: 'POST',
++      url: `/fake-psp/payments/${booking.payment.id}/pay`,
++      payload: { order: 'stripe', duplicate: false },
++    });
++    expect(await status(booking.id)).toBe('CONFIRMED');
++    await vi.waitFor(
++      async () => {
++        const job = await queue.getJob(expireJobId(booking.id));
++        expect(await job?.getState()).toBe('completed');
++      },
++      { timeout: 10_000, interval: 100 },
++    );
++    expect(await status(booking.id)).toBe('CONFIRMED');
++    expect(await psp.intentStatus(booking.payment.id)).toBe('succeeded');
++  });
++
++  it('is scheduled once per booking, even when the request is retried', async () => {
++    const headers = { 'idempotency-key': 'k-hold', 'x-user-id': 'alice' };
++    const first = await app.inject({
++      method: 'POST',
++      url: '/bookings',
++      headers,
++      payload: { resourceId: 'room-2', ...SLOT },
++    });
++    const retry = await app.inject({
++      method: 'POST',
++      url: '/bookings',
++      headers,
++      payload: { resourceId: 'room-2', ...SLOT },
++    });
++    expect([first.statusCode, retry.statusCode]).toEqual([201, 201]);
++    const delayed = await queue.getDelayed();
++    expect(delayed.filter((j) => j.id === expireJobId(first.json().id))).toHaveLength(1);
++  });
++});
++
++describe('the sweeper', () => {
++  it('expires holds whose delayed job was lost, and nothing else', async () => {
++    const lost = await prisma.booking.create({
++      data: {
++        resourceId: 'room-3',
++        userId: 'carol',
++        startsAt: SLOT.startsAt,
++        endsAt: SLOT.endsAt,
++        exclusive: true,
++        status: 'HELD',
++        holdExpiresAt: new Date(Date.now() - 60_000),
++      },
++    });
++    const fresh = await prisma.booking.create({
++      data: {
++        resourceId: 'room-4',
++        userId: 'carol',
++        startsAt: SLOT.startsAt,
++        endsAt: SLOT.endsAt,
++        exclusive: true,
++        status: 'HELD',
++        holdExpiresAt: new Date(Date.now() + 60_000),
++      },
++    });
++    const confirmed = await prisma.booking.create({
++      data: {
++        resourceId: 'room-5',
++        userId: 'carol',
++        startsAt: SLOT.startsAt,
++        endsAt: SLOT.endsAt,
++        exclusive: true,
++        status: 'CONFIRMED',
++        holdExpiresAt: new Date(Date.now() - 60_000),
++      },
++    });
++    expect(await worker.get(HoldExpiryService).sweep()).toBe(1);
++    expect(await status(lost.id)).toBe('EXPIRED');
++    expect(await status(fresh.id)).toBe('HELD');
++    expect(await status(confirmed.id)).toBe('CONFIRMED');
++    expect(await worker.get(HoldExpiryService).sweep()).toBe(0);
++  });
++
++  it('is registered as a repeatable job by the worker', async () => {
++    const schedulers = await queue.getJobSchedulers();
++    expect(schedulers.map((s) => s.key ?? s.id)).toContain(SWEEPER_ID);
++  });
++
++  it('works in batches larger than one', async () => {
++    await prisma.booking.createMany({
++      data: Array.from({ length: 7 }, (_, i) => ({
++        resourceId: 'pool-hot-desks',
++        userId: `u${i}`,
++        startsAt: SLOT.startsAt,
++        endsAt: SLOT.endsAt,
++        exclusive: false,
++        status: 'HELD' as const,
++        holdExpiresAt: new Date(Date.now() - 1000),
++      })),
++    });
++    expect(await worker.get(HoldExpiryService).sweep(3)).toBe(7);
++    expect(await prisma.booking.count({ where: { status: 'EXPIRED' } })).toBe(7);
++  });
++});
++
++describe('DELETE /bookings/:id', () => {
++  const cancel = (id: string, userId = 'alice') =>
++    app.inject({ method: 'DELETE', url: `/bookings/${id}`, headers: { 'x-user-id': userId } });
++
++  it('cancels a hold, cancels its intent and frees the seat', async () => {
++    const booking = await hold();
++    const response = await cancel(booking.id);
++    expect(response.statusCode).toBe(200);
++    expect(response.json()).toMatchObject({ id: booking.id, status: 'CANCELLED' });
++    expect(await psp.intentStatus(booking.payment.id)).toBe('canceled');
++    expect((await hold('room-1', 'bob')).id).not.toBe(booking.id);
++  });
++
++  it('cancels a confirmed booking too, and is idempotent', async () => {
++    const booking = await hold();
++    await app.inject({
++      method: 'POST',
++      url: `/fake-psp/payments/${booking.payment.id}/pay`,
++      payload: { order: 'stripe', duplicate: false },
++    });
++    expect((await cancel(booking.id)).json()).toMatchObject({ status: 'CANCELLED' });
++    expect((await cancel(booking.id)).statusCode).toBe(200);
++    expect(await status(booking.id)).toBe('CANCELLED');
++  });
++
++  it('refuses another user, an unknown booking, an expired one, and a missing user header', async () => {
++    const booking = await hold();
++    expect((await cancel(booking.id, 'mallory')).statusCode).toBe(403);
++    expect((await cancel('00000000-0000-0000-0000-000000000000')).statusCode).toBe(404);
++    await prisma.booking.update({ where: { id: booking.id }, data: { status: 'EXPIRED' } });
++    const expired = await cancel(booking.id);
++    expect(expired.statusCode).toBe(409);
++    expect(expired.json()).toMatchObject({ code: 'invalid_transition' });
++    expect(
++      (await app.inject({ method: 'DELETE', url: `/bookings/${booking.id}` })).statusCode,
++    ).toBe(400);
++  });
++});
+diff --git a/test/integration/webhooks.test.ts b/test/integration/webhooks.test.ts
+index 6ee98b8..8ad29d1 100644
+--- a/test/integration/webhooks.test.ts
++++ b/test/integration/webhooks.test.ts
+@@ -102,7 +102,7 @@ describe('POST /bookings creates a payment intent', () => {
+ describe('POST /webhooks/payments', () => {
+   it("confirms a hold when the events arrive in Stripe's order", async () => {
+     const booking = await hold();
+-    const events = psp.pay(booking.payment.id, 'succeeded');
++    const events = await psp.pay(booking.payment.id, 'succeeded');
+     const outcomes: string[] = [];
+     for (const event of events) {
+       const response = await deliver(event);
+@@ -118,7 +118,7 @@ describe('POST /webhooks/payments', () => {
+ 
+   it('converges on the same state when the events arrive reversed, and a late cancel is stale', async () => {
+     const booking = await hold();
+-    const [created, processing, succeeded] = psp.pay(booking.payment.id, 'succeeded');
++    const [created, processing, succeeded] = await psp.pay(booking.payment.id, 'succeeded');
+     if (!created || !processing || !succeeded) throw new Error('events');
+     expect((await deliver(succeeded)).json()).toMatchObject({
+       outcome: 'APPLIED',
+@@ -151,7 +151,7 @@ describe('POST /webhooks/payments', () => {
+ 
+   it('records a redelivered event as DUPLICATE, also when the redeliveries race', async () => {
+     const booking = await hold();
+-    const [, , succeeded] = psp.pay(booking.payment.id, 'succeeded');
++    const [, , succeeded] = await psp.pay(booking.payment.id, 'succeeded');
+     if (!succeeded) throw new Error('events');
+     const responses = await Promise.all(Array.from({ length: 10 }, () => deliver(succeeded)));
+     const outcomes = responses.map((r) => r.json().outcome).sort();
+@@ -163,7 +163,7 @@ describe('POST /webhooks/payments', () => {
+ 
+   it('converges when whole sequences are delivered concurrently and shuffled', async () => {
+     const booking = await hold();
+-    const events = psp.pay(booking.payment.id, 'succeeded');
++    const events = await psp.pay(booking.payment.id, 'succeeded');
+     const shuffled = [...events, ...events, ...events].sort(() => Math.random() - 0.5);
+     const responses = await Promise.all(shuffled.map((e) => deliver(e)));
+     expect(responses.every((r) => r.statusCode === 200)).toBe(true);
+@@ -175,7 +175,7 @@ describe('POST /webhooks/payments', () => {
+ 
+   it('cancels a hold on payment_intent.canceled and frees the seat', async () => {
+     const booking = await hold();
+-    const [, , canceled] = psp.pay(booking.payment.id, 'canceled');
++    const [, , canceled] = await psp.pay(booking.payment.id, 'canceled');
+     if (!canceled) throw new Error('events');
+     expect((await deliver(canceled)).json()).toMatchObject({
+       outcome: 'APPLIED',
+@@ -188,7 +188,7 @@ describe('POST /webhooks/payments', () => {
+   it('marks money for a booking that no longer holds its seat as ORPHANED', async () => {
+     const booking = await hold();
+     await prisma.booking.update({ where: { id: booking.id }, data: { status: 'EXPIRED' } });
+-    const [, , succeeded] = psp.pay(booking.payment.id, 'succeeded');
++    const [, , succeeded] = await psp.pay(booking.payment.id, 'succeeded');
+     if (!succeeded) throw new Error('events');
+     expect((await deliver(succeeded)).json()).toMatchObject({
+       outcome: 'ORPHANED',
+diff --git a/test/unit/fake.provider.test.ts b/test/unit/fake.provider.test.ts
+index 027e1e5..7990116 100644
+--- a/test/unit/fake.provider.test.ts
++++ b/test/unit/fake.provider.test.ts
+@@ -3,13 +3,39 @@ import { FakePaymentProvider } from '../../src/payments/fake.provider';
+ 
+ const SECRET = 'whsec_test_secret';
+ 
++/** Just enough of PrismaService for the fake PSP's intents. */
++function memoryPrisma() {
++  const rows = new Map<
++    string,
++    { id: string; bookingId: string; amountCents: number; status: string }
++  >();
++  return {
++    fakePaymentIntent: {
++      create: async ({
++        data,
++      }: {
++        data: { id: string; bookingId: string; amountCents: number; status: string };
++      }) => {
++        rows.set(data.id, { ...data });
++        return data;
++      },
++      findUnique: async ({ where }: { where: { id: string } }) => rows.get(where.id) ?? null,
++      update: async ({ where, data }: { where: { id: string }; data: { status: string } }) => {
++        const row = rows.get(where.id);
++        if (row) row.status = data.status;
++        return row;
++      },
++    },
++  } as never;
++}
++
+ describe('FakePaymentProvider', () => {
+   it('creates intents and produces the three events Stripe would, in order, a second apart', async () => {
+-    const psp = new FakePaymentProvider(SECRET);
++    const psp = new FakePaymentProvider(memoryPrisma(), SECRET);
+     const intent = await psp.createIntent({ bookingId: 'b1', amountCents: 2500, currency: 'usd' });
+     expect(intent.id).toMatch(/^pi_fake_/);
+     expect(intent.clientSecret).toContain('_secret_');
+-    const events = psp.pay(intent.id, 'succeeded', new Date('2026-10-01T09:00:00Z'));
++    const events = await psp.pay(intent.id, 'succeeded', new Date('2026-10-01T09:00:00Z'));
+     expect(events.map((e) => e.type)).toEqual([
+       'payment_intent.created',
+       'payment_intent.processing',
+@@ -23,9 +49,9 @@ describe('FakePaymentProvider', () => {
+   });
+ 
+   it('signs with the Stripe scheme, so the same verification accepts it and rejects tampering', async () => {
+-    const psp = new FakePaymentProvider(SECRET);
++    const psp = new FakePaymentProvider(memoryPrisma(), SECRET);
+     const intent = await psp.createIntent({ bookingId: 'b1', amountCents: 2500, currency: 'usd' });
+-    const [event] = psp.pay(intent.id, 'succeeded');
++    const [event] = await psp.pay(intent.id, 'succeeded');
+     if (!event) throw new Error('no event');
+     const parsed = psp.constructEvent(event.payload, event.signature);
+     expect(parsed).toMatchObject({
+@@ -38,7 +64,10 @@ describe('FakePaymentProvider', () => {
+     ).toThrow(/signature/);
+     expect(() => psp.constructEvent(event.payload, undefined)).toThrow(/signature/);
+     expect(() =>
+-      new FakePaymentProvider('whsec_other').constructEvent(event.payload, event.signature),
++      new FakePaymentProvider(memoryPrisma(), 'whsec_other').constructEvent(
++        event.payload,
++        event.signature,
++      ),
+     ).toThrow(/signature/);
+   });
+ });

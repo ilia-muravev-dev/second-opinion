@@ -1,0 +1,4073 @@
+diff --git a/.github/dependabot.yml b/.github/dependabot.yml
+index 2d22228..3e432ba 100644
+--- a/.github/dependabot.yml
++++ b/.github/dependabot.yml
+@@ -15,3 +15,7 @@ updates:
+     directory: /
+     schedule:
+       interval: monthly
++  - package-ecosystem: docker
++    directory: /backend
++    schedule:
++      interval: monthly
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 4b8eddd..5a9fde7 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -27,3 +27,5 @@ jobs:
+       - run: uv run ruff format --check .
+       - run: uv run mypy
+       - run: uv run pytest --cov --cov-report=term-missing
++      - name: The committed API contract is current
++        run: uv run fieldwise openapi /tmp/openapi.json && diff -q /tmp/openapi.json ../openapi.json
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 51ddfdc..a89860e 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -4,7 +4,8 @@ Monorepo: `backend/` (Python 3.12, uv, FastAPI, SQLAlchemy 2 sync + psycopg 3, C
+ and `web/` (Next.js). Postgres with pgvector and Redis run from `docker-compose.yml`.
+ 
+ ## Commands
+-- `just up` — Postgres + Redis; `just check` — everything CI runs; `just backend-fix` — ruff fixes + format
++- `just up` — Postgres + Redis; `just app` — the whole stack in Docker (migrate, API :8000, worker);
++  `just check` — everything CI runs; `just backend-fix` — ruff fixes + format; `just openapi` — regenerate the contract
+ - `cd backend && uv run fieldwise --help` — the CLI: `db`, `schemas`, `ingest`, `ocr`, `extract`, `eval`
+ - `uv run fieldwise eval run --prompt v1 --limit 20 --cassette record` — measure; `eval compare a b` — the README table
+ - Tests: `uv run pytest` (unit) — integration tests need Docker and are marked `integration`
+diff --git a/backend/.dockerignore b/backend/.dockerignore
+new file mode 100644
+index 0000000..fc4f865
+--- /dev/null
++++ b/backend/.dockerignore
+@@ -0,0 +1,13 @@
++.venv
++data
++evals/cassettes
++tests
++scripts
++.env
++.env.*
++__pycache__
++*.pyc
++.mypy_cache
++.ruff_cache
++.pytest_cache
++openapi.json
+diff --git a/backend/.env.example b/backend/.env.example
+index 6c0cc0f..48b0d83 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -17,7 +17,7 @@ ANTHROPIC_API_KEY=
+ #   OPENAI_API_KEY=sk-or-...
+ #   DEFAULT_MODEL=qwen/qwen3.8-27b:free
+ # A local Ollama model (brew install ollama; ollama pull qwen2.5vl:7b):
+-#   OPENAI_BASE_URL=http://localhost:11434/v1
++#   OPENAI_BASE_URL=http://localhost:11434/v1        (from Docker: http://host.docker.internal:11434/v1)
+ #   OPENAI_API_KEY=ollama
+ #   DEFAULT_MODEL=qwen2.5vl:7b
+ OPENAI_BASE_URL=https://openrouter.ai/api/v1
+diff --git a/backend/Dockerfile b/backend/Dockerfile
+new file mode 100644
+index 0000000..4f72fe2
+--- /dev/null
++++ b/backend/Dockerfile
+@@ -0,0 +1,20 @@
++# syntax=docker/dockerfile:1.7
++FROM python:3.12-slim AS base
++ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy \
++    UV_PROJECT_ENVIRONMENT=/opt/venv PATH=/opt/venv/bin:$PATH
++# libglib is needed by opencv-python-headless; nothing else from the OS.
++RUN apt-get update && apt-get install -y --no-install-recommends libglib2.0-0 && rm -rf /var/lib/apt/lists/*
++COPY --from=ghcr.io/astral-sh/uv:0.12 /uv /uvx /bin/
++WORKDIR /app
++
++FROM base AS deps
++COPY pyproject.toml uv.lock ./
++RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev --no-install-project
++
++FROM deps AS runtime
++COPY . .
++RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
++# OCR and embedding models are fetched on first use into these caches (mounted volumes in compose).
++ENV HF_HOME=/models/hf FASTEMBED_CACHE_PATH=/models/fastembed
++EXPOSE 8000
++CMD ["uvicorn", "fieldwise.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+diff --git a/backend/pyproject.toml b/backend/pyproject.toml
+index 51f4eda..b846464 100644
+--- a/backend/pyproject.toml
++++ b/backend/pyproject.toml
+@@ -30,6 +30,8 @@ dependencies = [
+   "jsonschema>=4.26,<5",
+   "openai>=2,<3",
+   "fastembed>=0.8,<1",
++  "celery[redis]>=5.6,<6",
++  "python-multipart>=0.0.32,<1",
+ ]
+ 
+ [project.scripts]
+@@ -47,6 +49,7 @@ dev = [
+   "boto3-stubs[s3]>=1.43,<2",
+   "pyarrow-stubs>=20",
+   "types-jsonschema>=4.25",
++  "celery-types>=0.23",
+ ]
+ 
+ [tool.uv]
+diff --git a/backend/src/fieldwise/api/app.py b/backend/src/fieldwise/api/app.py
+index 66753e0..9196c09 100644
+--- a/backend/src/fieldwise/api/app.py
++++ b/backend/src/fieldwise/api/app.py
+@@ -1,8 +1,10 @@
+ """FastAPI application factory."""
+ 
+ from fastapi import FastAPI
++from fastapi.middleware.cors import CORSMiddleware
+ 
+ from fieldwise import __version__
++from fieldwise.api.routers import documents, evals, meta, runs, schemas
+ from fieldwise.config import get_settings
+ from fieldwise.logging import configure_logging
+ 
+@@ -15,11 +17,17 @@ def create_app() -> FastAPI:
+         version=__version__,
+         description="Schema-driven document extraction with a review UI and per-field evals.",
+     )
+-
+-    @app.get("/health", tags=["meta"])
+-    def health() -> dict[str, str]:
+-        return {"status": "ok", "version": __version__}
+-
++    app.add_middleware(
++        CORSMiddleware,
++        allow_origins=settings.cors_origins,
++        allow_methods=["*"],
++        allow_headers=["*"],
++    )
++    app.include_router(meta.router)
++    app.include_router(schemas.router)
++    app.include_router(documents.router)
++    app.include_router(runs.router)
++    app.include_router(evals.router)
+     return app
+ 
+ 
+diff --git a/backend/src/fieldwise/api/deps.py b/backend/src/fieldwise/api/deps.py
+new file mode 100644
+index 0000000..772d28e
+--- /dev/null
++++ b/backend/src/fieldwise/api/deps.py
+@@ -0,0 +1,20 @@
++from collections.abc import Iterator
++from typing import Annotated
++
++from fastapi import Depends
++from sqlalchemy.orm import Session
++
++from fieldwise.db.engine import get_db
++from fieldwise.storage import Storage, get_storage
++
++
++def _db() -> Iterator[Session]:
++    yield from get_db()
++
++
++def _storage() -> Storage:
++    return get_storage()
++
++
++DbSession = Annotated[Session, Depends(_db)]
++Blobs = Annotated[Storage, Depends(_storage)]
+diff --git a/backend/src/fieldwise/api/models.py b/backend/src/fieldwise/api/models.py
+new file mode 100644
+index 0000000..7c8d81a
+--- /dev/null
++++ b/backend/src/fieldwise/api/models.py
+@@ -0,0 +1,208 @@
++"""Response and request models: the contract the web client is generated from."""
++
++from __future__ import annotations
++
++import uuid
++from datetime import datetime
++from typing import Any
++
++from pydantic import BaseModel, ConfigDict, Field
++
++
++class FieldMetaOut(BaseModel):
++    path: str
++    type: str
++    matcher: str
++    description: str = ""
++    children: list[str] = Field(default_factory=list)
++
++
++class SchemaOut(BaseModel):
++    model_config = ConfigDict(from_attributes=True)
++
++    id: uuid.UUID
++    name: str
++    version: int
++    json_schema: dict[str, Any]
++    fields: list[FieldMetaOut]
++    created_at: datetime
++
++
++class PageOut(BaseModel):
++    page: int
++    width: int
++    height: int
++    url: str
++
++
++class RunSummary(BaseModel):
++    model_config = ConfigDict(from_attributes=True)
++
++    id: uuid.UUID
++    status: str
++    prompt_version: str
++    model: str
++    effort: str
++    fewshot_k: int
++    use_ocr_text: bool
++    provider: str
++    cost_usd: float | None = None
++    latency_ms: int | None = None
++    error: str | None = None
++    created_at: datetime
++
++
++class DocumentOut(BaseModel):
++    id: uuid.UUID
++    name: str
++    source: str
++    split: str | None
++    mime: str
++    page_count: int
++    ocr_status: str
++    has_golden: bool
++    latest_run: RunSummary | None = None
++    created_at: datetime
++
++
++class DocumentList(BaseModel):
++    items: list[DocumentOut]
++    total: int
++
++
++class OcrWordOut(BaseModel):
++    text: str
++    box: list[int]
++    conf: float
++
++
++class OcrSpanOut(BaseModel):
++    page: int
++    text: str
++    box: list[int]
++    conf: float
++    words: list[OcrWordOut] = Field(default_factory=list)
++
++
++class GoldenOut(BaseModel):
++    source: str
++    data: dict[str, Any]
++    created_at: datetime
++
++
++class DocumentDetail(DocumentOut):
++    pages: list[PageOut]
++    ocr_text: str | None
++    golden: GoldenOut | None = None
++    runs: list[RunSummary]
++
++
++class RunOut(RunSummary):
++    document_id: uuid.UUID
++    schema_id: uuid.UUID
++    result: dict[str, Any] | None = None
++    confidences: dict[str, float] | None = None
++    evidence: dict[str, Any] | None = None
++    boxes: dict[str, list[list[int]]] | None = None
++    fewshot_document_ids: list[str] | None = None
++    input_tokens: int | None = None
++    cache_read_tokens: int | None = None
++    cache_write_tokens: int | None = None
++    output_tokens: int | None = None
++    served_model: str | None = None
++    request_id: str | None = None
++    repair_rounds: int = 0
++
++
++class ExtractRequest(BaseModel):
++    schema_name: str = "receipt"
++    prompt: str = "v1"
++    model: str | None = None
++    effort: str | None = None
++    fewshot_k: int | None = None
++    use_ocr_text: bool | None = None
++
++
++class GoldenIn(BaseModel):
++    data: dict[str, Any]
++
++
++class PromptOut(BaseModel):
++    name: str
++    notes: str
++    use_ocr_text: bool
++    fewshot_k: int
++    use_evidence: bool
++    consistency_check: bool
++
++
++class ModelOut(BaseModel):
++    id: str
++    provider: str
++    input_per_mtok: float | None = None
++    output_per_mtok: float | None = None
++
++
++class EvalOut(BaseModel):
++    model_config = ConfigDict(from_attributes=True)
++
++    id: uuid.UUID
++    schema_id: uuid.UUID
++    prompt_version: str
++    model: str
++    effort: str
++    fewshot_k: int
++    use_ocr_text: bool
++    provider: str
++    split: str
++    mode: str
++    notes: str
++    status: str
++    doc_count: int
++    reps: int
++    succeeded: int
++    truncated: int
++    failed: int
++    per_field: dict[str, Any]
++    lists: dict[str, Any]
++    field_order: list[str] = Field(default_factory=list)
++    overall_accuracy: float | None = None
++    lenient_accuracy: float | None = None
++    value_accuracy: float | None = None
++    doc_exact_rate: float | None = None
++    cost_usd: float | None = None
++    cost_per_doc: float | None = None
++    p50_ms: int | None = None
++    p95_ms: int | None = None
++    errors: list[dict[str, Any]]
++    created_at: datetime
++    finished_at: datetime | None = None
++
++
++class EvalResultOut(BaseModel):
++    document_id: uuid.UUID
++    document_name: str
++    extraction_run_id: uuid.UUID
++    rep: int
++    status: str
++    all_correct: bool | None = None
++    outcomes: dict[str, Any] | None = None
++
++
++class EvalRequest(BaseModel):
++    schema_name: str = "receipt"
++    prompt: str = "v1"
++    model: str | None = None
++    effort: str | None = None
++    fewshot_k: int | None = None
++    use_ocr_text: bool | None = None
++    split: str = "test"
++    limit: int | None = None
++    reps: int = 1
++    mode: str = "sync"
++    notes: str = ""
++
++
++class TaskAccepted(BaseModel):
++    task_id: str
++    status: str = "queued"
+diff --git a/backend/src/fieldwise/api/routers/__init__.py b/backend/src/fieldwise/api/routers/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/backend/src/fieldwise/api/routers/documents.py b/backend/src/fieldwise/api/routers/documents.py
+new file mode 100644
+index 0000000..193b7f0
+--- /dev/null
++++ b/backend/src/fieldwise/api/routers/documents.py
+@@ -0,0 +1,236 @@
++import uuid
++from typing import Annotated
++
++from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile
++from sqlalchemy import func, or_, select
++from sqlalchemy.orm import Session
++
++from fieldwise.api.deps import Blobs, DbSession
++from fieldwise.api.models import (
++    DocumentDetail,
++    DocumentList,
++    DocumentOut,
++    ExtractRequest,
++    GoldenIn,
++    GoldenOut,
++    OcrSpanOut,
++    PageOut,
++    RunOut,
++    RunSummary,
++)
++from fieldwise.config import get_settings
++from fieldwise.db.models import Document, ExtractionRun, GoldenLabel
++from fieldwise.documents.render import UnsupportedDocumentError
++from fieldwise.documents.service import create_document
++from fieldwise.extraction.prompts.registry import PROMPTS
++from fieldwise.schemas.registry import get_schema
++from fieldwise.worker.tasks import process_document, run_queued_extraction
++
++router = APIRouter(prefix="/documents", tags=["documents"])
++
++MAX_UPLOAD_BYTES = 25 * 1024 * 1024
++
++
++def _latest_golden(db: Session, document_id: uuid.UUID) -> GoldenLabel | None:
++    labels = db.scalars(
++        select(GoldenLabel)
++        .where(GoldenLabel.document_id == document_id)
++        .order_by(GoldenLabel.created_at.desc())
++    ).all()
++    corrections = [label for label in labels if label.source == "correction"]
++    return corrections[0] if corrections else (labels[0] if labels else None)
++
++
++def _latest_run(db: Session, document_id: uuid.UUID) -> ExtractionRun | None:
++    return db.scalars(
++        select(ExtractionRun)
++        .where(ExtractionRun.document_id == document_id)
++        .order_by(ExtractionRun.created_at.desc())
++    ).first()
++
++
++def _document_out(db: Session, document: Document) -> DocumentOut:
++    run = _latest_run(db, document.id)
++    return DocumentOut(
++        id=document.id,
++        name=document.name,
++        source=document.source,
++        split=document.split,
++        mime=document.mime,
++        page_count=document.page_count,
++        ocr_status=document.ocr_status,
++        has_golden=_latest_golden(db, document.id) is not None,
++        latest_run=RunSummary.model_validate(run) if run else None,
++        created_at=document.created_at,
++    )
++
++
++def _get_document(db: Session, document_id: uuid.UUID) -> Document:
++    document = db.get(Document, document_id)
++    if document is None:
++        raise HTTPException(404, "document not found")
++    return document
++
++
++@router.get("", response_model=DocumentList)
++def list_documents(
++    db: DbSession,
++    split: str | None = None,
++    q: str | None = None,
++    limit: Annotated[int, Query(ge=1, le=200)] = 50,
++    offset: Annotated[int, Query(ge=0)] = 0,
++) -> DocumentList:
++    stmt = select(Document)
++    if split:
++        stmt = stmt.where(Document.split == split)
++    if q:
++        stmt = stmt.where(or_(Document.name.ilike(f"%{q}%"), Document.external_id.ilike(f"%{q}%")))
++    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
++    rows = db.scalars(stmt.order_by(Document.created_at.desc()).offset(offset).limit(limit)).all()
++    return DocumentList(items=[_document_out(db, d) for d in rows], total=total)
++
++
++@router.post("", response_model=DocumentOut, status_code=201)
++async def upload_document(
++    db: DbSession, blobs: Blobs, file: Annotated[UploadFile, File()]
++) -> DocumentOut:
++    data = await file.read()
++    if len(data) > MAX_UPLOAD_BYTES:
++        raise HTTPException(413, "file larger than 25 MB")
++    try:
++        document = create_document(
++            db, blobs, data=data, name=file.filename or "upload", source="upload"
++        )
++    except UnsupportedDocumentError as error:
++        raise HTTPException(415, str(error)) from error
++    db.commit()
++    if document.ocr_status != "done":
++        process_document.delay(str(document.id))
++    return _document_out(db, document)
++
++
++@router.get("/{document_id}", response_model=DocumentDetail)
++def get_document(document_id: uuid.UUID, db: DbSession) -> DocumentDetail:
++    document = _get_document(db, document_id)
++    golden = _latest_golden(db, document.id)
++    runs = db.scalars(
++        select(ExtractionRun)
++        .where(ExtractionRun.document_id == document.id)
++        .order_by(ExtractionRun.created_at.desc())
++        .limit(20)
++    ).all()
++    base = _document_out(db, document)
++    return DocumentDetail(
++        **base.model_dump(),
++        pages=[
++            PageOut(
++                page=int(p["page"]),
++                width=int(p["width"]),
++                height=int(p["height"]),
++                url=f"/documents/{document.id}/pages/{p['page']}",
++            )
++            for p in document.pages
++        ],
++        ocr_text=document.ocr_text,
++        golden=GoldenOut(source=golden.source, data=golden.data, created_at=golden.created_at)
++        if golden
++        else None,
++        runs=[RunSummary.model_validate(r) for r in runs],
++    )
++
++
++@router.get("/{document_id}/pages/{page}")
++def get_page(document_id: uuid.UUID, page: int, db: DbSession, blobs: Blobs) -> Response:
++    document = _get_document(db, document_id)
++    for record in document.pages:
++        if int(record["page"]) == page:
++            return Response(
++                blobs.get(str(record["key"])),
++                media_type="image/jpeg",
++                headers={"Cache-Control": "private, max-age=3600"},
++            )
++    raise HTTPException(404, "page not found")
++
++
++@router.get("/{document_id}/ocr", response_model=list[OcrSpanOut])
++def get_ocr(document_id: uuid.UUID, db: DbSession) -> list[OcrSpanOut]:
++    document = _get_document(db, document_id)
++    return [OcrSpanOut(**span) for span in (document.ocr_words or [])]
++
++
++@router.get("/{document_id}/runs", response_model=list[RunOut])
++def list_runs(document_id: uuid.UUID, db: DbSession) -> list[RunOut]:
++    _get_document(db, document_id)
++    runs = db.scalars(
++        select(ExtractionRun)
++        .where(ExtractionRun.document_id == document_id)
++        .order_by(ExtractionRun.created_at.desc())
++    ).all()
++    return [RunOut.model_validate(r) for r in runs]
++
++
++@router.post("/{document_id}/extract", response_model=RunOut, status_code=202)
++def extract(document_id: uuid.UUID, body: ExtractRequest, db: DbSession) -> RunOut:
++    document = _get_document(db, document_id)
++    schema = get_schema(db, body.schema_name)
++    if schema is None:
++        raise HTTPException(404, f"schema {body.schema_name!r} not found")
++    if body.prompt not in PROMPTS:
++        raise HTTPException(422, f"unknown prompt {body.prompt!r}")
++    settings = get_settings()
++    options = {
++        "prompt": body.prompt,
++        "model": body.model or settings.default_model,
++        "effort": body.effort or settings.default_effort,
++        "fewshot_k": body.fewshot_k,
++        "use_ocr_text": body.use_ocr_text,
++    }
++    run = ExtractionRun(
++        document_id=document.id,
++        schema_id=schema.id,
++        prompt_version=body.prompt,
++        model=str(options["model"]),
++        effort=str(options["effort"]),
++        provider=settings.llm_provider,
++        status="queued",
++    )
++    db.add(run)
++    db.commit()
++    run_queued_extraction.delay(str(run.id), options)
++    return RunOut.model_validate(run)
++
++
++@router.get("/{document_id}/golden", response_model=GoldenOut)
++def get_golden(document_id: uuid.UUID, db: DbSession) -> GoldenOut:
++    _get_document(db, document_id)
++    golden = _latest_golden(db, document_id)
++    if golden is None:
++        raise HTTPException(404, "no golden label")
++    return GoldenOut(source=golden.source, data=golden.data, created_at=golden.created_at)
++
++
++@router.put("/{document_id}/golden", response_model=GoldenOut)
++def put_golden(
++    document_id: uuid.UUID, body: GoldenIn, db: DbSession, schema_name: str = "receipt"
++) -> GoldenOut:
++    """Stores a reviewer's correction; it becomes the document's golden label."""
++    document = _get_document(db, document_id)
++    schema = get_schema(db, schema_name)
++    if schema is None:
++        raise HTTPException(404, f"schema {schema_name!r} not found")
++    existing = db.scalars(
++        select(GoldenLabel).where(
++            GoldenLabel.document_id == document.id,
++            GoldenLabel.schema_id == schema.id,
++            GoldenLabel.source == "correction",
++        )
++    ).first()
++    if existing is None:
++        existing = GoldenLabel(
++            document_id=document.id, schema_id=schema.id, data=body.data, source="correction"
++        )
++        db.add(existing)
++    else:
++        existing.data = body.data
++    db.commit()
++    return GoldenOut(source=existing.source, data=existing.data, created_at=existing.created_at)
+diff --git a/backend/src/fieldwise/api/routers/evals.py b/backend/src/fieldwise/api/routers/evals.py
+new file mode 100644
+index 0000000..3668555
+--- /dev/null
++++ b/backend/src/fieldwise/api/routers/evals.py
+@@ -0,0 +1,96 @@
++import uuid
++from typing import Annotated
++
++from fastapi import APIRouter, HTTPException, Query
++from sqlalchemy import select
++
++from fieldwise.api.deps import DbSession
++from fieldwise.api.models import EvalOut, EvalRequest, EvalResultOut, TaskAccepted
++from fieldwise.config import get_settings
++from fieldwise.db.models import Document, EvalResult, EvalRun, ExtractionRun
++from fieldwise.evals.report import ordered_fields, render_comparison
++from fieldwise.extraction.prompts.registry import PROMPTS
++from fieldwise.worker.tasks import run_eval_task
++
++router = APIRouter(prefix="/evals", tags=["evals"])
++
++
++def _out(run: EvalRun) -> EvalOut:
++    out = EvalOut.model_validate(run)
++    out.field_order = ordered_fields(run, run.per_field) + ordered_fields(run, run.lists)
++    return out
++
++
++@router.get("", response_model=list[EvalOut])
++def list_evals(db: DbSession, limit: Annotated[int, Query(ge=1, le=200)] = 50) -> list[EvalOut]:
++    runs = db.scalars(select(EvalRun).order_by(EvalRun.created_at.desc()).limit(limit)).all()
++    return [_out(r) for r in runs]
++
++
++@router.get("/compare")
++def compare(db: DbSession, ids: Annotated[list[uuid.UUID], Query()]) -> dict[str, object]:
++    runs = [db.get(EvalRun, run_id) for run_id in ids]
++    if any(r is None for r in runs):
++        raise HTTPException(404, "eval run not found")
++    found = [r for r in runs if r is not None]
++    return {
++        "runs": [_out(r).model_dump(mode="json") for r in found],
++        "markdown": render_comparison(found),
++    }
++
++
++@router.get("/{eval_id}", response_model=EvalOut)
++def get_eval(eval_id: uuid.UUID, db: DbSession) -> EvalOut:
++    run = db.get(EvalRun, eval_id)
++    if run is None:
++        raise HTTPException(404, "eval run not found")
++    return _out(run)
++
++
++@router.get("/{eval_id}/results", response_model=list[EvalResultOut])
++def get_results(eval_id: uuid.UUID, db: DbSession) -> list[EvalResultOut]:
++    if db.get(EvalRun, eval_id) is None:
++        raise HTTPException(404, "eval run not found")
++    rows = db.execute(
++        select(EvalResult, Document, ExtractionRun)
++        .join(Document, Document.id == EvalResult.document_id)
++        .join(ExtractionRun, ExtractionRun.id == EvalResult.extraction_run_id)
++        .where(EvalResult.eval_run_id == eval_id)
++        .order_by(Document.external_id, Document.name, EvalResult.rep)
++    ).all()
++    return [
++        EvalResultOut(
++            document_id=result.document_id,
++            document_name=document.name,
++            extraction_run_id=result.extraction_run_id,
++            rep=result.rep,
++            status=run.status,
++            all_correct=(result.outcomes or {}).get("all_correct") if result.outcomes else None,
++            outcomes=result.outcomes,
++        )
++        for result, document, run in rows
++    ]
++
++
++@router.post("", response_model=TaskAccepted, status_code=202)
++def start_eval(body: EvalRequest) -> TaskAccepted:
++    if body.prompt not in PROMPTS:
++        raise HTTPException(422, f"unknown prompt {body.prompt!r}")
++    if body.mode not in ("sync", "batch"):
++        raise HTTPException(422, "mode must be sync or batch")
++    settings = get_settings()
++    config = {
++        "schema": body.schema_name,
++        "prompt": body.prompt,
++        "model": body.model or settings.default_model,
++        "effort": body.effort or settings.default_effort,
++        "fewshot_k": body.fewshot_k,
++        "use_ocr_text": body.use_ocr_text,
++        "split": body.split,
++        "limit": body.limit,
++        "reps": body.reps,
++        "mode": body.mode,
++        "notes": body.notes,
++    }
++    task = run_eval_task.delay(config)
++    return TaskAccepted(task_id=task.id)
+diff --git a/backend/src/fieldwise/api/routers/meta.py b/backend/src/fieldwise/api/routers/meta.py
+new file mode 100644
+index 0000000..e2d7b64
+--- /dev/null
++++ b/backend/src/fieldwise/api/routers/meta.py
+@@ -0,0 +1,41 @@
++from fastapi import APIRouter
++
++from fieldwise import __version__
++from fieldwise.api.models import ModelOut, PromptOut
++from fieldwise.config import get_settings
++from fieldwise.extraction.pricing import PRICES
++from fieldwise.extraction.prompts.registry import PROMPTS
++
++router = APIRouter(tags=["meta"])
++
++
++@router.get("/health")
++def health() -> dict[str, str]:
++    return {"status": "ok", "version": __version__}
++
++
++@router.get("/prompts", response_model=list[PromptOut])
++def prompts() -> list[PromptOut]:
++    return [
++        PromptOut(
++            name=spec.name,
++            notes=spec.notes,
++            use_ocr_text=spec.use_ocr_text,
++            fewshot_k=spec.fewshot_k,
++            use_evidence=spec.use_evidence,
++            consistency_check=spec.consistency_check,
++        )
++        for spec in PROMPTS.values()
++    ]
++
++
++@router.get("/models", response_model=list[ModelOut])
++def models() -> list[ModelOut]:
++    settings = get_settings()
++    known = [
++        ModelOut(id=model, provider="anthropic", input_per_mtok=p.input, output_per_mtok=p.output)
++        for model, p in PRICES.items()
++    ]
++    if settings.llm_provider == "openai":
++        known.insert(0, ModelOut(id=settings.default_model, provider="openai"))
++    return known
+diff --git a/backend/src/fieldwise/api/routers/runs.py b/backend/src/fieldwise/api/routers/runs.py
+new file mode 100644
+index 0000000..40410e6
+--- /dev/null
++++ b/backend/src/fieldwise/api/routers/runs.py
+@@ -0,0 +1,17 @@
++import uuid
++
++from fastapi import APIRouter, HTTPException
++
++from fieldwise.api.deps import DbSession
++from fieldwise.api.models import RunOut
++from fieldwise.db.models import ExtractionRun
++
++router = APIRouter(prefix="/runs", tags=["runs"])
++
++
++@router.get("/{run_id}", response_model=RunOut)
++def get_run(run_id: uuid.UUID, db: DbSession) -> RunOut:
++    run = db.get(ExtractionRun, run_id)
++    if run is None:
++        raise HTTPException(404, "run not found")
++    return RunOut.model_validate(run)
+diff --git a/backend/src/fieldwise/api/routers/schemas.py b/backend/src/fieldwise/api/routers/schemas.py
+new file mode 100644
+index 0000000..4b1235c
+--- /dev/null
++++ b/backend/src/fieldwise/api/routers/schemas.py
+@@ -0,0 +1,39 @@
++from fastapi import APIRouter, HTTPException
++from sqlalchemy import select
++
++from fieldwise.api.deps import DbSession
++from fieldwise.api.models import FieldMetaOut, SchemaOut
++from fieldwise.db.models import Schema
++from fieldwise.schemas.compiler import compile_schema
++from fieldwise.schemas.registry import get_schema
++
++router = APIRouter(prefix="/schemas", tags=["schemas"])
++
++
++def to_out(schema: Schema) -> SchemaOut:
++    compiled = compile_schema(schema.json_schema)
++    return SchemaOut(
++        id=schema.id,
++        name=schema.name,
++        version=schema.version,
++        json_schema=schema.json_schema,
++        fields=[FieldMetaOut(**f.to_dict()) for f in compiled.fields],
++        created_at=schema.created_at,
++    )
++
++
++@router.get("", response_model=list[SchemaOut])
++def list_schemas(db: DbSession) -> list[SchemaOut]:
++    rows = db.scalars(select(Schema).order_by(Schema.name, Schema.version.desc())).all()
++    latest: dict[str, Schema] = {}
++    for row in rows:
++        latest.setdefault(row.name, row)
++    return [to_out(s) for s in latest.values()]
++
++
++@router.get("/{name}", response_model=SchemaOut)
++def get_one(name: str, db: DbSession, version: int | None = None) -> SchemaOut:
++    schema = get_schema(db, name, version)
++    if schema is None:
++        raise HTTPException(404, f"schema {name!r} not found")
++    return to_out(schema)
+diff --git a/backend/src/fieldwise/cli.py b/backend/src/fieldwise/cli.py
+index 9c3e180..fa17dfe 100644
+--- a/backend/src/fieldwise/cli.py
++++ b/backend/src/fieldwise/cli.py
+@@ -115,6 +115,20 @@ def ingest_cord(
+                 console.print(f"  [red]{error}[/red]")
+ 
+ 
++@app.command()
++def openapi(
++    output: Annotated[Path, typer.Argument(help="Where to write the OpenAPI document.")] = Path(
++        "openapi.json"
++    ),
++) -> None:
++    """Write the API contract (the web client is generated from it)."""
++    from fieldwise.api.app import create_app  # noqa: PLC0415
++
++    document = create_app().openapi()
++    output.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    console.print(f"wrote {output} ({len(document.get('paths', {}))} paths)")
++
++
+ @app.command()
+ def embed(
+     split: Annotated[str | None, typer.Option(help="Only documents of this split.")] = None,
+diff --git a/backend/src/fieldwise/config.py b/backend/src/fieldwise/config.py
+index 1437ca7..68152b2 100644
+--- a/backend/src/fieldwise/config.py
++++ b/backend/src/fieldwise/config.py
+@@ -25,6 +25,7 @@ class Settings(BaseSettings):
+     openai_base_url: str = "https://openrouter.ai/api/v1"
+     openai_api_key: str | None = Field(default=None, repr=False)
+ 
++    cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
+     log_level: str = "INFO"
+ 
+ 
+diff --git a/backend/src/fieldwise/db/migrations/versions/0005_schema_json_order.py b/backend/src/fieldwise/db/migrations/versions/0005_schema_json_order.py
+new file mode 100644
+index 0000000..7df8b37
+--- /dev/null
++++ b/backend/src/fieldwise/db/migrations/versions/0005_schema_json_order.py
+@@ -0,0 +1,26 @@
++"""keep key order of authored schemas (json instead of jsonb)
++
++Revision ID: 0005
++Revises: 0004
++Create Date: 2026-09-18
++"""
++
++from collections.abc import Sequence
++
++from alembic import op
++
++revision: str = "0005"
++down_revision: str | None = "0004"
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++
++def upgrade() -> None:
++    # JSONB normalises object key order; the authored field order is meaningful (reports, UI).
++    op.execute(
++        "ALTER TABLE schemas ALTER COLUMN json_schema TYPE json USING json_schema::text::json"
++    )
++
++
++def downgrade() -> None:
++    op.execute("ALTER TABLE schemas ALTER COLUMN json_schema TYPE jsonb USING json_schema::jsonb")
+diff --git a/backend/src/fieldwise/db/models.py b/backend/src/fieldwise/db/models.py
+index 460bedd..8133710 100644
+--- a/backend/src/fieldwise/db/models.py
++++ b/backend/src/fieldwise/db/models.py
+@@ -5,7 +5,7 @@
+ from typing import Any
+ 
+ from pgvector.sqlalchemy import Vector
+-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
++from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+ from sqlalchemy.dialects.postgresql import JSONB, UUID
+ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+ 
+@@ -29,7 +29,8 @@ class Schema(Base):
+     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+     name: Mapped[str] = mapped_column(String(64))
+     version: Mapped[int] = mapped_column(Integer)
+-    json_schema: Mapped[dict[str, Any]] = mapped_column(JSONB)
++    # `json`, not `jsonb`: the authored key order is the field order in reports and the UI.
++    json_schema: Mapped[dict[str, Any]] = mapped_column(JSON)
+     field_meta: Mapped[dict[str, Any]] = mapped_column(JSONB)
+     created_at: Mapped[datetime] = mapped_column(
+         DateTime(timezone=True), default=utcnow, server_default=func.now()
+diff --git a/backend/src/fieldwise/extraction/pipeline.py b/backend/src/fieldwise/extraction/pipeline.py
+index 42b6e73..29513ac 100644
+--- a/backend/src/fieldwise/extraction/pipeline.py
++++ b/backend/src/fieldwise/extraction/pipeline.py
+@@ -77,6 +77,7 @@ def prepare_extraction(
+     options: ExtractionOptions,
+     provider_name: str,
+     examples: list[FewShotExample] | None = None,
++    run: ExtractionRun | None = None,
+ ) -> PreparedExtraction:
+     spec = get_prompt(options.prompt)
+     compiled = compile_schema(schema.json_schema)
+@@ -84,19 +85,17 @@ def prepare_extraction(
+     use_ocr_text = spec.use_ocr_text if options.use_ocr_text is None else options.use_ocr_text
+     examples = (examples or [])[:fewshot_k]
+ 
+-    run = ExtractionRun(
+-        document_id=document.id,
+-        schema_id=schema.id,
+-        prompt_version=spec.name,
+-        model=options.model,
+-        effort=options.effort,
+-        fewshot_k=len(examples),
+-        use_ocr_text=use_ocr_text,
+-        provider=provider_name,
+-        status="running",
+-        fewshot_document_ids=[e.document_id for e in examples],
+-    )
+-    session.add(run)
++    if run is None:
++        run = ExtractionRun(document_id=document.id, schema_id=schema.id)
++        session.add(run)
++    run.prompt_version = spec.name
++    run.model = options.model
++    run.effort = options.effort
++    run.fewshot_k = len(examples)
++    run.use_ocr_text = use_ocr_text
++    run.provider = provider_name
++    run.status = "running"
++    run.fewshot_document_ids = [e.document_id for e in examples]
+     session.flush()
+ 
+     request = build_request(
+diff --git a/backend/src/fieldwise/schemas/registry.py b/backend/src/fieldwise/schemas/registry.py
+index 34ca2b8..4d0ecf8 100644
+--- a/backend/src/fieldwise/schemas/registry.py
++++ b/backend/src/fieldwise/schemas/registry.py
+@@ -6,6 +6,7 @@
+ 
+ from sqlalchemy import select
+ from sqlalchemy.orm import Session
++from sqlalchemy.orm.attributes import flag_modified
+ 
+ from fieldwise.db.models import Schema
+ from fieldwise.schemas.compiler import CompiledSchema, compile_schema
+@@ -46,6 +47,10 @@ def upsert_schema(session: Session, authored: dict[str, Any]) -> Schema:
+     compiled = compile_schema(authored)
+     latest = get_schema(session, compiled.name)
+     if latest is not None and latest.json_schema == authored:
++        if json.dumps(latest.json_schema) != json.dumps(authored):
++            latest.json_schema = authored  # same schema, restore the authored key order
++            flag_modified(latest, "json_schema")  # dict equality would hide the reorder
++            session.flush()
+         return latest
+     schema = Schema(
+         name=compiled.name,
+diff --git a/backend/src/fieldwise/worker/__init__.py b/backend/src/fieldwise/worker/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/backend/src/fieldwise/worker/app.py b/backend/src/fieldwise/worker/app.py
+new file mode 100644
+index 0000000..1da3cd0
+--- /dev/null
++++ b/backend/src/fieldwise/worker/app.py
+@@ -0,0 +1,24 @@
++"""Celery application: Redis as broker and result backend, one queue, JSON only."""
++
++from celery import Celery
++
++from fieldwise.config import get_settings
++
++settings = get_settings()
++
++celery_app = Celery(
++    "fieldwise",
++    broker=settings.redis_url,
++    backend=settings.redis_url,
++    include=["fieldwise.worker.tasks"],
++)
++celery_app.conf.update(
++    task_serializer="json",
++    result_serializer="json",
++    accept_content=["json"],
++    task_track_started=True,
++    task_acks_late=True,
++    worker_prefetch_multiplier=1,  # OCR and model calls are long; do not hoard tasks
++    task_default_queue="fieldwise",
++    result_expires=24 * 3600,
++)
+diff --git a/backend/src/fieldwise/worker/tasks.py b/backend/src/fieldwise/worker/tasks.py
+new file mode 100644
+index 0000000..a8131b5
+--- /dev/null
++++ b/backend/src/fieldwise/worker/tasks.py
+@@ -0,0 +1,122 @@
++"""Background work: OCR + embedding after an upload, queued extractions, eval runs.
++Every task opens its own session and commits its own outcome; failures are written to the row
++the client is polling, so nothing is lost when a task dies."""
++
++from __future__ import annotations
++
++import uuid
++from typing import Any
++
++import structlog
++
++from fieldwise.config import get_settings
++from fieldwise.db.engine import session_factory
++from fieldwise.db.models import Document, ExtractionRun, Schema
++from fieldwise.documents.ocr import RapidOcrProvider
++from fieldwise.documents.ocr_service import ocr_document
++from fieldwise.evals.runner import EvalConfig, run_eval
++from fieldwise.extraction.factory import build_provider
++from fieldwise.extraction.pipeline import (
++    ExtractionOptions,
++    finish_extraction,
++    prepare_extraction,
++)
++from fieldwise.extraction.prompts.registry import get_prompt
++from fieldwise.extraction.provider import LLMError, LLMResponse
++from fieldwise.retrieval.embeddings import FastEmbedder
++from fieldwise.retrieval.fewshot import embed_documents, make_retriever
++from fieldwise.storage import get_storage
++from fieldwise.worker.app import celery_app
++
++log = structlog.get_logger(__name__)
++
++_ocr = RapidOcrProvider()
++_embedder = FastEmbedder()
++
++
++@celery_app.task(name="fieldwise.process_document")
++def process_document(document_id: str) -> dict[str, Any]:
++    """OCR the pages, then embed the text so the document can serve as a few-shot example."""
++    with session_factory()() as session:
++        document = session.get(Document, uuid.UUID(document_id))
++        if document is None:
++            return {"status": "missing"}
++        try:
++            ocr_document(document, get_storage(), _ocr)
++            session.commit()
++            embed_documents(session, _embedder, limit=None, force=False)
++            session.commit()
++        except Exception as error:
++            session.commit()  # ocr_status=failed is already on the row
++            log.warning("process_document.failed", document_id=document_id, error=str(error))
++            return {"status": "failed", "error": str(error)}
++        return {"status": document.ocr_status}
++
++
++@celery_app.task(name="fieldwise.run_queued_extraction")
++def run_queued_extraction(run_id: str, options: dict[str, Any]) -> dict[str, Any]:
++    """Executes an ExtractionRun the API created in `queued` status."""
++    settings = get_settings()
++    with session_factory()() as session:
++        run = session.get(ExtractionRun, uuid.UUID(run_id))
++        if run is None:
++            return {"status": "missing"}
++        document = session.get(Document, run.document_id)
++        schema = session.get(Schema, run.schema_id)
++        if document is None or schema is None:
++            run.status = "failed"
++            run.error = "document or schema missing"
++            session.commit()
++            return {"status": "failed"}
++        provider = build_provider(settings)
++        extraction_options = ExtractionOptions(**options)
++        spec = get_prompt(extraction_options.prompt)
++        k = spec.fewshot_k if extraction_options.fewshot_k is None else extraction_options.fewshot_k
++        examples = make_retriever(session, schema, _embedder)(document, k) if k else []
++        try:
++            prepared = prepare_extraction(
++                session,
++                get_storage(),
++                document,
++                schema=schema,
++                options=extraction_options,
++                provider_name=provider.name,
++                examples=examples,
++                run=run,
++            )
++            session.commit()
++            outcome: LLMResponse | LLMError
++            try:
++                outcome = provider.complete(prepared.request)
++            except LLMError as error:
++                outcome = error
++            finish_extraction(prepared, outcome)
++        except Exception as error:
++            run.status = "failed"
++            run.error = f"worker: {error}"
++            log.warning("run_queued_extraction.failed", run_id=run_id, error=str(error))
++        session.commit()
++        return {"status": run.status}
++
++
++@celery_app.task(name="fieldwise.run_eval")
++def run_eval_task(config: dict[str, Any]) -> dict[str, Any]:
++    settings = get_settings()
++    eval_config = EvalConfig(**config)
++    with session_factory()() as session:
++        provider = build_provider(settings)
++        schema = (
++            session.query(Schema)
++            .filter(Schema.name == eval_config.schema)
++            .order_by(Schema.version.desc())
++            .first()
++        )
++        retriever = make_retriever(session, schema, _embedder) if schema else None
++        try:
++            run = run_eval(session, get_storage(), eval_config, provider, retriever=retriever)
++            session.commit()
++        except Exception as error:
++            session.rollback()
++            log.warning("run_eval.failed", error=str(error))
++            return {"status": "failed", "error": str(error)}
++        return {"status": run.status, "eval_run_id": str(run.id)}
+diff --git a/backend/tests/integration/test_api.py b/backend/tests/integration/test_api.py
+new file mode 100644
+index 0000000..40b6a3e
+--- /dev/null
++++ b/backend/tests/integration/test_api.py
+@@ -0,0 +1,221 @@
++import json
++from collections.abc import Iterator
++from io import BytesIO
++from pathlib import Path
++from typing import Any
++
++import pytest
++from fastapi.testclient import TestClient
++from PIL import Image
++from sqlalchemy.orm import Session
++
++from fieldwise.api import deps
++from fieldwise.api.app import create_app
++from fieldwise.api.routers import documents as documents_router
++from fieldwise.api.routers import evals as evals_router
++from fieldwise.db.models import Document
++from fieldwise.documents.cord_import import map_gt_parse
++from fieldwise.documents.ocr import FakeOcrProvider, OcrSpan
++from fieldwise.documents.ocr_service import ocr_document
++from fieldwise.evals.runner import EvalConfig, labelled_documents, run_eval
++from fieldwise.extraction.pipeline import ExtractionOptions, run_extraction
++from fieldwise.extraction.provider import FakeProvider
++from fieldwise.schemas.registry import sync_builtins
++from fieldwise.storage import LocalStorage
++
++pytestmark = pytest.mark.integration
++
++FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "cord"
++
++
++class Delayed:
++    def __init__(self) -> None:
++        self.calls: list[tuple[Any, ...]] = []
++
++    def delay(self, *args: Any) -> Any:
++        self.calls.append(args)
++        return type("Task", (), {"id": "task-1"})()
++
++
++@pytest.fixture
++def api(
++    session: Session, storage: LocalStorage, monkeypatch: pytest.MonkeyPatch
++) -> Iterator[tuple[TestClient, Delayed, Delayed, Delayed]]:
++    sync_builtins(session)
++    session.flush()
++    app = create_app()
++    app.dependency_overrides[deps._db] = lambda: session
++    app.dependency_overrides[deps._storage] = lambda: storage
++    process, extract, evaluate = Delayed(), Delayed(), Delayed()
++    monkeypatch.setattr(documents_router, "process_document", process)
++    monkeypatch.setattr(documents_router, "run_queued_extraction", extract)
++    monkeypatch.setattr(evals_router, "run_eval_task", evaluate)
++    with TestClient(app) as client:
++        yield client, process, extract, evaluate
++
++
++def _jpeg() -> bytes:
++    buffer = BytesIO()
++    Image.new("RGB", (200, 300), "white").save(buffer, format="JPEG")
++    return buffer.getvalue()
++
++
++def test_meta_endpoints(api: tuple[TestClient, Delayed, Delayed, Delayed]) -> None:
++    client = api[0]
++    assert client.get("/health").json()["status"] == "ok"
++    prompts = client.get("/prompts").json()
++    assert [p["name"] for p in prompts] == ["v1", "v2", "v3"]
++    assert prompts[2]["fewshot_k"] == 3
++    assert any(m["id"] == "claude-sonnet-5" for m in client.get("/models").json())
++
++
++def test_schemas(api: tuple[TestClient, Delayed, Delayed, Delayed]) -> None:
++    client = api[0]
++    listed = client.get("/schemas").json()
++    assert [s["name"] for s in listed] == ["receipt"]
++    one = client.get("/schemas/receipt").json()
++    assert one["version"] == 1
++    assert any(
++        f["path"] == "line_items[].line_total" and f["matcher"] == "money" for f in one["fields"]
++    )
++    assert client.get("/schemas/nope").status_code == 404
++
++
++def test_document_lifecycle(
++    api: tuple[TestClient, Delayed, Delayed, Delayed], session: Session
++) -> None:
++    client, process, extract, _ = api
++
++    created = client.post("/documents", files={"file": ("r.jpg", _jpeg(), "image/jpeg")})
++    assert created.status_code == 201, created.text
++    doc = created.json()
++    assert doc["ocr_status"] == "pending"
++    assert doc["has_golden"] is False
++    assert process.calls == [(doc["id"],)]
++
++    listed = client.get("/documents", params={"limit": 10}).json()
++    assert listed["total"] == 1
++    assert listed["items"][0]["name"] == "r.jpg"
++
++    detail = client.get(f"/documents/{doc['id']}").json()
++    assert detail["pages"][0]["url"].endswith("/pages/1")
++    page = client.get(detail["pages"][0]["url"])
++    assert page.headers["content-type"] == "image/jpeg"
++    assert page.content.startswith(b"\xff\xd8")
++    assert client.get(f"/documents/{doc['id']}/pages/9").status_code == 404
++
++    row = session.get(Document, __import__("uuid").UUID(doc["id"]))
++    ocr_document(row, api_storage(client), FakeOcrProvider([OcrSpan("TOTAL", (1, 2, 30, 12), 0.9)]))  # type: ignore[arg-type]
++    session.flush()
++    spans = client.get(f"/documents/{doc['id']}/ocr").json()
++    assert spans == [{"page": 1, "text": "TOTAL", "box": [1, 2, 30, 12], "conf": 0.9, "words": []}]
++
++    queued = client.post(f"/documents/{doc['id']}/extract", json={"prompt": "v2"})
++    assert queued.status_code == 202, queued.text
++    run = queued.json()
++    assert run["status"] == "queued"
++    assert extract.calls[0][0] == run["id"]
++    assert extract.calls[0][1]["prompt"] == "v2"
++    assert client.get(f"/runs/{run['id']}").json()["status"] == "queued"
++    assert client.post(f"/documents/{doc['id']}/extract", json={"prompt": "v9"}).status_code == 422
++
++    assert client.get(f"/documents/{doc['id']}/golden").status_code == 404
++    saved = client.put(
++        f"/documents/{doc['id']}/golden", json={"data": {"total": 1.0, "line_items": []}}
++    )
++    assert saved.status_code == 200
++    assert saved.json()["source"] == "correction"
++    assert client.get(f"/documents/{doc['id']}").json()["has_golden"] is True
++    again = client.put(
++        f"/documents/{doc['id']}/golden", json={"data": {"total": 2.0, "line_items": []}}
++    )
++    assert again.json()["data"]["total"] == 2.0
++
++
++def api_storage(client: TestClient) -> LocalStorage:
++    override = client.app.dependency_overrides[deps._storage]  # type: ignore[attr-defined]
++    storage: LocalStorage = override()
++    return storage
++
++
++def test_rejects_garbage_uploads(api: tuple[TestClient, Delayed, Delayed, Delayed]) -> None:
++    client = api[0]
++    assert (
++        client.post("/documents", files={"file": ("x.bin", b"hello", "text/plain")}).status_code
++        == 415
++    )
++
++
++def test_evals_endpoints(
++    api: tuple[TestClient, Delayed, Delayed, Delayed], session: Session, storage: LocalStorage
++) -> None:
++    client, _, _, evaluate = api
++    schema = sync_builtins(session)[0]
++    from fieldwise.documents.cord_import import CordRow, import_rows  # noqa: PLC0415
++
++    stem = "cord-v2_validation_0000"
++    row = CordRow(
++        "test",
++        0,
++        (FIXTURES / f"{stem}.jpg").read_bytes(),
++        json.loads((FIXTURES / f"{stem}.json").read_text()),
++    )
++    import_rows(session, storage, iter([row]), schema)
++    golden_by_sha = {d.sha256: g for d, g in labelled_documents(session, schema, "test")}
++    run = run_eval(
++        session,
++        storage,
++        EvalConfig(model="claude-sonnet-5", concurrency=1),
++        FakeProvider(lambda req: golden_by_sha[req.cache_key["document"]]),
++    )
++    session.flush()
++
++    listed = client.get("/evals").json()
++    assert listed[0]["id"] == str(run.id)
++    assert listed[0]["overall_accuracy"] == 1.0
++    assert listed[0]["field_order"][0] == "line_items[].name"
++    one = client.get(f"/evals/{run.id}").json()
++    assert one["per_field"]["total"]["accuracy"] == 1.0
++    results = client.get(f"/evals/{run.id}/results").json()
++    assert results[0]["all_correct"] is True
++    compared = client.get("/evals/compare", params={"ids": [str(run.id), str(run.id)]}).json()
++    assert compared["markdown"].startswith("| Metric |")
++    assert len(compared["runs"]) == 2
++
++    started = client.post("/evals", json={"prompt": "v2", "limit": 5, "notes": "from the api"})
++    assert started.status_code == 202
++    assert started.json()["task_id"] == "task-1"
++    assert evaluate.calls[0][0]["prompt"] == "v2"
++    assert client.post("/evals", json={"prompt": "v9"}).status_code == 422
++    assert client.get(f"/evals/{run.id}".replace(str(run.id)[:8], "00000000")).status_code == 404
++
++
++def test_run_extraction_result_is_served(
++    api: tuple[TestClient, Delayed, Delayed, Delayed], session: Session, storage: LocalStorage
++) -> None:
++    client = api[0]
++    schema = sync_builtins(session)[0]
++    from fieldwise.documents.service import create_document  # noqa: PLC0415
++
++    document = create_document(
++        session,
++        storage,
++        data=(FIXTURES / "cord-v2_validation_0000.jpg").read_bytes(),
++        name="r",
++        source="upload",
++    )
++    golden = map_gt_parse(json.loads((FIXTURES / "cord-v2_validation_0000.json").read_text()))
++    run = run_extraction(
++        session,
++        storage,
++        document,
++        schema=schema,
++        options=ExtractionOptions(),
++        provider=FakeProvider(lambda req: golden),
++    )
++    served = client.get(f"/runs/{run.id}").json()
++    assert served["status"] == "succeeded"
++    assert served["result"]["total"] == golden["total"]
++    detail = client.get(f"/documents/{document.id}").json()
++    assert detail["latest_run"]["id"] == str(run.id)
++    assert detail["runs"][0]["status"] == "succeeded"
+diff --git a/backend/uv.lock b/backend/uv.lock
+index 67013b1..d4d87b0 100644
+--- a/backend/uv.lock
++++ b/backend/uv.lock
+@@ -19,6 +19,18 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/3f/27/78a89b55b0904d222183164e079b4ca56208e94eff1d35ad1f1ad5be9b06/alembic-1.20.0-py3-none-any.whl", hash = "sha256:77eb101048d95f982c0353e9233404889dcd7a6fc244c107836c0e2fc9cf7d9d", size = 268719, upload-time = "2026-09-11T19:09:12.88Z" },
+ ]
+ 
++[[package]]
++name = "amqp"
++version = "5.3.1"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "vine" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/79/fc/ec94a357dfc6683d8c86f8b4cfa5416a4c36b28052ec8260c77aca96a443/amqp-5.3.1.tar.gz", hash = "sha256:cddc00c725449522023bad949f70fff7b48f0b1ade74d170a6f10ab044739432", size = 129013, upload-time = "2024-11-12T19:55:44.051Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/26/99/fc813cd978842c26c82534010ea849eee9ab3a13ea2b74e95cb9c99e747b/amqp-5.3.1-py3-none-any.whl", hash = "sha256:43b3319e1b4e7d1251833a93d672b4af1e40f3d632d479b98661a95f117880a2", size = 50944, upload-time = "2024-11-12T19:55:41.782Z" },
++]
++
+ [[package]]
+ name = "annotated-doc"
+ version = "0.0.5"
+@@ -127,6 +139,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/64/b4/17d4b0b2a2dc85a6df63d1157e028ed19f90d4cd97c36717afef2bc2f395/attrs-26.1.0-py3-none-any.whl", hash = "sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309", size = 67548, upload-time = "2026-03-19T14:22:23.645Z" },
+ ]
+ 
++[[package]]
++name = "billiard"
++version = "4.3.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/60/a9/b1c91c6866717e68b12331222f294e20df4b7674f58c14639ecd0166549c/billiard-4.3.0.tar.gz", hash = "sha256:3ddeaf82c0373e076c7b450c2fdc7ded6d73981bcfd931da1cdd0c0a03468dc5", size = 160930, upload-time = "2026-09-17T08:38:04.925Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/60/60/ade6d336983b82fbc330d0d0371f945249b448152852952f643787a3288d/billiard-4.3.0-py3-none-any.whl", hash = "sha256:be3e51fb6202df38e1d67ff0aa3bfa4cdc1838a3c47c36373cc3220c6b787c2a", size = 88116, upload-time = "2026-09-17T08:38:03.233Z" },
++]
++
+ [[package]]
+ name = "boto3"
+ version = "1.43.97"
+@@ -182,6 +203,43 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/4e/5e/bdbf19967898a032292da65a47d6e25b2eee55865db4e687f861d80b5602/botocore_stubs-1.43.67-py3-none-any.whl", hash = "sha256:c51262bac3341c1cda71f05fa01141fffd3990d7a92c7960e3b755c1bc830373", size = 67244, upload-time = "2026-08-08T14:57:52.01Z" },
+ ]
+ 
++[[package]]
++name = "celery"
++version = "5.6.3"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "billiard" },
++    { name = "click" },
++    { name = "click-didyoumean" },
++    { name = "click-plugins" },
++    { name = "click-repl" },
++    { name = "kombu" },
++    { name = "python-dateutil" },
++    { name = "tzlocal" },
++    { name = "vine" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/e8/b4/a1233943ab5c8ea05fb877a88a0a0622bf47444b99e4991a8045ac37ea1d/celery-5.6.3.tar.gz", hash = "sha256:177006bd2054b882e9f01be59abd8529e88879ef50d7918a7050c5a9f4e12912", size = 1742243, upload-time = "2026-03-26T12:14:51.76Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/cf/c9/6eccdda96e098f7ae843162db2d3c149c6931a24fda69fe4ab84d0027eb5/celery-5.6.3-py3-none-any.whl", hash = "sha256:0808f42f80909c4d5833202360ffafb2a4f83f4d8e23e1285d926610e9a7afa6", size = 451235, upload-time = "2026-03-26T12:14:49.491Z" },
++]
++
++[package.optional-dependencies]
++redis = [
++    { name = "kombu", extra = ["redis"] },
++]
++
++[[package]]
++name = "celery-types"
++version = "0.26.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "typing-extensions" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/fc/38/813dd7534e41682684d3a5c2cc4a8710e3acc51b364920b9c4d747c7b18f/celery_types-0.26.0.tar.gz", hash = "sha256:fa318136fdad83f83f1531deecd9fe664b5dfffff29f3c31e9120a46b8e3908f", size = 106210, upload-time = "2026-03-12T23:06:49.941Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/d9/e5/c5ec98f7fd7817d077c9a5a5e705d54f74d4ca08ee3f14dee881c93c0511/celery_types-0.26.0-py3-none-any.whl", hash = "sha256:eb9da76f461786091970df466ec647d9a27956399852542cb6cab9309970f950", size = 211260, upload-time = "2026-03-12T23:06:48.588Z" },
++]
++
+ [[package]]
+ name = "certifi"
+ version = "2026.7.22"
+@@ -264,6 +322,44 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/58/50/6c0d534c5f134586a8e1ba4e330569e32f057e33372ae556463212fb4cd3/click-8.5.0-py3-none-any.whl", hash = "sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360", size = 125251, upload-time = "2026-08-26T13:33:12.928Z" },
+ ]
+ 
++[[package]]
++name = "click-didyoumean"
++version = "0.3.1"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "click" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/30/ce/217289b77c590ea1e7c24242d9ddd6e249e52c795ff10fac2c50062c48cb/click_didyoumean-0.3.1.tar.gz", hash = "sha256:4f82fdff0dbe64ef8ab2279bd6aa3f6a99c3b28c05aa09cbfc07c9d7fbb5a463", size = 3089, upload-time = "2024-03-24T08:22:07.499Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/1b/5b/974430b5ffdb7a4f1941d13d83c64a0395114503cc357c6b9ae4ce5047ed/click_didyoumean-0.3.1-py3-none-any.whl", hash = "sha256:5c4bb6007cfea5f2fd6583a2fb6701a22a41eb98957e63d0fac41c10e7c3117c", size = 3631, upload-time = "2024-03-24T08:22:06.356Z" },
++]
++
++[[package]]
++name = "click-plugins"
++version = "1.1.1.2"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "click" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/c3/a4/34847b59150da33690a36da3681d6bbc2ec14ee9a846bc30a6746e5984e4/click_plugins-1.1.1.2.tar.gz", hash = "sha256:d7af3984a99d243c131aa1a828331e7630f4a88a9741fd05c927b204bcf92261", size = 8343, upload-time = "2025-06-25T00:47:37.555Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/3d/9a/2abecb28ae875e39c8cad711eb1186d8d14eab564705325e77e4e6ab9ae5/click_plugins-1.1.1.2-py2.py3-none-any.whl", hash = "sha256:008d65743833ffc1f5417bf0e78e8d2c23aab04d9745ba817bd3e71b0feb6aa6", size = 11051, upload-time = "2025-06-25T00:47:36.731Z" },
++]
++
++[[package]]
++name = "click-repl"
++version = "0.4.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "click" },
++    { name = "prompt-toolkit" },
++    { name = "typing-extensions" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/8e/f5/19bce5e62ee97138752eeef0b91bfa46d880725cc8ec00aa00daa2685410/click_repl-0.4.0.tar.gz", hash = "sha256:52f8962ff0fdae8105d568123b144951257b6bfcfb44ff6f043379c307d0a8ac", size = 15941, upload-time = "2026-09-17T07:22:01.768Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/e0/ae/63d94d251d2e1a7bf3794ea47cb1c99fe6de055b732ea79d7bcdabef8ff5/click_repl-0.4.0-py3-none-any.whl", hash = "sha256:fee730650f34204f1bd41b8fab46f6b51dda019b4a35ed89ab8553ba31f7d6d3", size = 14976, upload-time = "2026-09-17T07:22:00.429Z" },
++]
++
+ [[package]]
+ name = "colorama"
+ version = "0.4.6"
+@@ -423,6 +519,7 @@ dependencies = [
+     { name = "alembic" },
+     { name = "anthropic" },
+     { name = "boto3" },
++    { name = "celery", extra = ["redis"] },
+     { name = "fastapi" },
+     { name = "fastembed" },
+     { name = "huggingface-hub" },
+@@ -437,6 +534,7 @@ dependencies = [
+     { name = "pydantic" },
+     { name = "pydantic-settings" },
+     { name = "pypdfium2" },
++    { name = "python-multipart" },
+     { name = "rapidfuzz" },
+     { name = "rapidocr" },
+     { name = "rich" },
+@@ -449,6 +547,7 @@ dependencies = [
+ [package.dev-dependencies]
+ dev = [
+     { name = "boto3-stubs", extra = ["s3"] },
++    { name = "celery-types" },
+     { name = "httpx2" },
+     { name = "moto", extra = ["s3"] },
+     { name = "mypy" },
+@@ -465,6 +564,7 @@ requires-dist = [
+     { name = "alembic", specifier = ">=1.20,<2" },
+     { name = "anthropic", specifier = ">=1.6,<2" },
+     { name = "boto3", specifier = ">=1.43,<2" },
++    { name = "celery", extras = ["redis"], specifier = ">=5.6,<6" },
+     { name = "fastapi", specifier = ">=0.141,<1" },
+     { name = "fastembed", specifier = ">=0.8,<1" },
+     { name = "huggingface-hub", specifier = ">=0.35,<2" },
+@@ -479,6 +579,7 @@ requires-dist = [
+     { name = "pydantic", specifier = ">=2.13,<3" },
+     { name = "pydantic-settings", specifier = ">=2.15,<3" },
+     { name = "pypdfium2", specifier = ">=5.13,<6" },
++    { name = "python-multipart", specifier = ">=0.0.32,<1" },
+     { name = "rapidfuzz", specifier = ">=3.14,<4" },
+     { name = "rapidocr", specifier = ">=3.9,<4" },
+     { name = "rich", specifier = ">=15,<16" },
+@@ -491,6 +592,7 @@ requires-dist = [
+ [package.metadata.requires-dev]
+ dev = [
+     { name = "boto3-stubs", extras = ["s3"], specifier = ">=1.43,<2" },
++    { name = "celery-types", specifier = ">=0.23" },
+     { name = "httpx2", specifier = ">=2.13,<3" },
+     { name = "moto", extras = ["s3"], specifier = ">=5,<6" },
+     { name = "mypy", specifier = ">=2.3,<3" },
+@@ -751,6 +853,26 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/41/45/1a4ed80516f02155c51f51e8cedb3c1902296743db0bbc66608a0db2814f/jsonschema_specifications-2025.9.1-py3-none-any.whl", hash = "sha256:98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe", size = 18437, upload-time = "2025-09-08T01:34:57.871Z" },
+ ]
+ 
++[[package]]
++name = "kombu"
++version = "5.6.2"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "amqp" },
++    { name = "packaging" },
++    { name = "tzdata" },
++    { name = "vine" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/b6/a5/607e533ed6c83ae1a696969b8e1c137dfebd5759a2e9682e26ff1b97740b/kombu-5.6.2.tar.gz", hash = "sha256:8060497058066c6f5aed7c26d7cd0d3b574990b09de842a8c5aaed0b92cc5a55", size = 472594, upload-time = "2025-12-29T20:30:07.779Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/fb/0f/834427d8c03ff1d7e867d3db3d176470c64871753252b21b4f4897d1fa45/kombu-5.6.2-py3-none-any.whl", hash = "sha256:efcfc559da324d41d61ca311b0c64965ea35b4c55cc04ee36e55386145dace93", size = 214219, upload-time = "2025-12-29T20:30:05.74Z" },
++]
++
++[package.optional-dependencies]
++redis = [
++    { name = "redis" },
++]
++
+ [[package]]
+ name = "librt"
+ version = "0.15.0"
+@@ -1068,6 +1190,18 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+ ]
+ 
++[[package]]
++name = "prompt-toolkit"
++version = "3.0.53"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "wcwidth" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/7d/ea/39b988c938f75cb75d7045b5c69f8bfed47ee2152c8837fb403de29d6fb8/prompt_toolkit-3.0.53.tar.gz", hash = "sha256:9ec8a0ad96d5c56148b3f914aa79c1564c3fde5d2e6b876e7bc327e353cf8fa6", size = 435492, upload-time = "2026-07-26T20:56:14.758Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/54/6f/84908cad2d6aa5144abcf7b42709fe4fdb459bc640ec7ac5786e7693dabc/prompt_toolkit-3.0.53-py3-none-any.whl", hash = "sha256:01c0891d7f9237d5e339f7d3e42cdae80b7534abb1c7c0e3352efba6231492f2", size = 392288, upload-time = "2026-07-26T20:56:12.512Z" },
++]
++
+ [[package]]
+ name = "protobuf"
+ version = "7.36.2"
+@@ -1344,6 +1478,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/0d/17/c5c6b53ddc18f297992099b3d9ec16c855c0ccc83263a21fe4d1c625ec6c/python_dotenv-1.2.3-py3-none-any.whl", hash = "sha256:904552145e8bfed22162c09dab1c2b9b54fefa7b23ba780f4f26ca0316b0f0d9", size = 22780, upload-time = "2026-08-16T16:54:52.473Z" },
+ ]
+ 
++[[package]]
++name = "python-multipart"
++version = "0.0.32"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/5b/42/55c32bb9b12693c092ad250a0e82edb5b31ddeda6eb772de5f308b3804ad/python_multipart-0.0.32.tar.gz", hash = "sha256:be54b7f3fa167bb83e4fcd936b887b708f4e57fe75911c02aebf53efaf8d938e", size = 46881, upload-time = "2026-06-04T16:18:58.647Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/e1/04/e8135ebd1ad02c56ec633277529b2602ff99ff634be76cdba5744cf554fd/python_multipart-0.0.32-py3-none-any.whl", hash = "sha256:ff6d3f776f16878c894e52e107296ffc890e913c611b1a4ec6c44e2821fe2e23", size = 30042, upload-time = "2026-06-04T16:18:57.319Z" },
++]
++
+ [[package]]
+ name = "pywin32"
+ version = "312"
+@@ -1415,6 +1558,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/55/ed/0ee9b9281986974be9d2406ae0134c8d7c91d2fc613f16ffda9701eeda6f/rapidocr-3.9.2-py3-none-any.whl", hash = "sha256:04d6b8d151f823d930bd91910555f57bea897c0c44fa6794267b94cf9c1ef9a0", size = 27275208, upload-time = "2026-07-21T10:59:01.599Z" },
+ ]
+ 
++[[package]]
++name = "redis"
++version = "6.4.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/0d/d6/e8b92798a5bd67d659d51a18170e91c16ac3b59738d91894651ee255ed49/redis-6.4.0.tar.gz", hash = "sha256:b01bc7282b8444e28ec36b261df5375183bb47a07eb9c603f284e89cbc5ef010", size = 4647399, upload-time = "2025-08-07T08:10:11.441Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/e8/02/89e2ed7e85db6c93dfa9e8f691c5087df4e3551ab39081a4d7c6d1f90e05/redis-6.4.0-py3-none-any.whl", hash = "sha256:f0544fa9604264e9464cdf4814e7d4830f74b165d52f2a330a760a88dd248b7f", size = 279847, upload-time = "2025-08-07T08:10:09.84Z" },
++]
++
+ [[package]]
+ name = "referencing"
+ version = "0.37.0"
+@@ -1749,6 +1901,18 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/f9/bc/8737e8d54cf51106118039b83f485a4783112fab49ea9d044b234978a46e/tzdata-2026.4-py2.py3-none-any.whl", hash = "sha256:c2169a8b0a7a5e9674da5a135ccdfb2b3e671b333ed9fed17b41f73c34476e81", size = 347494, upload-time = "2026-09-12T12:56:01.67Z" },
+ ]
+ 
++[[package]]
++name = "tzlocal"
++version = "5.4.4"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "tzdata", marker = "sys_platform == 'win32'" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/81/5b/879b2f932adfa7a053c360d50bc896c977fa6426109185f7c12ebdd0cb9d/tzlocal-5.4.4.tar.gz", hash = "sha256:8dbb8660838688a7b6ba4fed31d18dedf842afb4d47ca050d6d891c2c15f3be4", size = 31170, upload-time = "2026-06-29T08:03:40.026Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/9e/a4/017a7a6cbe387d961a688ec31364ae60a5c4e22c96ae9921b79a947c855d/tzlocal-5.4.4-py3-none-any.whl", hash = "sha256:aae09f0126a8a86fa736be266eb4a471380d26a0de3bc14844e7821fee3e2a15", size = 18115, upload-time = "2026-06-29T08:03:38.666Z" },
++]
++
+ [[package]]
+ name = "urllib3"
+ version = "2.8.0"
+@@ -1795,6 +1959,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/99/39/6b3f7d234ba3964c428a6e40006340f53ba37993f46ed6e111c6e9141d18/uvloop-0.22.1-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:512fec6815e2dd45161054592441ef76c830eddaad55c8aa30952e6fe1ed07c0", size = 4296343, upload-time = "2025-10-16T22:16:35.149Z" },
+ ]
+ 
++[[package]]
++name = "vine"
++version = "5.1.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/bd/e4/d07b5f29d283596b9727dd5275ccbceb63c44a1a82aa9e4bfd20426762ac/vine-5.1.0.tar.gz", hash = "sha256:8b62e981d35c41049211cf62a0a1242d8c1ee9bd15bb196ce38aefd6799e61e0", size = 48980, upload-time = "2023-11-05T08:46:53.857Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/03/ff/7c0c86c43b3cbb927e0ccc0255cb4057ceba4799cd44ae95174ce8e8b5b2/vine-5.1.0-py3-none-any.whl", hash = "sha256:40fdf3c48b2cfe1c38a49e9ae2da6fda88e4794c810050a728bd7413811fb1dc", size = 9636, upload-time = "2023-11-05T08:46:51.205Z" },
++]
++
+ [[package]]
+ name = "watchfiles"
+ version = "1.2.0"
+@@ -1820,6 +1993,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/0a/26/88e0dc6ee3898169d7fa22bb6a69cabf2502d2ee25cb8c876d1262d204f8/watchfiles-1.2.0-cp312-cp312-win_arm64.whl", hash = "sha256:8fa585ede612ee9f9e91b18bebf9ba11b9ae29a4e3a0d0cf6fca3e382133f0d5", size = 281026, upload-time = "2026-05-18T04:30:22.23Z" },
+ ]
+ 
++[[package]]
++name = "wcwidth"
++version = "0.8.4"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/3d/7a/f98d4ada7c499565ab0c0fcef28a4e54fafa72b8228a6309803c80493c92/wcwidth-0.8.4.tar.gz", hash = "sha256:2dae09efa25253ae2874188e86d6861af3b1652aef4118cdf3f0bda288a957fb", size = 414609, upload-time = "2026-09-17T23:31:45.287Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/39/cc/9c0adc5861020de426ec71716b6c1bef8d90694b7d6d0a16202cdb1647f5/wcwidth-0.8.4-py3-none-any.whl", hash = "sha256:2097bb1d28a0ba8fe177c2eb607317f9b1627b03f33ebebfd3da670b337a65ba", size = 299474, upload-time = "2026-09-17T23:31:43.816Z" },
++]
++
+ [[package]]
+ name = "websockets"
+ version = "17.1"
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 8796bd1..838f941 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -1,3 +1,21 @@
++x-backend: &backend
++  build: ./backend
++  env_file:
++    - path: ./backend/.env
++      required: false
++  environment:
++    DATABASE_URL: postgresql+psycopg://fieldwise:fieldwise@db:5432/fieldwise
++    REDIS_URL: redis://redis:6379/0
++    STORAGE_URL: file:///data/storage
++  volumes:
++    - ./backend/data/storage:/data/storage   # shared with the CLI running on the host
++    - models:/models
++  depends_on:
++    db:
++      condition: service_healthy
++    redis:
++      condition: service_healthy
++
+ services:
+   db:
+     image: pgvector/pgvector:pg17
+@@ -25,5 +43,34 @@ services:
+       timeout: 3s
+       retries: 10
+ 
++  migrate:
++    <<: *backend
++    profiles: [app]
++    command: sh -c "fieldwise db upgrade && fieldwise schemas sync"
++    restart: "no"
++
++  api:
++    <<: *backend
++    profiles: [app]
++    ports:
++      - "8000:8000"
++    depends_on:
++      migrate:
++        condition: service_completed_successfully
++    healthcheck:
++      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
++      interval: 10s
++      timeout: 5s
++      retries: 10
++
++  worker:
++    <<: *backend
++    profiles: [app]
++    command: celery -A fieldwise.worker.app:celery_app worker --loglevel=info --concurrency=2
++    depends_on:
++      migrate:
++        condition: service_completed_successfully
++
+ volumes:
+   db-data:
++  models:
+diff --git a/justfile b/justfile
+index 6b9b53f..c5d6c4a 100644
+--- a/justfile
++++ b/justfile
+@@ -7,9 +7,13 @@ default:
+ up:
+     docker compose up -d --wait db redis
+ 
++# Start everything: database, redis, migrations, API, worker (and the web app when present)
++app:
++    docker compose --profile app up -d --build --wait
++
+ # Stop everything
+ down:
+-    docker compose down
++    docker compose --profile app down
+ 
+ # Lint, types and tests for the backend
+ backend-check:
+@@ -19,9 +23,21 @@ backend-check:
+ backend-fix:
+     cd backend && uv run ruff check --fix . && uv run ruff format .
+ 
++# Regenerate the API contract the web client is built from
++openapi:
++    cd backend && uv run fieldwise openapi ../openapi.json
++
++# Fail when openapi.json is stale (CI runs this)
++openapi-check:
++    cd backend && uv run fieldwise openapi /tmp/fieldwise-openapi.json >/dev/null && diff -q /tmp/fieldwise-openapi.json ../openapi.json
++
+ # Everything CI runs
+-check: backend-check
++check: backend-check openapi-check
+ 
+ # Run the API locally with reload
+ api:
+     cd backend && uv run uvicorn fieldwise.api.app:app --reload --port 8000
++
++# Run the worker locally
++worker:
++    cd backend && uv run celery -A fieldwise.worker.app:celery_app worker --loglevel=info --concurrency=2
+diff --git a/openapi.json b/openapi.json
+new file mode 100644
+index 0000000..8a3f1c2
+--- /dev/null
++++ b/openapi.json
+@@ -0,0 +1,2258 @@
++{
++  "components": {
++    "schemas": {
++      "Body_upload_document_documents_post": {
++        "properties": {
++          "file": {
++            "contentMediaType": "application/octet-stream",
++            "title": "File",
++            "type": "string"
++          }
++        },
++        "required": [
++          "file"
++        ],
++        "title": "Body_upload_document_documents_post",
++        "type": "object"
++      },
++      "DocumentDetail": {
++        "properties": {
++          "created_at": {
++            "format": "date-time",
++            "title": "Created At",
++            "type": "string"
++          },
++          "golden": {
++            "anyOf": [
++              {
++                "$ref": "#/components/schemas/GoldenOut"
++              },
++              {
++                "type": "null"
++              }
++            ]
++          },
++          "has_golden": {
++            "title": "Has Golden",
++            "type": "boolean"
++          },
++          "id": {
++            "format": "uuid",
++            "title": "Id",
++            "type": "string"
++          },
++          "latest_run": {
++            "anyOf": [
++              {
++                "$ref": "#/components/schemas/RunSummary"
++              },
++              {
++                "type": "null"
++              }
++            ]
++          },
++          "mime": {
++            "title": "Mime",
++            "type": "string"
++          },
++          "name": {
++            "title": "Name",
++            "type": "string"
++          },
++          "ocr_status": {
++            "title": "Ocr Status",
++            "type": "string"
++          },
++          "ocr_text": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Ocr Text"
++          },
++          "page_count": {
++            "title": "Page Count",
++            "type": "integer"
++          },
++          "pages": {
++            "items": {
++              "$ref": "#/components/schemas/PageOut"
++            },
++            "title": "Pages",
++            "type": "array"
++          },
++          "runs": {
++            "items": {
++              "$ref": "#/components/schemas/RunSummary"
++            },
++            "title": "Runs",
++            "type": "array"
++          },
++          "source": {
++            "title": "Source",
++            "type": "string"
++          },
++          "split": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Split"
++          }
++        },
++        "required": [
++          "id",
++          "name",
++          "source",
++          "split",
++          "mime",
++          "page_count",
++          "ocr_status",
++          "has_golden",
++          "created_at",
++          "pages",
++          "ocr_text",
++          "runs"
++        ],
++        "title": "DocumentDetail",
++        "type": "object"
++      },
++      "DocumentList": {
++        "properties": {
++          "items": {
++            "items": {
++              "$ref": "#/components/schemas/DocumentOut"
++            },
++            "title": "Items",
++            "type": "array"
++          },
++          "total": {
++            "title": "Total",
++            "type": "integer"
++          }
++        },
++        "required": [
++          "items",
++          "total"
++        ],
++        "title": "DocumentList",
++        "type": "object"
++      },
++      "DocumentOut": {
++        "properties": {
++          "created_at": {
++            "format": "date-time",
++            "title": "Created At",
++            "type": "string"
++          },
++          "has_golden": {
++            "title": "Has Golden",
++            "type": "boolean"
++          },
++          "id": {
++            "format": "uuid",
++            "title": "Id",
++            "type": "string"
++          },
++          "latest_run": {
++            "anyOf": [
++              {
++                "$ref": "#/components/schemas/RunSummary"
++              },
++              {
++                "type": "null"
++              }
++            ]
++          },
++          "mime": {
++            "title": "Mime",
++            "type": "string"
++          },
++          "name": {
++            "title": "Name",
++            "type": "string"
++          },
++          "ocr_status": {
++            "title": "Ocr Status",
++            "type": "string"
++          },
++          "page_count": {
++            "title": "Page Count",
++            "type": "integer"
++          },
++          "source": {
++            "title": "Source",
++            "type": "string"
++          },
++          "split": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Split"
++          }
++        },
++        "required": [
++          "id",
++          "name",
++          "source",
++          "split",
++          "mime",
++          "page_count",
++          "ocr_status",
++          "has_golden",
++          "created_at"
++        ],
++        "title": "DocumentOut",
++        "type": "object"
++      },
++      "EvalOut": {
++        "properties": {
++          "cost_per_doc": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Cost Per Doc"
++          },
++          "cost_usd": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Cost Usd"
++          },
++          "created_at": {
++            "format": "date-time",
++            "title": "Created At",
++            "type": "string"
++          },
++          "doc_count": {
++            "title": "Doc Count",
++            "type": "integer"
++          },
++          "doc_exact_rate": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Doc Exact Rate"
++          },
++          "effort": {
++            "title": "Effort",
++            "type": "string"
++          },
++          "errors": {
++            "items": {
++              "additionalProperties": true,
++              "type": "object"
++            },
++            "title": "Errors",
++            "type": "array"
++          },
++          "failed": {
++            "title": "Failed",
++            "type": "integer"
++          },
++          "fewshot_k": {
++            "title": "Fewshot K",
++            "type": "integer"
++          },
++          "field_order": {
++            "items": {
++              "type": "string"
++            },
++            "title": "Field Order",
++            "type": "array"
++          },
++          "finished_at": {
++            "anyOf": [
++              {
++                "format": "date-time",
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Finished At"
++          },
++          "id": {
++            "format": "uuid",
++            "title": "Id",
++            "type": "string"
++          },
++          "lenient_accuracy": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Lenient Accuracy"
++          },
++          "lists": {
++            "additionalProperties": true,
++            "title": "Lists",
++            "type": "object"
++          },
++          "mode": {
++            "title": "Mode",
++            "type": "string"
++          },
++          "model": {
++            "title": "Model",
++            "type": "string"
++          },
++          "notes": {
++            "title": "Notes",
++            "type": "string"
++          },
++          "overall_accuracy": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Overall Accuracy"
++          },
++          "p50_ms": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "P50 Ms"
++          },
++          "p95_ms": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "P95 Ms"
++          },
++          "per_field": {
++            "additionalProperties": true,
++            "title": "Per Field",
++            "type": "object"
++          },
++          "prompt_version": {
++            "title": "Prompt Version",
++            "type": "string"
++          },
++          "provider": {
++            "title": "Provider",
++            "type": "string"
++          },
++          "reps": {
++            "title": "Reps",
++            "type": "integer"
++          },
++          "schema_id": {
++            "format": "uuid",
++            "title": "Schema Id",
++            "type": "string"
++          },
++          "split": {
++            "title": "Split",
++            "type": "string"
++          },
++          "status": {
++            "title": "Status",
++            "type": "string"
++          },
++          "succeeded": {
++            "title": "Succeeded",
++            "type": "integer"
++          },
++          "truncated": {
++            "title": "Truncated",
++            "type": "integer"
++          },
++          "use_ocr_text": {
++            "title": "Use Ocr Text",
++            "type": "boolean"
++          },
++          "value_accuracy": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Value Accuracy"
++          }
++        },
++        "required": [
++          "id",
++          "schema_id",
++          "prompt_version",
++          "model",
++          "effort",
++          "fewshot_k",
++          "use_ocr_text",
++          "provider",
++          "split",
++          "mode",
++          "notes",
++          "status",
++          "doc_count",
++          "reps",
++          "succeeded",
++          "truncated",
++          "failed",
++          "per_field",
++          "lists",
++          "errors",
++          "created_at"
++        ],
++        "title": "EvalOut",
++        "type": "object"
++      },
++      "EvalRequest": {
++        "properties": {
++          "effort": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Effort"
++          },
++          "fewshot_k": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Fewshot K"
++          },
++          "limit": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Limit"
++          },
++          "mode": {
++            "default": "sync",
++            "title": "Mode",
++            "type": "string"
++          },
++          "model": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Model"
++          },
++          "notes": {
++            "default": "",
++            "title": "Notes",
++            "type": "string"
++          },
++          "prompt": {
++            "default": "v1",
++            "title": "Prompt",
++            "type": "string"
++          },
++          "reps": {
++            "default": 1,
++            "title": "Reps",
++            "type": "integer"
++          },
++          "schema_name": {
++            "default": "receipt",
++            "title": "Schema Name",
++            "type": "string"
++          },
++          "split": {
++            "default": "test",
++            "title": "Split",
++            "type": "string"
++          },
++          "use_ocr_text": {
++            "anyOf": [
++              {
++                "type": "boolean"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Use Ocr Text"
++          }
++        },
++        "title": "EvalRequest",
++        "type": "object"
++      },
++      "EvalResultOut": {
++        "properties": {
++          "all_correct": {
++            "anyOf": [
++              {
++                "type": "boolean"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "All Correct"
++          },
++          "document_id": {
++            "format": "uuid",
++            "title": "Document Id",
++            "type": "string"
++          },
++          "document_name": {
++            "title": "Document Name",
++            "type": "string"
++          },
++          "extraction_run_id": {
++            "format": "uuid",
++            "title": "Extraction Run Id",
++            "type": "string"
++          },
++          "outcomes": {
++            "anyOf": [
++              {
++                "additionalProperties": true,
++                "type": "object"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Outcomes"
++          },
++          "rep": {
++            "title": "Rep",
++            "type": "integer"
++          },
++          "status": {
++            "title": "Status",
++            "type": "string"
++          }
++        },
++        "required": [
++          "document_id",
++          "document_name",
++          "extraction_run_id",
++          "rep",
++          "status"
++        ],
++        "title": "EvalResultOut",
++        "type": "object"
++      },
++      "ExtractRequest": {
++        "properties": {
++          "effort": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Effort"
++          },
++          "fewshot_k": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Fewshot K"
++          },
++          "model": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Model"
++          },
++          "prompt": {
++            "default": "v1",
++            "title": "Prompt",
++            "type": "string"
++          },
++          "schema_name": {
++            "default": "receipt",
++            "title": "Schema Name",
++            "type": "string"
++          },
++          "use_ocr_text": {
++            "anyOf": [
++              {
++                "type": "boolean"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Use Ocr Text"
++          }
++        },
++        "title": "ExtractRequest",
++        "type": "object"
++      },
++      "FieldMetaOut": {
++        "properties": {
++          "children": {
++            "items": {
++              "type": "string"
++            },
++            "title": "Children",
++            "type": "array"
++          },
++          "description": {
++            "default": "",
++            "title": "Description",
++            "type": "string"
++          },
++          "matcher": {
++            "title": "Matcher",
++            "type": "string"
++          },
++          "path": {
++            "title": "Path",
++            "type": "string"
++          },
++          "type": {
++            "title": "Type",
++            "type": "string"
++          }
++        },
++        "required": [
++          "path",
++          "type",
++          "matcher"
++        ],
++        "title": "FieldMetaOut",
++        "type": "object"
++      },
++      "GoldenIn": {
++        "properties": {
++          "data": {
++            "additionalProperties": true,
++            "title": "Data",
++            "type": "object"
++          }
++        },
++        "required": [
++          "data"
++        ],
++        "title": "GoldenIn",
++        "type": "object"
++      },
++      "GoldenOut": {
++        "properties": {
++          "created_at": {
++            "format": "date-time",
++            "title": "Created At",
++            "type": "string"
++          },
++          "data": {
++            "additionalProperties": true,
++            "title": "Data",
++            "type": "object"
++          },
++          "source": {
++            "title": "Source",
++            "type": "string"
++          }
++        },
++        "required": [
++          "source",
++          "data",
++          "created_at"
++        ],
++        "title": "GoldenOut",
++        "type": "object"
++      },
++      "HTTPValidationError": {
++        "properties": {
++          "detail": {
++            "items": {
++              "$ref": "#/components/schemas/ValidationError"
++            },
++            "title": "Detail",
++            "type": "array"
++          }
++        },
++        "title": "HTTPValidationError",
++        "type": "object"
++      },
++      "ModelOut": {
++        "properties": {
++          "id": {
++            "title": "Id",
++            "type": "string"
++          },
++          "input_per_mtok": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Input Per Mtok"
++          },
++          "output_per_mtok": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Output Per Mtok"
++          },
++          "provider": {
++            "title": "Provider",
++            "type": "string"
++          }
++        },
++        "required": [
++          "id",
++          "provider"
++        ],
++        "title": "ModelOut",
++        "type": "object"
++      },
++      "OcrSpanOut": {
++        "properties": {
++          "box": {
++            "items": {
++              "type": "integer"
++            },
++            "title": "Box",
++            "type": "array"
++          },
++          "conf": {
++            "title": "Conf",
++            "type": "number"
++          },
++          "page": {
++            "title": "Page",
++            "type": "integer"
++          },
++          "text": {
++            "title": "Text",
++            "type": "string"
++          },
++          "words": {
++            "items": {
++              "$ref": "#/components/schemas/OcrWordOut"
++            },
++            "title": "Words",
++            "type": "array"
++          }
++        },
++        "required": [
++          "page",
++          "text",
++          "box",
++          "conf"
++        ],
++        "title": "OcrSpanOut",
++        "type": "object"
++      },
++      "OcrWordOut": {
++        "properties": {
++          "box": {
++            "items": {
++              "type": "integer"
++            },
++            "title": "Box",
++            "type": "array"
++          },
++          "conf": {
++            "title": "Conf",
++            "type": "number"
++          },
++          "text": {
++            "title": "Text",
++            "type": "string"
++          }
++        },
++        "required": [
++          "text",
++          "box",
++          "conf"
++        ],
++        "title": "OcrWordOut",
++        "type": "object"
++      },
++      "PageOut": {
++        "properties": {
++          "height": {
++            "title": "Height",
++            "type": "integer"
++          },
++          "page": {
++            "title": "Page",
++            "type": "integer"
++          },
++          "url": {
++            "title": "Url",
++            "type": "string"
++          },
++          "width": {
++            "title": "Width",
++            "type": "integer"
++          }
++        },
++        "required": [
++          "page",
++          "width",
++          "height",
++          "url"
++        ],
++        "title": "PageOut",
++        "type": "object"
++      },
++      "PromptOut": {
++        "properties": {
++          "consistency_check": {
++            "title": "Consistency Check",
++            "type": "boolean"
++          },
++          "fewshot_k": {
++            "title": "Fewshot K",
++            "type": "integer"
++          },
++          "name": {
++            "title": "Name",
++            "type": "string"
++          },
++          "notes": {
++            "title": "Notes",
++            "type": "string"
++          },
++          "use_evidence": {
++            "title": "Use Evidence",
++            "type": "boolean"
++          },
++          "use_ocr_text": {
++            "title": "Use Ocr Text",
++            "type": "boolean"
++          }
++        },
++        "required": [
++          "name",
++          "notes",
++          "use_ocr_text",
++          "fewshot_k",
++          "use_evidence",
++          "consistency_check"
++        ],
++        "title": "PromptOut",
++        "type": "object"
++      },
++      "RunOut": {
++        "properties": {
++          "boxes": {
++            "anyOf": [
++              {
++                "additionalProperties": {
++                  "items": {
++                    "items": {
++                      "type": "integer"
++                    },
++                    "type": "array"
++                  },
++                  "type": "array"
++                },
++                "type": "object"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Boxes"
++          },
++          "cache_read_tokens": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Cache Read Tokens"
++          },
++          "cache_write_tokens": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Cache Write Tokens"
++          },
++          "confidences": {
++            "anyOf": [
++              {
++                "additionalProperties": {
++                  "type": "number"
++                },
++                "type": "object"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Confidences"
++          },
++          "cost_usd": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Cost Usd"
++          },
++          "created_at": {
++            "format": "date-time",
++            "title": "Created At",
++            "type": "string"
++          },
++          "document_id": {
++            "format": "uuid",
++            "title": "Document Id",
++            "type": "string"
++          },
++          "effort": {
++            "title": "Effort",
++            "type": "string"
++          },
++          "error": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Error"
++          },
++          "evidence": {
++            "anyOf": [
++              {
++                "additionalProperties": true,
++                "type": "object"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Evidence"
++          },
++          "fewshot_document_ids": {
++            "anyOf": [
++              {
++                "items": {
++                  "type": "string"
++                },
++                "type": "array"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Fewshot Document Ids"
++          },
++          "fewshot_k": {
++            "title": "Fewshot K",
++            "type": "integer"
++          },
++          "id": {
++            "format": "uuid",
++            "title": "Id",
++            "type": "string"
++          },
++          "input_tokens": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Input Tokens"
++          },
++          "latency_ms": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Latency Ms"
++          },
++          "model": {
++            "title": "Model",
++            "type": "string"
++          },
++          "output_tokens": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Output Tokens"
++          },
++          "prompt_version": {
++            "title": "Prompt Version",
++            "type": "string"
++          },
++          "provider": {
++            "title": "Provider",
++            "type": "string"
++          },
++          "repair_rounds": {
++            "default": 0,
++            "title": "Repair Rounds",
++            "type": "integer"
++          },
++          "request_id": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Request Id"
++          },
++          "result": {
++            "anyOf": [
++              {
++                "additionalProperties": true,
++                "type": "object"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Result"
++          },
++          "schema_id": {
++            "format": "uuid",
++            "title": "Schema Id",
++            "type": "string"
++          },
++          "served_model": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Served Model"
++          },
++          "status": {
++            "title": "Status",
++            "type": "string"
++          },
++          "use_ocr_text": {
++            "title": "Use Ocr Text",
++            "type": "boolean"
++          }
++        },
++        "required": [
++          "id",
++          "status",
++          "prompt_version",
++          "model",
++          "effort",
++          "fewshot_k",
++          "use_ocr_text",
++          "provider",
++          "created_at",
++          "document_id",
++          "schema_id"
++        ],
++        "title": "RunOut",
++        "type": "object"
++      },
++      "RunSummary": {
++        "properties": {
++          "cost_usd": {
++            "anyOf": [
++              {
++                "type": "number"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Cost Usd"
++          },
++          "created_at": {
++            "format": "date-time",
++            "title": "Created At",
++            "type": "string"
++          },
++          "effort": {
++            "title": "Effort",
++            "type": "string"
++          },
++          "error": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Error"
++          },
++          "fewshot_k": {
++            "title": "Fewshot K",
++            "type": "integer"
++          },
++          "id": {
++            "format": "uuid",
++            "title": "Id",
++            "type": "string"
++          },
++          "latency_ms": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Latency Ms"
++          },
++          "model": {
++            "title": "Model",
++            "type": "string"
++          },
++          "prompt_version": {
++            "title": "Prompt Version",
++            "type": "string"
++          },
++          "provider": {
++            "title": "Provider",
++            "type": "string"
++          },
++          "status": {
++            "title": "Status",
++            "type": "string"
++          },
++          "use_ocr_text": {
++            "title": "Use Ocr Text",
++            "type": "boolean"
++          }
++        },
++        "required": [
++          "id",
++          "status",
++          "prompt_version",
++          "model",
++          "effort",
++          "fewshot_k",
++          "use_ocr_text",
++          "provider",
++          "created_at"
++        ],
++        "title": "RunSummary",
++        "type": "object"
++      },
++      "SchemaOut": {
++        "properties": {
++          "created_at": {
++            "format": "date-time",
++            "title": "Created At",
++            "type": "string"
++          },
++          "fields": {
++            "items": {
++              "$ref": "#/components/schemas/FieldMetaOut"
++            },
++            "title": "Fields",
++            "type": "array"
++          },
++          "id": {
++            "format": "uuid",
++            "title": "Id",
++            "type": "string"
++          },
++          "json_schema": {
++            "additionalProperties": true,
++            "title": "Json Schema",
++            "type": "object"
++          },
++          "name": {
++            "title": "Name",
++            "type": "string"
++          },
++          "version": {
++            "title": "Version",
++            "type": "integer"
++          }
++        },
++        "required": [
++          "id",
++          "name",
++          "version",
++          "json_schema",
++          "fields",
++          "created_at"
++        ],
++        "title": "SchemaOut",
++        "type": "object"
++      },
++      "TaskAccepted": {
++        "properties": {
++          "status": {
++            "default": "queued",
++            "title": "Status",
++            "type": "string"
++          },
++          "task_id": {
++            "title": "Task Id",
++            "type": "string"
++          }
++        },
++        "required": [
++          "task_id"
++        ],
++        "title": "TaskAccepted",
++        "type": "object"
++      },
++      "ValidationError": {
++        "properties": {
++          "ctx": {
++            "title": "Context",
++            "type": "object"
++          },
++          "input": {
++            "title": "Input"
++          },
++          "loc": {
++            "items": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "integer"
++                }
++              ]
++            },
++            "title": "Location",
++            "type": "array"
++          },
++          "msg": {
++            "title": "Message",
++            "type": "string"
++          },
++          "type": {
++            "title": "Error Type",
++            "type": "string"
++          }
++        },
++        "required": [
++          "loc",
++          "msg",
++          "type"
++        ],
++        "title": "ValidationError",
++        "type": "object"
++      }
++    }
++  },
++  "info": {
++    "description": "Schema-driven document extraction with a review UI and per-field evals.",
++    "title": "fieldwise",
++    "version": "0.1.0"
++  },
++  "openapi": "3.1.0",
++  "paths": {
++    "/documents": {
++      "get": {
++        "operationId": "list_documents_documents_get",
++        "parameters": [
++          {
++            "in": "query",
++            "name": "split",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "Split"
++            }
++          },
++          {
++            "in": "query",
++            "name": "q",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "Q"
++            }
++          },
++          {
++            "in": "query",
++            "name": "limit",
++            "required": false,
++            "schema": {
++              "default": 50,
++              "maximum": 200,
++              "minimum": 1,
++              "title": "Limit",
++              "type": "integer"
++            }
++          },
++          {
++            "in": "query",
++            "name": "offset",
++            "required": false,
++            "schema": {
++              "default": 0,
++              "minimum": 0,
++              "title": "Offset",
++              "type": "integer"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/DocumentList"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "List Documents",
++        "tags": [
++          "documents"
++        ]
++      },
++      "post": {
++        "operationId": "upload_document_documents_post",
++        "requestBody": {
++          "content": {
++            "multipart/form-data": {
++              "schema": {
++                "$ref": "#/components/schemas/Body_upload_document_documents_post"
++              }
++            }
++          },
++          "required": true
++        },
++        "responses": {
++          "201": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/DocumentOut"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Upload Document",
++        "tags": [
++          "documents"
++        ]
++      }
++    },
++    "/documents/{document_id}": {
++      "get": {
++        "operationId": "get_document_documents__document_id__get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "document_id",
++            "required": true,
++            "schema": {
++              "format": "uuid",
++              "title": "Document Id",
++              "type": "string"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/DocumentDetail"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Get Document",
++        "tags": [
++          "documents"
++        ]
++      }
++    },
++    "/documents/{document_id}/extract": {
++      "post": {
++        "operationId": "extract_documents__document_id__extract_post",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "document_id",
++            "required": true,
++            "schema": {
++              "format": "uuid",
++              "title": "Document Id",
++              "type": "string"
++            }
++          }
++        ],
++        "requestBody": {
++          "content": {
++            "application/json": {
++              "schema": {
++                "$ref": "#/components/schemas/ExtractRequest"
++              }
++            }
++          },
++          "required": true
++        },
++        "responses": {
++          "202": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/RunOut"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Extract",
++        "tags": [
++          "documents"
++        ]
++      }
++    },
++    "/documents/{document_id}/golden": {
++      "get": {
++        "operationId": "get_golden_documents__document_id__golden_get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "document_id",
++            "required": true,
++            "schema": {
++              "format": "uuid",
++              "title": "Document Id",
++              "type": "string"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/GoldenOut"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Get Golden",
++        "tags": [
++          "documents"
++        ]
++      },
++      "put": {
++        "description": "Stores a reviewer's correction; it becomes the document's golden label.",
++        "operationId": "put_golden_documents__document_id__golden_put",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "document_id",
++            "required": true,
++            "schema": {
++              "format": "uuid",
++              "title": "Document Id",
++              "type": "string"
++            }
++          },
++          {
++            "in": "query",
++            "name": "schema_name",
++            "required": false,
++            "schema": {
++              "default": "receipt",
++              "title": "Schema Name",
++              "type": "string"
++            }
++          }
++        ],
++        "requestBody": {
++          "content": {
++            "application/json": {
++              "schema": {
++                "$ref": "#/components/schemas/GoldenIn"
++              }
++            }
++          },
++          "required": true
++        },
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/GoldenOut"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Put Golden",
++        "tags": [
++          "documents"
++        ]
++      }
++    },
++    "/documents/{document_id}/ocr": {
++      "get": {
++        "operationId": "get_ocr_documents__document_id__ocr_get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "document_id",
++            "required": true,
++            "schema": {
++              "format": "uuid",
++              "title": "Document Id",
++              "type": "string"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "items": {
++                    "$ref": "#/components/schemas/OcrSpanOut"
++                  },
++                  "title": "Response Get Ocr Documents  Document Id  Ocr Get",
++                  "type": "array"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Get Ocr",
++        "tags": [
++          "documents"
++        ]
++      }
++    },
++    "/documents/{document_id}/pages/{page}": {
++      "get": {
++        "operationId": "get_page_documents__document_id__pages__page__get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "document_id",
++            "required": true,
++            "schema": {
++              "format": "uuid",
++              "title": "Document Id",
++              "type": "string"
++            }
++          },
++          {
++            "in": "path",
++            "name": "page",
++            "required": true,
++            "schema": {
++              "title": "Page",
++              "type": "integer"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {}
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Get Page",
++        "tags": [
++          "documents"
++        ]
++      }
++    },
++    "/documents/{document_id}/runs": {
++      "get": {
++        "operationId": "list_runs_documents__document_id__runs_get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "document_id",
++            "required": true,
++            "schema": {
++              "format": "uuid",
++              "title": "Document Id",
++              "type": "string"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "items": {
++                    "$ref": "#/components/schemas/RunOut"
++                  },
++                  "title": "Response List Runs Documents  Document Id  Runs Get",
++                  "type": "array"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "List Runs",
++        "tags": [
++          "documents"
++        ]
++      }
++    },
++    "/evals": {
++      "get": {
++        "operationId": "list_evals_evals_get",
++        "parameters": [
++          {
++            "in": "query",
++            "name": "limit",
++            "required": false,
++            "schema": {
++              "default": 50,
++              "maximum": 200,
++              "minimum": 1,
++              "title": "Limit",
++              "type": "integer"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "items": {
++                    "$ref": "#/components/schemas/EvalOut"
++                  },
++                  "title": "Response List Evals Evals Get",
++                  "type": "array"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "List Evals",
++        "tags": [
++          "evals"
++        ]
++      },
++      "post": {
++        "operationId": "start_eval_evals_post",
++        "requestBody": {
++          "content": {
++            "application/json": {
++              "schema": {
++                "$ref": "#/components/schemas/EvalRequest"
++              }
++            }
++          },
++          "required": true
++        },
++        "responses": {
++          "202": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/TaskAccepted"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Start Eval",
++        "tags": [
++          "evals"
++        ]
++      }
++    },
++    "/evals/compare": {
++      "get": {
++        "operationId": "compare_evals_compare_get",
++        "parameters": [
++          {
++            "in": "query",
++            "name": "ids",
++            "required": true,
++            "schema": {
++              "items": {
++                "format": "uuid",
++                "type": "string"
++              },
++              "title": "Ids",
++              "type": "array"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "additionalProperties": true,
++                  "title": "Response Compare Evals Compare Get",
++                  "type": "object"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Compare",
++        "tags": [
++          "evals"
++        ]
++      }
++    },
++    "/evals/{eval_id}": {
++      "get": {
++        "operationId": "get_eval_evals__eval_id__get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "eval_id",
++            "required": true,
++            "schema": {
++              "format": "uuid",
++              "title": "Eval Id",
++              "type": "string"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/EvalOut"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Get Eval",
++        "tags": [
++          "evals"
++        ]
++      }
++    },
++    "/evals/{eval_id}/results": {
++      "get": {
++        "operationId": "get_results_evals__eval_id__results_get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "eval_id",
++            "required": true,
++            "schema": {
++              "format": "uuid",
++              "title": "Eval Id",
++              "type": "string"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "items": {
++                    "$ref": "#/components/schemas/EvalResultOut"
++                  },
++                  "title": "Response Get Results Evals  Eval Id  Results Get",
++                  "type": "array"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Get Results",
++        "tags": [
++          "evals"
++        ]
++      }
++    },
++    "/health": {
++      "get": {
++        "operationId": "health_health_get",
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "additionalProperties": {
++                    "type": "string"
++                  },
++                  "title": "Response Health Health Get",
++                  "type": "object"
++                }
++              }
++            },
++            "description": "Successful Response"
++          }
++        },
++        "summary": "Health",
++        "tags": [
++          "meta"
++        ]
++      }
++    },
++    "/models": {
++      "get": {
++        "operationId": "models_models_get",
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "items": {
++                    "$ref": "#/components/schemas/ModelOut"
++                  },
++                  "title": "Response Models Models Get",
++                  "type": "array"
++                }
++              }
++            },
++            "description": "Successful Response"
++          }
++        },
++        "summary": "Models",
++        "tags": [
++          "meta"
++        ]
++      }
++    },
++    "/prompts": {
++      "get": {
++        "operationId": "prompts_prompts_get",
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "items": {
++                    "$ref": "#/components/schemas/PromptOut"
++                  },
++                  "title": "Response Prompts Prompts Get",
++                  "type": "array"
++                }
++              }
++            },
++            "description": "Successful Response"
++          }
++        },
++        "summary": "Prompts",
++        "tags": [
++          "meta"
++        ]
++      }
++    },
++    "/runs/{run_id}": {
++      "get": {
++        "operationId": "get_run_runs__run_id__get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "run_id",
++            "required": true,
++            "schema": {
++              "format": "uuid",
++              "title": "Run Id",
++              "type": "string"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/RunOut"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Get Run",
++        "tags": [
++          "runs"
++        ]
++      }
++    },
++    "/schemas": {
++      "get": {
++        "operationId": "list_schemas_schemas_get",
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "items": {
++                    "$ref": "#/components/schemas/SchemaOut"
++                  },
++                  "title": "Response List Schemas Schemas Get",
++                  "type": "array"
++                }
++              }
++            },
++            "description": "Successful Response"
++          }
++        },
++        "summary": "List Schemas",
++        "tags": [
++          "schemas"
++        ]
++      }
++    },
++    "/schemas/{name}": {
++      "get": {
++        "operationId": "get_one_schemas__name__get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "name",
++            "required": true,
++            "schema": {
++              "title": "Name",
++              "type": "string"
++            }
++          },
++          {
++            "in": "query",
++            "name": "version",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "integer"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "title": "Version"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/SchemaOut"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Get One",
++        "tags": [
++          "schemas"
++        ]
++      }
++    }
++  }
++}

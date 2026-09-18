@@ -1,0 +1,402 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 104e21b..42ac36a 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -85,3 +85,38 @@ jobs:
+       - name: The generated API client matches openapi.json
+         run: pnpm gen:api && git diff --exit-code -- src/lib/api/schema.d.ts
+       - run: pnpm build
++
++  e2e:
++    name: E2E — the Docker stack with the fake provider, driven by Playwright
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v7
++      - uses: docker/setup-buildx-action@v3
++      - name: Build and start the stack
++        run: docker compose -f docker-compose.yml -f docker-compose.e2e.yml --profile app up -d --build --wait
++      - uses: pnpm/action-setup@v6
++        with:
++          version: 12
++      - uses: actions/setup-node@v7
++        with:
++          node-version: 24
++          cache: pnpm
++          cache-dependency-path: web/pnpm-lock.yaml
++      - run: pnpm install --frozen-lockfile
++        working-directory: web
++      - run: pnpm exec playwright install --with-deps chromium
++        working-directory: web
++      - run: pnpm e2e
++        working-directory: web
++      - name: Stack logs
++        if: failure()
++        run: docker compose --profile app logs --no-color --tail=200
++      - uses: actions/upload-artifact@v7
++        if: failure()
++        with:
++          name: playwright-report
++          path: web/playwright-report
++          retention-days: 7
++      - name: Stop the stack
++        if: always()
++        run: docker compose -f docker-compose.yml -f docker-compose.e2e.yml --profile app down -v
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 4793fcf..e0e3693 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -11,6 +11,7 @@ and `web/` (Next.js). Postgres with pgvector and Redis run from `docker-compose.
+ - Tests: `uv run pytest` (unit) — integration tests need Docker and are marked `integration`
+ - Web: `just web` (dev server on :3000, proxies `/api` to :8000), `just web-check`; the typed client in
+   `web/src/lib/api/schema.d.ts` is generated from `openapi.json` — never edit it by hand
++- End to end: `just app-e2e` (the stack with `LLM_PROVIDER=fake`), then `just e2e` (Playwright)
+ 
+ ## Rules of the codebase
+ - Evals first: any change to a prompt, the schema compiler or a matcher must be re-measured, and the
+diff --git a/docker-compose.e2e.yml b/docker-compose.e2e.yml
+new file mode 100644
+index 0000000..9ac5086
+--- /dev/null
++++ b/docker-compose.e2e.yml
+@@ -0,0 +1,8 @@
++# `just app-e2e`: the same stack with the fake model provider, so the end-to-end tests need no key.
++services:
++  api:
++    environment:
++      LLM_PROVIDER: fake
++  worker:
++    environment:
++      LLM_PROVIDER: fake
+diff --git a/justfile b/justfile
+index ca99471..9c8a156 100644
+--- a/justfile
++++ b/justfile
+@@ -11,9 +11,13 @@ up:
+ app:
+     docker compose --profile app up -d --build --wait
+ 
++# The whole stack with the fake model provider (what the e2e tests run against)
++app-e2e:
++    docker compose -f docker-compose.yml -f docker-compose.e2e.yml --profile app up -d --build --wait
++
+ # Stop everything
+ down:
+-    docker compose --profile app down
++    docker compose -f docker-compose.yml -f docker-compose.e2e.yml --profile app down
+ 
+ # Lint, types and tests for the backend
+ backend-check:
+@@ -51,6 +55,10 @@ check: backend-check openapi-check web-check
+ web:
+     cd web && pnpm dev
+ 
++# Browser smoke test against the running stack (`just app-e2e` first)
++e2e:
++    cd web && pnpm e2e
++
+ # Run the API locally with reload
+ api:
+     cd backend && uv run uvicorn fieldwise.api.app:app --reload --port 8000
+diff --git a/web/.gitignore b/web/.gitignore
+index 5ef6a52..bacdb4f 100644
+--- a/web/.gitignore
++++ b/web/.gitignore
+@@ -39,3 +39,7 @@ yarn-error.log*
+ # typescript
+ *.tsbuildinfo
+ next-env.d.ts
++
++# playwright
++/test-results
++/playwright-report
+diff --git a/web/e2e/smoke.spec.ts b/web/e2e/smoke.spec.ts
+new file mode 100644
+index 0000000..3cd6554
+--- /dev/null
++++ b/web/e2e/smoke.spec.ts
+@@ -0,0 +1,50 @@
++import path from "node:path";
++import { expect, test } from "@playwright/test";
++
++const FIXTURE = path.resolve(
++  __dirname,
++  "../../backend/tests/fixtures/cord/cord-v2_validation_0006.jpg",
++);
++
++test("upload → OCR → extraction → correction, end to end", async ({ page }) => {
++  await page.goto("/documents");
++  await expect(page.getByRole("heading", { name: "Documents" })).toBeVisible();
++
++  // Upload through the hidden input behind the dropzone button.
++  await page.locator('input[type="file"]').setInputFiles(FIXTURE);
++  await expect(page).toHaveURL(/\/documents\/[0-9a-f-]{36}$/);
++  await expect(page.getByRole("heading", { name: "cord-v2_validation_0006.jpg" })).toBeVisible();
++
++  // The worker runs OCR (RapidOCR) and the page polls until it is done.
++  await expect(page.getByText("done", { exact: true }).first()).toBeVisible({ timeout: 60_000 });
++  await page.getByRole("switch", { name: "OCR boxes" }).click();
++  await expect(page.locator("button[title]").first()).toBeVisible();
++
++  // Queue an extraction; with LLM_PROVIDER=fake the worker answers with an all-null result.
++  await page.getByRole("button", { name: "Run extraction" }).click();
++  await expect(page.getByText("succeeded", { exact: true }).first()).toBeVisible({
++    timeout: 60_000,
++  });
++  await expect(page.getByText("line items", { exact: true }).first()).toBeVisible();
++
++  // Correct the total and save: it becomes the golden label.
++  await page.getByRole("button", { name: "Edit values" }).click();
++  const totalInput = page.locator("li", { hasText: "total" }).last().getByRole("textbox");
++  await totalInput.fill("45500");
++  await page.getByRole("button", { name: "Save correction" }).click();
++  await expect(page.getByText("Correction saved")).toBeVisible();
++  await expect(page.getByText("golden: correction")).toBeVisible();
++
++  // The document now shows as labelled in the list.
++  await page.goto("/documents?split=upload");
++  await expect(
++    page.getByRole("row", { name: /cord-v2_validation_0006\.jpg/ }).getByText("labelled"),
++  ).toBeVisible();
++});
++
++test("eval pages render", async ({ page }) => {
++  await page.goto("/evals");
++  await expect(page.getByRole("heading", { name: "Evals" })).toBeVisible();
++  await page.goto("/schemas");
++  await expect(page.getByText("line_items[].line_total")).toBeVisible();
++});
+diff --git a/web/next.config.ts b/web/next.config.ts
+index d2d28ad..03e8df3 100644
+--- a/web/next.config.ts
++++ b/web/next.config.ts
+@@ -1,14 +1,10 @@
+ import type { NextConfig } from "next";
+ 
+-// The browser only talks to this app; /api/* is proxied server-side to the FastAPI service.
+-const API_URL = process.env.API_URL ?? "http://localhost:8000";
+-
++// /api/* is proxied to the FastAPI service by src/app/api/[...path]/route.ts at request time
++// (API_URL), so the built image needs no baked-in address.
+ const nextConfig: NextConfig = {
+   output: "standalone",
+   reactCompiler: true,
+-  rewrites() {
+-    return [{ source: "/api/:path*", destination: `${API_URL}/:path*` }];
+-  },
+ };
+ 
+ export default nextConfig;
+diff --git a/web/package.json b/web/package.json
+index e62ee97..d23fb2b 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -11,7 +11,8 @@
+     "typecheck": "next typegen && tsc --noEmit",
+     "test": "vitest run",
+     "gen:api": "openapi-typescript ../openapi.json -o src/lib/api/schema.d.ts",
+-    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build"
++    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
++    "e2e": "playwright test"
+   },
+   "dependencies": {
+     "@base-ui/react": "^1.8.0",
+@@ -32,6 +33,7 @@
+   },
+   "devDependencies": {
+     "@biomejs/biome": "^2.5.14",
++    "@playwright/test": "^1.63.0",
+     "@tailwindcss/postcss": "^4",
+     "@testing-library/dom": "^10.4.2",
+     "@testing-library/react": "^16.3.3",
+diff --git a/web/playwright.config.ts b/web/playwright.config.ts
+new file mode 100644
+index 0000000..cd91dca
+--- /dev/null
++++ b/web/playwright.config.ts
+@@ -0,0 +1,17 @@
++import { defineConfig, devices } from "@playwright/test";
++
++// Runs against the compose stack (`LLM_PROVIDER=fake just app`): web on :3000, API on :8000.
++export default defineConfig({
++  testDir: "e2e",
++  timeout: 90_000,
++  expect: { timeout: 15_000 },
++  fullyParallel: false,
++  workers: 1,
++  retries: process.env.CI ? 1 : 0,
++  reporter: process.env.CI ? [["github"], ["html", { open: "never" }]] : [["list"]],
++  use: {
++    baseURL: process.env.E2E_BASE_URL ?? "http://localhost:3000",
++    trace: "retain-on-failure",
++  },
++  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
++});
+diff --git a/web/pnpm-lock.yaml b/web/pnpm-lock.yaml
+index 8457b18..ac6dae7 100644
+--- a/web/pnpm-lock.yaml
++++ b/web/pnpm-lock.yaml
+@@ -186,7 +186,7 @@ importers:
+         version: 1.47.0(react@19.3.0)
+       next:
+         specifier: 16.3.5
+-        version: 16.3.5(@babel/core@7.29.7(supports-color@10.2.2))(@types/node@24.13.5)(babel-plugin-react-compiler@1.0.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
++        version: 16.3.5(@babel/core@7.29.7(supports-color@10.2.2))(@playwright/test@1.63.0)(@types/node@24.13.5)(babel-plugin-react-compiler@1.0.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+       next-themes:
+         specifier: ^0.4.6
+         version: 0.4.6(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+@@ -215,6 +215,9 @@ importers:
+       '@biomejs/biome':
+         specifier: ^2.5.14
+         version: 2.5.14
++      '@playwright/test':
++        specifier: ^1.63.0
++        version: 1.63.0
+       '@tailwindcss/postcss':
+         specifier: ^4
+         version: 4.3.3
+@@ -767,6 +770,11 @@ packages:
+   '@oxc-project/types@0.150.0':
+     resolution: {integrity: sha512-rDS5/31E9HfPl/CIzGrn0DOlvBbXFseQ5URJ9sYMfstbKLD/c6Gm9vmRzRGDdAXyOIL4zmO37lc9RIwYqVruZw==}
+ 
++  '@playwright/test@1.63.0':
++    resolution: {integrity: sha512-oxMK4vllB9RK5NQ2l1pq1IfOf2AvnEuj/vYGDj0H2nMtmtZpKtCwt/l00GEO6xjGfpBNAvjovvYdCm50dRQkpQ==}
++    engines: {node: '>=20'}
++    hasBin: true
++
+   '@redocly/ajv@8.11.2':
+     resolution: {integrity: sha512-io1JpnwtIcvojV7QKDUSIuMN/ikdOUd1ReEnUnMKGfDVridQZ31J0MmIuqwuRjWDZfmvr+Q0MqCcfHM2gTivOg==}
+ 
+@@ -2173,6 +2181,16 @@ packages:
+     resolution: {integrity: sha512-nDywThFk1i4BQK4twPQ6TA4RT8bDY96yeuCVBWL3ePARCiEKDRSrNGbFIgUJpLp+XeIR65v8ra7WuJOFUBtkMA==}
+     engines: {node: '>=8'}
+ 
++  playwright-core@1.63.0:
++    resolution: {integrity: sha512-rYCsBF/M5HjUch52bbtVONEFjv6Xu8sm8h72dNlR5bzIE1fvC/bxgspzkjSfU+MweEMmPM8KJebG6nnyxo5mCg==}
++    engines: {node: '>=20'}
++    hasBin: true
++
++  playwright@1.63.0:
++    resolution: {integrity: sha512-+7ziBLidS4NaNCdt57SUDT+wYmmd5fmiQejUic/kb+YsYSCPyOOE9sebzMjNmQrsnNpDJqd4WHvV/8lfKfUDUg==}
++    engines: {node: '>=20'}
++    hasBin: true
++
+   pluralize@8.0.0:
+     resolution: {integrity: sha512-Nc3IT5yHzflTfbjgqWcCPpo7DaKy4FnpB0l/zCAW0Tc7jxAiuqSxHasntB3D7887LSrA93kDJ9IXovxJYxyLCA==}
+     engines: {node: '>=4'}
+@@ -3186,6 +3204,10 @@ snapshots:
+ 
+   '@oxc-project/types@0.150.0': {}
+ 
++  '@playwright/test@1.63.0':
++    dependencies:
++      playwright: 1.63.0
++
+   '@redocly/ajv@8.11.2':
+     dependencies:
+       fast-deep-equal: 3.1.3
+@@ -4206,7 +4228,7 @@ snapshots:
+       react: 19.3.0
+       react-dom: 19.3.0(react@19.3.0)
+ 
+-  next@16.3.5(@babel/core@7.29.7(supports-color@10.2.2))(@types/node@24.13.5)(babel-plugin-react-compiler@1.0.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0):
++  next@16.3.5(@babel/core@7.29.7(supports-color@10.2.2))(@playwright/test@1.63.0)(@types/node@24.13.5)(babel-plugin-react-compiler@1.0.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0):
+     dependencies:
+       '@next/env': 16.3.5
+       '@swc/helpers': 0.5.23
+@@ -4225,6 +4247,7 @@ snapshots:
+       '@next/swc-linux-x64-musl': 16.3.5
+       '@next/swc-win32-arm64-msvc': 16.3.5
+       '@next/swc-win32-x64-msvc': 16.3.5
++      '@playwright/test': 1.63.0
+       babel-plugin-react-compiler: 1.0.0
+       sharp: 0.35.4(@types/node@24.13.5)
+     transitivePeerDependencies:
+@@ -4363,6 +4386,12 @@ snapshots:
+     dependencies:
+       find-up: 3.0.0
+ 
++  playwright-core@1.63.0: {}
++
++  playwright@1.63.0:
++    dependencies:
++      playwright-core: 1.63.0
++
+   pluralize@8.0.0: {}
+ 
+   postcss-selector-parser@7.1.6:
+diff --git a/web/public/robots.txt b/web/public/robots.txt
+new file mode 100644
+index 0000000..1f53798
+--- /dev/null
++++ b/web/public/robots.txt
+@@ -0,0 +1,2 @@
++User-agent: *
++Disallow: /
+diff --git a/web/src/app/api/[...path]/route.ts b/web/src/app/api/[...path]/route.ts
+new file mode 100644
+index 0000000..0402193
+--- /dev/null
++++ b/web/src/app/api/[...path]/route.ts
+@@ -0,0 +1,43 @@
++import type { NextRequest } from "next/server";
++
++// A runtime proxy to the FastAPI service: the browser only ever talks to this app, and the target
++// is read from the environment when the request arrives (so the same image runs anywhere).
++const API_URL = () => (process.env.API_URL ?? "http://localhost:8000").replace(/\/$/, "");
++
++const HOP_BY_HOP = new Set([
++  "connection",
++  "keep-alive",
++  "transfer-encoding",
++  "host",
++  "content-length",
++]);
++
++async function proxy(
++  request: NextRequest,
++  { params }: RouteContext<"/api/[...path]">,
++): Promise<Response> {
++  const { path } = await params;
++  const target = new URL(`${API_URL()}/${path.join("/")}`);
++  target.search = request.nextUrl.search;
++  const headers = new Headers();
++  request.headers.forEach((value, key) => {
++    if (!HOP_BY_HOP.has(key.toLowerCase())) headers.set(key, value);
++  });
++  const hasBody = request.method !== "GET" && request.method !== "HEAD";
++  const upstream = await fetch(target, {
++    method: request.method,
++    headers,
++    body: hasBody ? request.body : undefined,
++    // @ts-expect-error — required by Node's fetch for streaming request bodies
++    duplex: hasBody ? "half" : undefined,
++    redirect: "manual",
++    cache: "no-store",
++  });
++  const responseHeaders = new Headers(upstream.headers);
++  responseHeaders.delete("content-encoding");
++  responseHeaders.delete("content-length");
++  return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
++}
++
++export const dynamic = "force-dynamic";
++export { proxy as DELETE, proxy as GET, proxy as PATCH, proxy as POST, proxy as PUT };
+diff --git a/web/src/app/documents/[id]/review.tsx b/web/src/app/documents/[id]/review.tsx
+index b2db3cc..813e29e 100644
+--- a/web/src/app/documents/[id]/review.tsx
++++ b/web/src/app/documents/[id]/review.tsx
+@@ -45,12 +45,10 @@ export function Review({ documentId }: { documentId: string }) {
+   const [editing, setEditing] = useState(false);
+   const [drafts, setDrafts] = useState<Record<string, string>>({});
+ 
+-  // Default to the newest run; follow newly queued runs.
++  // Default to the newest run once; a run queued from this page selects itself.
+   useEffect(() => {
+     const newest = runs.data?.[0];
+-    if (newest && (selectedRunId === null || !runs.data?.some((r) => r.id === selectedRunId))) {
+-      setSelectedRunId(newest.id);
+-    }
++    if (newest && selectedRunId === null) setSelectedRunId(newest.id);
+   }, [runs.data, selectedRunId]);
+ 
+   const run = useRun(selectedRunId);

@@ -1,0 +1,13 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 194b140..da90965 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -47,7 +47,7 @@ jobs:
+       - name: Publish the race summary
+         if: always()
+         run: cat test-results/race-summary.md >> "$GITHUB_STEP_SUMMARY" || true
+-      - uses: actions/upload-artifact@v4
++      - uses: actions/upload-artifact@v7
+         if: failure()
+         with:
+           name: playwright-report

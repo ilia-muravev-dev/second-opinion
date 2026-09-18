@@ -1,0 +1,274 @@
+diff --git a/test/integration/booking-sequences.property.test.ts b/test/integration/booking-sequences.property.test.ts
+new file mode 100644
+index 0000000..99528f2
+--- /dev/null
++++ b/test/integration/booking-sequences.property.test.ts
+@@ -0,0 +1,268 @@
++import type { NestFastifyApplication } from '@nestjs/platform-fastify';
++import fc from 'fast-check';
++import { afterAll, beforeAll, describe, expect, it } from 'vitest';
++import { HoldExpiryService } from '../../src/bookings/holds/hold-expiry.service';
++import { PrismaService } from '../../src/prisma/prisma.service';
++import { createTestApp, resetDatabase } from './harness';
++
++/**
++ * Model-based: random sequences of book / replay / pay / cancel / expire / sweep against the real
++ * API and database, checked after every step against a small in-memory model and the two
++ * invariants that matter — no room double-booked, no pool over capacity — plus the promise that a
++ * retried request is answered exactly like the original.
++ */
++
++const RESOURCES = {
++  'room-1': { capacity: 1 },
++  'room-2': { capacity: 1 },
++  'pool-quiet': { capacity: 3 },
++} as const;
++type ResourceId = keyof typeof RESOURCES;
++
++// four one-hour slots; 0 and 1 overlap, 1 and 2 overlap, 2 and 3 are back to back
++const SLOTS = [
++  ['2026-10-01T09:00:00.000Z', '2026-10-01T10:00:00.000Z'],
++  ['2026-10-01T09:30:00.000Z', '2026-10-01T10:30:00.000Z'],
++  ['2026-10-01T10:00:00.000Z', '2026-10-01T11:00:00.000Z'],
++  ['2026-10-01T11:00:00.000Z', '2026-10-01T12:00:00.000Z'],
++] as const;
++const USERS = ['u1', 'u2', 'u3'] as const;
++type Status = 'HELD' | 'CONFIRMED' | 'CANCELLED' | 'EXPIRED';
++
++interface ModelBooking {
++  id: string;
++  resource: ResourceId;
++  slot: number;
++  user: string;
++  status: Status;
++  overdue: boolean;
++  paymentId: string;
++  request: { key: string; user: string; body: unknown; status: number; response: unknown };
++}
++
++type Command =
++  | { kind: 'book'; resource: ResourceId; slot: number; user: string }
++  | { kind: 'replay'; ref: number }
++  | { kind: 'pay'; ref: number; outcome: 'succeeded' | 'canceled' }
++  | { kind: 'cancel'; ref: number; user: string }
++  | { kind: 'makeOverdue'; ref: number }
++  | { kind: 'expire'; ref: number }
++  | { kind: 'sweep' };
++
++const command: fc.Arbitrary<Command> = fc.oneof(
++  {
++    weight: 5,
++    arbitrary: fc.record({
++      kind: fc.constant('book' as const),
++      resource: fc.constantFrom(...(Object.keys(RESOURCES) as ResourceId[])),
++      slot: fc.nat(SLOTS.length - 1),
++      user: fc.constantFrom(...USERS),
++    }),
++  },
++  { weight: 1, arbitrary: fc.record({ kind: fc.constant('replay' as const), ref: fc.nat(9) }) },
++  {
++    weight: 3,
++    arbitrary: fc.record({
++      kind: fc.constant('pay' as const),
++      ref: fc.nat(9),
++      outcome: fc.constantFrom('succeeded' as const, 'canceled' as const),
++    }),
++  },
++  {
++    weight: 2,
++    arbitrary: fc.record({
++      kind: fc.constant('cancel' as const),
++      ref: fc.nat(9),
++      user: fc.constantFrom(...USERS),
++    }),
++  },
++  {
++    weight: 1,
++    arbitrary: fc.record({ kind: fc.constant('makeOverdue' as const), ref: fc.nat(9) }),
++  },
++  { weight: 1, arbitrary: fc.record({ kind: fc.constant('expire' as const), ref: fc.nat(9) }) },
++  { weight: 1, arbitrary: fc.record({ kind: fc.constant('sweep' as const) }) },
++);
++
++function overlaps(a: number, b: number): boolean {
++  const [aStart, aEnd] = SLOTS[a] as [string, string];
++  const [bStart, bEnd] = SLOTS[b] as [string, string];
++  return aStart < bEnd && bStart < aEnd;
++}
++
++let app: NestFastifyApplication;
++let prisma: PrismaService;
++
++beforeAll(async () => {
++  app = await createTestApp({ HOLD_SWEEP_INTERVAL_MS: '600000' });
++  prisma = app.get(PrismaService);
++});
++afterAll(async () => {
++  await app.close();
++});
++
++class Run {
++  readonly bookings: ModelBooking[] = [];
++  private keys = 0;
++
++  pick(ref: number): ModelBooking | undefined {
++    return this.bookings.length === 0 ? undefined : this.bookings[ref % this.bookings.length];
++  }
++
++  active(resource: ResourceId, slot: number): number {
++    return this.bookings.filter(
++      (b) =>
++        b.resource === resource &&
++        (b.status === 'HELD' || b.status === 'CONFIRMED') &&
++        overlaps(b.slot, slot),
++    ).length;
++  }
++
++  async step(cmd: Command): Promise<void> {
++    switch (cmd.kind) {
++      case 'book': {
++        const key = `k${this.keys++}`;
++        const [startsAt, endsAt] = SLOTS[cmd.slot] as [string, string];
++        const body = { resourceId: cmd.resource, startsAt, endsAt };
++        const response = await app.inject({
++          method: 'POST',
++          url: '/bookings',
++          headers: { 'idempotency-key': key, 'x-user-id': cmd.user },
++          payload: body,
++        });
++        const expected =
++          this.active(cmd.resource, cmd.slot) < RESOURCES[cmd.resource].capacity ? 201 : 409;
++        expect(response.statusCode, `book ${cmd.resource} slot ${cmd.slot}`).toBe(expected);
++        if (response.statusCode === 201) {
++          const json = response.json<{ id: string; payment: { id: string } }>();
++          this.bookings.push({
++            id: json.id,
++            resource: cmd.resource,
++            slot: cmd.slot,
++            user: cmd.user,
++            status: 'HELD',
++            overdue: false,
++            paymentId: json.payment.id,
++            request: { key, user: cmd.user, body, status: 201, response: json },
++          });
++        }
++        return;
++      }
++      case 'replay': {
++        const b = this.pick(cmd.ref);
++        if (!b) return;
++        const response = await app.inject({
++          method: 'POST',
++          url: '/bookings',
++          headers: { 'idempotency-key': b.request.key, 'x-user-id': b.request.user },
++          payload: b.request.body as Record<string, unknown>,
++        });
++        expect(response.statusCode).toBe(b.request.status);
++        expect(response.headers['idempotency-replayed']).toBe('true');
++        expect(response.json()).toEqual(b.request.response);
++        return;
++      }
++      case 'pay': {
++        const b = this.pick(cmd.ref);
++        if (!b) return;
++        const response = await app.inject({
++          method: 'POST',
++          url: `/fake-psp/payments/${b.paymentId}/pay`,
++          payload: { outcome: cmd.outcome, order: 'shuffled', duplicate: true },
++        });
++        expect(response.statusCode).toBe(200);
++        if (b.status === 'HELD') b.status = cmd.outcome === 'succeeded' ? 'CONFIRMED' : 'CANCELLED';
++        return;
++      }
++      case 'cancel': {
++        const b = this.pick(cmd.ref);
++        if (!b) return;
++        const response = await app.inject({
++          method: 'DELETE',
++          url: `/bookings/${b.id}`,
++          headers: { 'x-user-id': cmd.user },
++        });
++        if (cmd.user !== b.user) {
++          expect(response.statusCode).toBe(403);
++        } else if (b.status === 'EXPIRED') {
++          expect(response.statusCode).toBe(409);
++        } else {
++          expect(response.statusCode).toBe(200);
++          b.status = 'CANCELLED';
++        }
++        return;
++      }
++      case 'makeOverdue': {
++        const b = this.pick(cmd.ref);
++        if (!b) return;
++        await prisma.booking.update({
++          where: { id: b.id },
++          data: { holdExpiresAt: new Date(Date.now() - 60_000) },
++        });
++        b.overdue = true;
++        return;
++      }
++      case 'expire': {
++        const b = this.pick(cmd.ref);
++        if (!b) return;
++        await prisma.booking.update({
++          where: { id: b.id },
++          data: { holdExpiresAt: new Date(Date.now() - 60_000) },
++        });
++        b.overdue = true;
++        const result = await app.get(HoldExpiryService).expire(b.id);
++        expect(result).toBe(b.status === 'HELD' ? 'expired' : 'skipped');
++        if (b.status === 'HELD') b.status = 'EXPIRED';
++        return;
++      }
++      case 'sweep': {
++        const due = this.bookings.filter((b) => b.status === 'HELD' && b.overdue);
++        expect(await app.get(HoldExpiryService).sweep()).toBe(due.length);
++        for (const b of due) b.status = 'EXPIRED';
++        return;
++      }
++    }
++  }
++
++  async checkInvariants(): Promise<void> {
++    const rows = await prisma.booking.findMany({ orderBy: { createdAt: 'asc' } });
++    // the model and the database agree on every booking
++    expect(Object.fromEntries(rows.map((r) => [r.id, r.status]))).toEqual(
++      Object.fromEntries(this.bookings.map((b) => [b.id, b.status])),
++    );
++    // no room is double-booked and no pool is over capacity, judged from the database alone
++    for (const resource of Object.keys(RESOURCES) as ResourceId[]) {
++      const active = rows.filter(
++        (r) => r.resourceId === resource && (r.status === 'HELD' || r.status === 'CONFIRMED'),
++      );
++      const points = active.flatMap((r) => [
++        { at: r.startsAt.getTime(), delta: 1 },
++        { at: r.endsAt.getTime(), delta: -1 },
++      ]);
++      points.sort((a, b) => a.at - b.at || a.delta - b.delta); // ends before starts at the same instant
++      let concurrent = 0;
++      for (const point of points) {
++        concurrent += point.delta;
++        expect(concurrent, `${resource} concurrent active bookings`).toBeLessThanOrEqual(
++          RESOURCES[resource].capacity,
++        );
++      }
++    }
++  }
++}
++
++describe('random booking sequences', () => {
++  it('keep every invariant after every step', { timeout: 300_000 }, async () => {
++    await fc.assert(
++      fc.asyncProperty(fc.array(command, { minLength: 1, maxLength: 30 }), async (commands) => {
++        await resetDatabase(app);
++        const run = new Run();
++        for (const cmd of commands) {
++          await run.step(cmd);
++          await run.checkInvariants();
++        }
++      }),
++      { numRuns: 50 },
++    );
++  });
++});

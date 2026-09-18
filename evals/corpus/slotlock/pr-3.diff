@@ -1,0 +1,1974 @@
+diff --git a/docs/adr/0001-five-ways-to-serialise-a-booking.md b/docs/adr/0001-five-ways-to-serialise-a-booking.md
+index 2ed0cb1..d2a5b91 100644
+--- a/docs/adr/0001-five-ways-to-serialise-a-booking.md
++++ b/docs/adr/0001-five-ways-to-serialise-a-booking.md
+@@ -30,6 +30,16 @@ locking" costs in correctness, not just in latency. The configuration refuses it
+ 
+ ## Consequences
+ 
++- The exclusion strategy must insert with `ON CONFLICT ON CONSTRAINT … DO NOTHING`. A plain
++  insert is checked *after* its index entry is written, so N concurrent inserts for one slot find
++  each other's uncommitted rows, wait on each other, and are unpicked by the deadlock detector one
++  `deadlock_timeout` (1 s) at a time — the first version of this repository answered the 50-way
++  race with no 201 at all. Speculative insertion pre-checks before writing, so a committed winner
++  makes the losers' inserts return no row, and nothing deadlocks.
++- The constraint is also rechecked on every non-HOT update of a booking row (attaching the payment
++  id, confirming), and that check waits on in-flight inserts for the same slot; what follows a
++  reserve runs through `retryOnConflict` in case the detector picks it as the victim.
++
+ - One code path per strategy, one integration test parametrised over all five, one benchmark.
+ - Production would pick one (`advisory` by default); the others stay as living documentation of
+   the trade-offs, which is the point of the repository.
+diff --git a/docs/adr/0003-webhooks-ordered-by-provider-time.md b/docs/adr/0003-webhooks-ordered-by-provider-time.md
+new file mode 100644
+index 0000000..d810be2
+--- /dev/null
++++ b/docs/adr/0003-webhooks-ordered-by-provider-time.md
+@@ -0,0 +1,41 @@
++# ADR 0003: Payment webhooks are ordered by the provider's clock, not by arrival
++
++Status: accepted · 2026-09-18
++
++## Context
++
++A payment provider delivers webhooks at least once and in no particular order: retries duplicate
++them, and `payment_intent.succeeded` can arrive before `payment_intent.processing` or after a
++`payment_intent.canceled` that was created earlier. Applying events as they arrive turns a
++confirmed booking back into a cancelled one, or confirms a hold that has already expired and
++whose seat has been given to someone else.
++
++## Decision
++
++`POST /webhooks/payments` verifies the Stripe signature (the in-process fake PSP signs with the
++same scheme, so there is one verification path), then `PaymentEventsService.apply` decides, in one
++transaction with the booking row locked:
++
++| Situation | Outcome | Effect |
++| --- | --- | --- |
++| event id already recorded (before or concurrently) | `DUPLICATE` | none |
++| event type that changes nothing (`created`, `processing`, `payment_failed`) | `IGNORED` | none — a failed attempt may be retried until the hold expires |
++| event older than `paymentLastEventAt` | `STALE` | none |
++| `succeeded` / `canceled` on a `HELD` booking | `APPLIED` | `CONFIRMED` / `CANCELLED`, `paymentLastEventAt` advances |
++| anything on a `CONFIRMED` booking | `STALE` | none — confirmed is terminal for payments |
++| `succeeded` on a `CANCELLED` or `EXPIRED` booking | `ORPHANED` | recorded for a refund; the seat is not restored |
++| no booking for the payment | `UNKNOWN` | recorded |
++
++Every event is stored in `payment_events` with its outcome, so the log answers "what did this
++webhook do?" and the response body says the same. All outcomes return 200; only a bad signature is
++a 400, and only a database failure is a 5xx — the provider retries those, and the retry is safe.
++
++## Consequences
++
++- Any interleaving, with any duplicates, converges: the tests deliver whole sequences shuffled and
++  concurrently and assert the same final state.
++- Ordering by provider time needs the provider's timestamp on every event; Stripe's `created` is
++  in seconds, so two events in the same second fall through to the state machine, which is
++  order-independent for the two signals that matter.
++- Orphaned money is a business event (refund), not a state transition: it leaves through the
++  outbox (ADR 0004), never by re-seating the booking.
+diff --git a/prisma/migrations/20260918180639_payments/migration.sql b/prisma/migrations/20260918180639_payments/migration.sql
+new file mode 100644
+index 0000000..182cb52
+--- /dev/null
++++ b/prisma/migrations/20260918180639_payments/migration.sql
+@@ -0,0 +1,16 @@
++-- AlterEnum
++-- This migration adds more than one value to an enum.
++-- With PostgreSQL versions 11 and earlier, this is not possible
++-- in a single migration. This can be worked around by creating
++-- multiple migrations, each migration adding only one value to
++-- the enum.
++
++
++ALTER TYPE "PaymentEventOutcome" ADD VALUE 'IGNORED';
++ALTER TYPE "PaymentEventOutcome" ADD VALUE 'UNKNOWN';
++
++-- AlterTable
++ALTER TABLE "bookings" ADD COLUMN     "amountCents" INTEGER NOT NULL DEFAULT 0;
++
++-- AlterTable
++ALTER TABLE "payment_events" ALTER COLUMN "paymentId" DROP NOT NULL;
+diff --git a/prisma/schema.prisma b/prisma/schema.prisma
+index 28c511e..63e5839 100644
+--- a/prisma/schema.prisma
++++ b/prisma/schema.prisma
+@@ -32,6 +32,8 @@ enum PaymentEventOutcome {
+   STALE
+   DUPLICATE
+   ORPHANED
++  IGNORED
++  UNKNOWN
+ }
+ 
+ /// A bookable thing: a meeting room (exclusive) or a pool of hot desks (capacity N).
+@@ -60,6 +62,7 @@ model Booking {
+   exclusive          Boolean
+   status             BookingStatus @default(HELD)
+   holdExpiresAt      DateTime?     @db.Timestamptz(3)
++  amountCents        Int           @default(0)
+   paymentId          String?       @unique
+   /// Provider timestamp of the last payment event applied; older events are stale.
+   paymentLastEventAt DateTime?     @db.Timestamptz(3)
+@@ -90,7 +93,7 @@ model IdempotencyKey {
+ /// Every payment webhook received, by provider event id; the outcome records what was done with it.
+ model PaymentEvent {
+   id                String              @id
+-  paymentId         String
++  paymentId         String?
+   type              String
+   providerCreatedAt DateTime            @db.Timestamptz(3)
+   receivedAt        DateTime            @default(now()) @db.Timestamptz(3)
+diff --git a/src/app.module.ts b/src/app.module.ts
+index 9de03c0..ea99c0c 100644
+--- a/src/app.module.ts
++++ b/src/app.module.ts
+@@ -4,6 +4,7 @@ import { BookingsModule } from './bookings/bookings.module';
+ import { CONFIG, type Config } from './config';
+ import { ConfigModule } from './config.module';
+ import { HealthController } from './health/health.controller';
++import { PaymentsModule } from './payments/payments.module';
+ import { PrismaModule } from './prisma/prisma.module';
+ import { ResourcesModule } from './resources/resources.module';
+ 
+@@ -26,6 +27,7 @@ export class AppModule {
+           }),
+         }),
+         PrismaModule,
++        PaymentsModule,
+         ResourcesModule,
+         BookingsModule,
+       ],
+diff --git a/src/bookings/booking.state.ts b/src/bookings/booking.state.ts
+new file mode 100644
+index 0000000..0b465d1
+--- /dev/null
++++ b/src/bookings/booking.state.ts
+@@ -0,0 +1,36 @@
++import type { BookingStatus } from '../generated/prisma/enums';
++
++export type PaymentSignal = 'succeeded' | 'canceled';
++
++export type PaymentDecision =
++  | { outcome: 'APPLIED'; next: BookingStatus }
++  | { outcome: 'STALE' | 'ORPHANED' | 'IGNORED' };
++
++/** The Stripe event types that change a booking; everything else is recorded and ignored. */
++export function signalOf(eventType: string): PaymentSignal | undefined {
++  switch (eventType) {
++    case 'payment_intent.succeeded':
++      return 'succeeded';
++    case 'payment_intent.canceled':
++      return 'canceled';
++    default:
++      return undefined;
++  }
++}
++
++/**
++ * The booking's answer to a payment signal, given its current status. Money for a booking that is
++ * no longer holding its seat is ORPHANED (it has to be refunded, not seated); a signal that cannot
++ * move the booking is STALE — CONFIRMED is terminal for payments.
++ */
++export function onPayment(status: BookingStatus, signal: PaymentSignal): PaymentDecision {
++  switch (status) {
++    case 'HELD':
++      return { outcome: 'APPLIED', next: signal === 'succeeded' ? 'CONFIRMED' : 'CANCELLED' };
++    case 'CONFIRMED':
++      return { outcome: 'STALE' };
++    case 'CANCELLED':
++    case 'EXPIRED':
++      return signal === 'succeeded' ? { outcome: 'ORPHANED' } : { outcome: 'STALE' };
++  }
++}
+diff --git a/src/bookings/bookings.controller.ts b/src/bookings/bookings.controller.ts
+index 0659c03..7d88cf9 100644
+--- a/src/bookings/bookings.controller.ts
++++ b/src/bookings/bookings.controller.ts
+@@ -19,7 +19,12 @@ import {
+ } from '@nestjs/swagger';
+ import { ZodValidationPipe } from '../common/zod-validation.pipe';
+ import { IdempotencyInterceptor } from '../idempotency/idempotency.interceptor';
+-import { type BookingOut, type CreateBooking, createBookingSchema } from './bookings.dto';
++import {
++  type BookingOut,
++  type CreateBooking,
++  type CreatedBooking,
++  createBookingSchema,
++} from './bookings.dto';
+ import { BookingsService } from './bookings.service';
+ 
+ @ApiTags('bookings')
+@@ -47,7 +52,7 @@ export class BookingsController {
+   create(
+     @Headers('x-user-id') userId: string,
+     @Body(new ZodValidationPipe(createBookingSchema)) body: CreateBooking,
+-  ): Promise<BookingOut> {
++  ): Promise<CreatedBooking> {
+     return this.bookings.create(userId, body);
+   }
+ 
+diff --git a/src/bookings/bookings.dto.ts b/src/bookings/bookings.dto.ts
+index 9d9144b..3048f17 100644
+--- a/src/bookings/bookings.dto.ts
++++ b/src/bookings/bookings.dto.ts
+@@ -27,5 +27,11 @@ export interface BookingOut {
+   endsAt: string;
+   status: 'HELD' | 'CONFIRMED' | 'CANCELLED' | 'EXPIRED';
+   holdExpiresAt: string | null;
++  amountCents: number;
+   paymentId: string | null;
+ }
++
++/** The 201 body: the booking plus what the client needs to pay for it. */
++export interface CreatedBooking extends BookingOut {
++  payment: { provider: 'stripe' | 'fake'; id: string; clientSecret: string | null };
++}
+diff --git a/src/bookings/bookings.module.ts b/src/bookings/bookings.module.ts
+index cf4ad41..f998492 100644
+--- a/src/bookings/bookings.module.ts
++++ b/src/bookings/bookings.module.ts
+@@ -1,11 +1,12 @@
+ import { Module } from '@nestjs/common';
+ import { IdempotencyModule } from '../idempotency/idempotency.module';
++import { PaymentsModule } from '../payments/payments.module';
+ import { BookingsController } from './bookings.controller';
+ import { BookingsService, CLOCK, systemClock } from './bookings.service';
+ import { StrategyModule } from './strategies/strategy.module';
+ 
+ @Module({
+-  imports: [StrategyModule, IdempotencyModule],
++  imports: [StrategyModule, IdempotencyModule, PaymentsModule],
+   controllers: [BookingsController],
+   providers: [BookingsService, { provide: CLOCK, useValue: systemClock }],
+   exports: [BookingsService],
+diff --git a/src/bookings/bookings.service.ts b/src/bookings/bookings.service.ts
+index 4dd8aab..b96ecb7 100644
+--- a/src/bookings/bookings.service.ts
++++ b/src/bookings/bookings.service.ts
+@@ -1,8 +1,15 @@
+ import { Inject, Injectable } from '@nestjs/common';
+-import { BookingNotFoundError, ResourceNotFoundError } from '../common/errors';
++import {
++  BookingNotFoundError,
++  PaymentProviderError,
++  ResourceNotFoundError,
++} from '../common/errors';
++import { retryOnConflict } from '../common/retry';
+ import { CONFIG, type Config } from '../config';
++import type { Booking } from '../generated/prisma/client';
++import { PAYMENT_PROVIDER, type PaymentProvider } from '../payments/payment.provider';
+ import { PrismaService } from '../prisma/prisma.service';
+-import type { BookingOut, CreateBooking } from './bookings.dto';
++import type { BookingOut, CreateBooking, CreatedBooking } from './bookings.dto';
+ import { RESERVE_STRATEGY, type ReserveStrategy } from './strategies/reserve.strategy';
+ 
+ export interface Clock {
+@@ -19,13 +26,18 @@ export class BookingsService {
+     @Inject(RESERVE_STRATEGY) private readonly strategy: ReserveStrategy,
+     @Inject(CONFIG) private readonly config: Config,
+     @Inject(CLOCK) private readonly clock: Clock,
++    @Inject(PAYMENT_PROVIDER) private readonly payments: PaymentProvider,
+   ) {}
+ 
+   get strategyName(): string {
+     return this.strategy.name;
+   }
+ 
+-  async create(userId: string, input: CreateBooking): Promise<BookingOut> {
++  /**
++   * Reserve first, then ask the PSP for an intent: an intent for a seat we do not have is waste,
++   * and a hold we cannot charge for is released again so the client's retry can reserve anew.
++   */
++  async create(userId: string, input: CreateBooking): Promise<CreatedBooking> {
+     const resource = await this.prisma.resource.findUnique({ where: { id: input.resourceId } });
+     if (!resource) throw new ResourceNotFoundError(input.resourceId);
+     const now = this.clock.now();
+@@ -40,21 +52,55 @@ export class BookingsService {
+       endsAt: input.endsAt,
+       holdExpiresAt: new Date(now.getTime() + this.config.HOLD_TTL_SECONDS * 1000),
+     });
+-    return this.get(held.id);
++    const amountCents = priceFor(resource.priceCents, input.startsAt, input.endsAt);
++    let intent: Awaited<ReturnType<PaymentProvider['createIntent']>>;
++    try {
++      intent = await this.payments.createIntent({
++        bookingId: held.id,
++        amountCents,
++        currency: this.config.PAYMENT_CURRENCY,
++      });
++    } catch (error) {
++      await retryOnConflict(() =>
++        this.prisma.booking.update({ where: { id: held.id }, data: { status: 'CANCELLED' } }),
++      ).catch(() => undefined); // if this fails too, the hold expires on its own
++      throw new PaymentProviderError(error);
++    }
++    const booking = await retryOnConflict(() =>
++      this.prisma.booking.update({
++        where: { id: held.id },
++        data: { paymentId: intent.id, amountCents },
++      }),
++    );
++    return {
++      ...toBookingOut(booking),
++      payment: { provider: this.payments.name, id: intent.id, clientSecret: intent.clientSecret },
++    };
+   }
+ 
+   async get(id: string): Promise<BookingOut> {
+     const row = await this.prisma.booking.findUnique({ where: { id } });
+     if (!row) throw new BookingNotFoundError(id);
+-    return {
+-      id: row.id,
+-      resourceId: row.resourceId,
+-      userId: row.userId,
+-      startsAt: row.startsAt.toISOString(),
+-      endsAt: row.endsAt.toISOString(),
+-      status: row.status,
+-      holdExpiresAt: row.holdExpiresAt?.toISOString() ?? null,
+-      paymentId: row.paymentId,
+-    };
++    return toBookingOut(row);
+   }
+ }
++
++/** Hourly prices, pro-rated to the minute and rounded to the cent. */
++export function priceFor(priceCentsPerHour: number, startsAt: Date, endsAt: Date): number {
++  const minutes = (endsAt.getTime() - startsAt.getTime()) / 60_000;
++  return Math.round((priceCentsPerHour * minutes) / 60);
++}
++
++export function toBookingOut(row: Booking): BookingOut {
++  return {
++    id: row.id,
++    resourceId: row.resourceId,
++    userId: row.userId,
++    startsAt: row.startsAt.toISOString(),
++    endsAt: row.endsAt.toISOString(),
++    status: row.status,
++    holdExpiresAt: row.holdExpiresAt?.toISOString() ?? null,
++    amountCents: row.amountCents,
++    paymentId: row.paymentId,
++  };
++}
+diff --git a/src/bookings/strategies/exclusion.strategy.ts b/src/bookings/strategies/exclusion.strategy.ts
+index b1aba84..0b4554c 100644
+--- a/src/bookings/strategies/exclusion.strategy.ts
++++ b/src/bookings/strategies/exclusion.strategy.ts
+@@ -1,40 +1,32 @@
+ import { Injectable } from '@nestjs/common';
+-import {
+-  isRetryableConflict,
+-  NoCapacityError,
+-  PG,
+-  pgCode,
+-  RetryExhaustedError,
+-} from '../../common/errors';
++import { isRetryableConflict, NoCapacityError, RetryExhaustedError } from '../../common/errors';
++import { Prisma } from '../../generated/prisma/client';
+ import { PrismaService } from '../../prisma/prisma.service';
+ import { AdvisoryStrategy } from './advisory.strategy';
+-import {
+-  insertHeld,
+-  type ReservedBooking,
+-  type ReserveInput,
+-  type ReserveStrategy,
+-} from './reserve.strategy';
++import type { ReservedBooking, ReserveInput, ReserveStrategy } from './reserve.strategy';
+ 
+ export const EXCLUSION_CONSTRAINT = 'booking_no_overlap';
++const EXCLUSION_CONSTRAINT_SQL = Prisma.raw(EXCLUSION_CONSTRAINT);
+ 
+ /**
+  * Let the database say no: a GiST exclusion constraint rejects an overlapping active booking on an
+- * exclusive resource, so the insert simply fails with 23P01. "At most N" cannot be expressed this
+- * way, so pools use the advisory strategy underneath.
++ * exclusive resource. "At most N" cannot be expressed this way, so pools use the advisory strategy
++ * underneath.
+  *
+- * The insert is a single autocommit statement rather than an interactive transaction. Postgres
+- * checks an exclusion constraint after inserting the index entry, so two concurrent inserters can
+- * each find the other's uncommitted row and wait on each other; the deadlock detector then aborts
+- * one of them with 40P01 (after deadlock_timeout, 1 s by default), and that one retries and gets
+- * its 23P01. A client-side transaction timeout would only add a way to lose the row that would
+- * have won.
++ * The insert is `ON CONFLICT ON CONSTRAINT … DO NOTHING`, not a plain insert that fails with
++ * 23P01. Postgres checks an exclusion constraint after it has inserted the index entry, so N
++ * plain inserts for the same slot each find the others' uncommitted rows and wait on each other;
++ * the deadlock detector then unpicks them one `deadlock_timeout` (1 s) at a time, and retrying
++ * victims re-enter the fight. `ON CONFLICT` uses speculative insertion: the pre-check waits for
++ * in-flight rows before inserting anything, so there is nothing to deadlock on, and a committed
++ * winner simply makes the insert return no row.
+  */
+ @Injectable()
+ export class ExclusionStrategy implements ReserveStrategy {
+   readonly name = 'exclusion' as const;
+   static readonly MAX_ATTEMPTS = 5;
+   attempts = 0;
+-  deadlocks = 0;
++  retries = 0;
+ 
+   constructor(
+     private readonly prisma: PrismaService,
+@@ -46,14 +38,21 @@ export class ExclusionStrategy implements ReserveStrategy {
+     for (let attempt = 0; ; attempt += 1) {
+       this.attempts += 1;
+       try {
+-        return await insertHeld(this.prisma, input);
++        const rows = await this.prisma.$queryRaw<ReservedBooking[]>`
++          INSERT INTO bookings
++            ("id", "resourceId", "userId", "startsAt", "endsAt", "exclusive", "status",
++             "holdExpiresAt", "createdAt", "updatedAt")
++          VALUES
++            (gen_random_uuid()::text, ${input.resource.id}, ${input.userId}, ${input.startsAt},
++             ${input.endsAt}, true, 'HELD'::"BookingStatus", ${input.holdExpiresAt}, now(), now())
++          ON CONFLICT ON CONSTRAINT ${EXCLUSION_CONSTRAINT_SQL} DO NOTHING
++          RETURNING "id", "resourceId", "userId", "startsAt", "endsAt", "status", "holdExpiresAt"`;
++        const booking = rows[0];
++        if (!booking) throw new NoCapacityError(input.resource.id);
++        return booking;
+       } catch (error) {
+-        const code = pgCode(error);
+-        if (code === PG.exclusionViolation || String(error).includes(EXCLUSION_CONSTRAINT)) {
+-          throw new NoCapacityError(input.resource.id);
+-        }
+         if (!isRetryableConflict(error)) throw error;
+-        this.deadlocks += 1;
++        this.retries += 1;
+         if (attempt + 1 >= ExclusionStrategy.MAX_ATTEMPTS) {
+           throw new RetryExhaustedError(this.name, ExclusionStrategy.MAX_ATTEMPTS);
+         }
+diff --git a/src/common/errors.ts b/src/common/errors.ts
+index 3650d43..10a6f70 100644
+--- a/src/common/errors.ts
++++ b/src/common/errors.ts
+@@ -1,4 +1,6 @@
+ import {
++  BadGatewayException,
++  BadRequestException,
+   ConflictException,
+   HttpException,
+   NotFoundException,
+@@ -53,6 +55,22 @@ export class BookingNotFoundError extends NotFoundException {
+   }
+ }
+ 
++export class InvalidSignatureError extends BadRequestException {
++  constructor(reason: string) {
++    super({ code: 'invalid_signature', message: `webhook signature rejected: ${reason}` });
++  }
++}
++
++/** The PSP did not answer; the hold was released so a retry can reserve again. */
++export class PaymentProviderError extends BadGatewayException {
++  constructor(cause: unknown) {
++    super({
++      code: 'payment_provider_unavailable',
++      message: `payment provider failed: ${cause instanceof Error ? cause.message : String(cause)}`,
++    });
++  }
++}
++
+ export class InvalidTransitionError extends HttpException {
+   constructor(from: string, to: string) {
+     super({ code: 'invalid_transition', message: `a ${from} booking cannot become ${to}` }, 409);
+diff --git a/src/common/retry.ts b/src/common/retry.ts
+new file mode 100644
+index 0000000..49ff287
+--- /dev/null
++++ b/src/common/retry.ts
+@@ -0,0 +1,20 @@
++import { isRetryableConflict } from './errors';
++
++/**
++ * Runs `fn` again when Postgres aborted it with a serialization failure or a deadlock (40001,
++ * 40P01, Prisma P2034). Any statement that touches a table with an exclusion constraint can be a
++ * deadlock victim under contention — the constraint is rechecked on every non-HOT update, and the
++ * check waits on in-flight conflicting inserts — so the callers that follow a reserve use this.
++ */
++export async function retryOnConflict<T>(fn: () => Promise<T>, attempts = 5): Promise<T> {
++  for (let attempt = 0; ; attempt += 1) {
++    try {
++      return await fn();
++    } catch (error) {
++      if (!isRetryableConflict(error) || attempt + 1 >= attempts) throw error;
++      await new Promise((resolve) =>
++        setTimeout(resolve, Math.floor(Math.random() * 20 * 2 ** attempt)),
++      );
++    }
++  }
++}
+diff --git a/src/config.ts b/src/config.ts
+index b3d2d01..c35bc2c 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -29,6 +29,7 @@ const schema = z
+       .optional()
+       .transform((v) => (v ? v : undefined)),
+     STRIPE_WEBHOOK_SECRET: z.string().min(8).default('whsec_slotlock_dev'),
++    PAYMENT_CURRENCY: z.string().length(3).toLowerCase().default('usd'),
+   })
+   .refine((c) => !(c.NODE_ENV === 'production' && c.BOOKING_STRATEGY === 'naive'), {
+     message: 'BOOKING_STRATEGY=naive double-books by design and is refused in production',
+diff --git a/src/generated/prisma/enums.ts b/src/generated/prisma/enums.ts
+index b512cac..0cdd476 100644
+--- a/src/generated/prisma/enums.ts
++++ b/src/generated/prisma/enums.ts
+@@ -39,7 +39,9 @@ export const PaymentEventOutcome = {
+   APPLIED: 'APPLIED',
+   STALE: 'STALE',
+   DUPLICATE: 'DUPLICATE',
+-  ORPHANED: 'ORPHANED'
++  ORPHANED: 'ORPHANED',
++  IGNORED: 'IGNORED',
++  UNKNOWN: 'UNKNOWN'
+ } as const
+ 
+ export type PaymentEventOutcome = (typeof PaymentEventOutcome)[keyof typeof PaymentEventOutcome]
+diff --git a/src/generated/prisma/internal/class.ts b/src/generated/prisma/internal/class.ts
+index f575180..50557ce 100644
+--- a/src/generated/prisma/internal/class.ts
++++ b/src/generated/prisma/internal/class.ts
+@@ -20,7 +20,7 @@ const config: runtime.GetPrismaClientConfig = {
+   "clientVersion": "7.10.0",
+   "engineVersion": "0edf323efd1d98336f3f0a68684b56f689b900d3",
+   "activeProvider": "postgresql",
+-  "inlineSchema": "// slotlock — see docs/adr for the reasoning behind the shape.\n\ngenerator client {\n  provider     = \"prisma-client\"\n  output       = \"../src/generated/prisma\"\n  moduleFormat = \"cjs\"\n}\n\ndatasource db {\n  provider = \"postgresql\"\n}\n\nenum ResourceKind {\n  ROOM\n  DESK_POOL\n}\n\nenum BookingStatus {\n  HELD\n  CONFIRMED\n  CANCELLED\n  EXPIRED\n}\n\nenum IdempotencyStatus {\n  IN_FLIGHT\n  DONE\n}\n\nenum PaymentEventOutcome {\n  APPLIED\n  STALE\n  DUPLICATE\n  ORPHANED\n}\n\n/// A bookable thing: a meeting room (exclusive) or a pool of hot desks (capacity N).\nmodel Resource {\n  id         String       @id\n  kind       ResourceKind\n  name       String\n  capacity   Int\n  priceCents Int\n  /// Bumped by the optimistic strategy on every successful reservation.\n  version    Int          @default(0)\n  createdAt  DateTime     @default(now()) @db.Timestamptz(3)\n  bookings   Booking[]\n\n  @@map(\"resources\")\n}\n\nmodel Booking {\n  id                 String        @id @default(uuid())\n  resourceId         String\n  resource           Resource      @relation(fields: [resourceId], references: [id])\n  userId             String\n  startsAt           DateTime      @db.Timestamptz(3)\n  endsAt             DateTime      @db.Timestamptz(3)\n  /// Denormalised from the resource kind so the exclusion constraint can filter on it.\n  exclusive          Boolean\n  status             BookingStatus @default(HELD)\n  holdExpiresAt      DateTime?     @db.Timestamptz(3)\n  paymentId          String?       @unique\n  /// Provider timestamp of the last payment event applied; older events are stale.\n  paymentLastEventAt DateTime?     @db.Timestamptz(3)\n  version            Int           @default(0)\n  createdAt          DateTime      @default(now()) @db.Timestamptz(3)\n  updatedAt          DateTime      @updatedAt @db.Timestamptz(3)\n\n  @@index([resourceId, startsAt, endsAt])\n  @@index([status, holdExpiresAt])\n  @@map(\"bookings\")\n}\n\n/// One row per Idempotency-Key: in flight while the request runs, then the stored response.\nmodel IdempotencyKey {\n  key            String            @id\n  userId         String\n  requestHash    String\n  status         IdempotencyStatus @default(IN_FLIGHT)\n  responseStatus Int?\n  responseBody   Json?\n  createdAt      DateTime          @default(now()) @db.Timestamptz(3)\n  expiresAt      DateTime          @db.Timestamptz(3)\n\n  @@index([expiresAt])\n  @@map(\"idempotency_keys\")\n}\n\n/// Every payment webhook received, by provider event id; the outcome records what was done with it.\nmodel PaymentEvent {\n  id                String              @id\n  paymentId         String\n  type              String\n  providerCreatedAt DateTime            @db.Timestamptz(3)\n  receivedAt        DateTime            @default(now()) @db.Timestamptz(3)\n  outcome           PaymentEventOutcome\n\n  @@index([paymentId])\n  @@map(\"payment_events\")\n}\n\n/// Domain events written in the same transaction as the change they describe.\nmodel OutboxEvent {\n  id          String    @id @default(uuid())\n  type        String\n  payload     Json\n  createdAt   DateTime  @default(now()) @db.Timestamptz(3)\n  publishedAt DateTime? @db.Timestamptz(3)\n\n  @@index([publishedAt, createdAt])\n  @@map(\"outbox_events\")\n}\n\n/// Idempotent consumers: a job key is processed at most once.\nmodel ProcessedJob {\n  key         String   @id\n  processedAt DateTime @default(now()) @db.Timestamptz(3)\n\n  @@map(\"processed_jobs\")\n}\n",
++  "inlineSchema": "// slotlock — see docs/adr for the reasoning behind the shape.\n\ngenerator client {\n  provider     = \"prisma-client\"\n  output       = \"../src/generated/prisma\"\n  moduleFormat = \"cjs\"\n}\n\ndatasource db {\n  provider = \"postgresql\"\n}\n\nenum ResourceKind {\n  ROOM\n  DESK_POOL\n}\n\nenum BookingStatus {\n  HELD\n  CONFIRMED\n  CANCELLED\n  EXPIRED\n}\n\nenum IdempotencyStatus {\n  IN_FLIGHT\n  DONE\n}\n\nenum PaymentEventOutcome {\n  APPLIED\n  STALE\n  DUPLICATE\n  ORPHANED\n  IGNORED\n  UNKNOWN\n}\n\n/// A bookable thing: a meeting room (exclusive) or a pool of hot desks (capacity N).\nmodel Resource {\n  id         String       @id\n  kind       ResourceKind\n  name       String\n  capacity   Int\n  priceCents Int\n  /// Bumped by the optimistic strategy on every successful reservation.\n  version    Int          @default(0)\n  createdAt  DateTime     @default(now()) @db.Timestamptz(3)\n  bookings   Booking[]\n\n  @@map(\"resources\")\n}\n\nmodel Booking {\n  id                 String        @id @default(uuid())\n  resourceId         String\n  resource           Resource      @relation(fields: [resourceId], references: [id])\n  userId             String\n  startsAt           DateTime      @db.Timestamptz(3)\n  endsAt             DateTime      @db.Timestamptz(3)\n  /// Denormalised from the resource kind so the exclusion constraint can filter on it.\n  exclusive          Boolean\n  status             BookingStatus @default(HELD)\n  holdExpiresAt      DateTime?     @db.Timestamptz(3)\n  amountCents        Int           @default(0)\n  paymentId          String?       @unique\n  /// Provider timestamp of the last payment event applied; older events are stale.\n  paymentLastEventAt DateTime?     @db.Timestamptz(3)\n  version            Int           @default(0)\n  createdAt          DateTime      @default(now()) @db.Timestamptz(3)\n  updatedAt          DateTime      @updatedAt @db.Timestamptz(3)\n\n  @@index([resourceId, startsAt, endsAt])\n  @@index([status, holdExpiresAt])\n  @@map(\"bookings\")\n}\n\n/// One row per Idempotency-Key: in flight while the request runs, then the stored response.\nmodel IdempotencyKey {\n  key            String            @id\n  userId         String\n  requestHash    String\n  status         IdempotencyStatus @default(IN_FLIGHT)\n  responseStatus Int?\n  responseBody   Json?\n  createdAt      DateTime          @default(now()) @db.Timestamptz(3)\n  expiresAt      DateTime          @db.Timestamptz(3)\n\n  @@index([expiresAt])\n  @@map(\"idempotency_keys\")\n}\n\n/// Every payment webhook received, by provider event id; the outcome records what was done with it.\nmodel PaymentEvent {\n  id                String              @id\n  paymentId         String?\n  type              String\n  providerCreatedAt DateTime            @db.Timestamptz(3)\n  receivedAt        DateTime            @default(now()) @db.Timestamptz(3)\n  outcome           PaymentEventOutcome\n\n  @@index([paymentId])\n  @@map(\"payment_events\")\n}\n\n/// Domain events written in the same transaction as the change they describe.\nmodel OutboxEvent {\n  id          String    @id @default(uuid())\n  type        String\n  payload     Json\n  createdAt   DateTime  @default(now()) @db.Timestamptz(3)\n  publishedAt DateTime? @db.Timestamptz(3)\n\n  @@index([publishedAt, createdAt])\n  @@map(\"outbox_events\")\n}\n\n/// Idempotent consumers: a job key is processed at most once.\nmodel ProcessedJob {\n  key         String   @id\n  processedAt DateTime @default(now()) @db.Timestamptz(3)\n\n  @@map(\"processed_jobs\")\n}\n",
+   "runtimeDataModel": {
+     "models": {},
+     "enums": {},
+@@ -32,10 +32,10 @@ const config: runtime.GetPrismaClientConfig = {
+   }
+ }
+ 
+-config.runtimeDataModel = JSON.parse("{\"models\":{\"Resource\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"kind\",\"kind\":\"enum\",\"type\":\"ResourceKind\"},{\"name\":\"name\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"capacity\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"priceCents\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"version\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"bookings\",\"kind\":\"object\",\"type\":\"Booking\",\"relationName\":\"BookingToResource\"}],\"dbName\":\"resources\",\"schema\":null},\"Booking\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"resourceId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"resource\",\"kind\":\"object\",\"type\":\"Resource\",\"relationName\":\"BookingToResource\"},{\"name\":\"userId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"startsAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"endsAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"exclusive\",\"kind\":\"scalar\",\"type\":\"Boolean\"},{\"name\":\"status\",\"kind\":\"enum\",\"type\":\"BookingStatus\"},{\"name\":\"holdExpiresAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"paymentId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"paymentLastEventAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"version\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"updatedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"bookings\",\"schema\":null},\"IdempotencyKey\":{\"fields\":[{\"name\":\"key\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"userId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"requestHash\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"status\",\"kind\":\"enum\",\"type\":\"IdempotencyStatus\"},{\"name\":\"responseStatus\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"responseBody\",\"kind\":\"scalar\",\"type\":\"Json\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"expiresAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"idempotency_keys\",\"schema\":null},\"PaymentEvent\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"paymentId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"type\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"providerCreatedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"receivedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"outcome\",\"kind\":\"enum\",\"type\":\"PaymentEventOutcome\"}],\"dbName\":\"payment_events\",\"schema\":null},\"OutboxEvent\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"type\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"payload\",\"kind\":\"scalar\",\"type\":\"Json\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"publishedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"outbox_events\",\"schema\":null},\"ProcessedJob\":{\"fields\":[{\"name\":\"key\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"processedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"processed_jobs\",\"schema\":null}},\"enums\":{},\"types\":{}}")
++config.runtimeDataModel = JSON.parse("{\"models\":{\"Resource\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"kind\",\"kind\":\"enum\",\"type\":\"ResourceKind\"},{\"name\":\"name\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"capacity\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"priceCents\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"version\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"bookings\",\"kind\":\"object\",\"type\":\"Booking\",\"relationName\":\"BookingToResource\"}],\"dbName\":\"resources\",\"schema\":null},\"Booking\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"resourceId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"resource\",\"kind\":\"object\",\"type\":\"Resource\",\"relationName\":\"BookingToResource\"},{\"name\":\"userId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"startsAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"endsAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"exclusive\",\"kind\":\"scalar\",\"type\":\"Boolean\"},{\"name\":\"status\",\"kind\":\"enum\",\"type\":\"BookingStatus\"},{\"name\":\"holdExpiresAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"amountCents\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"paymentId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"paymentLastEventAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"version\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"updatedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"bookings\",\"schema\":null},\"IdempotencyKey\":{\"fields\":[{\"name\":\"key\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"userId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"requestHash\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"status\",\"kind\":\"enum\",\"type\":\"IdempotencyStatus\"},{\"name\":\"responseStatus\",\"kind\":\"scalar\",\"type\":\"Int\"},{\"name\":\"responseBody\",\"kind\":\"scalar\",\"type\":\"Json\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"expiresAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"idempotency_keys\",\"schema\":null},\"PaymentEvent\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"paymentId\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"type\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"providerCreatedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"receivedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"outcome\",\"kind\":\"enum\",\"type\":\"PaymentEventOutcome\"}],\"dbName\":\"payment_events\",\"schema\":null},\"OutboxEvent\":{\"fields\":[{\"name\":\"id\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"type\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"payload\",\"kind\":\"scalar\",\"type\":\"Json\"},{\"name\":\"createdAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"},{\"name\":\"publishedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"outbox_events\",\"schema\":null},\"ProcessedJob\":{\"fields\":[{\"name\":\"key\",\"kind\":\"scalar\",\"type\":\"String\"},{\"name\":\"processedAt\",\"kind\":\"scalar\",\"type\":\"DateTime\"}],\"dbName\":\"processed_jobs\",\"schema\":null}},\"enums\":{},\"types\":{}}")
+ config.parameterizationSchema = {
+-  strings: JSON.parse("[\"where\",\"orderBy\",\"cursor\",\"resource\",\"bookings\",\"_count\",\"Resource.findUnique\",\"Resource.findUniqueOrThrow\",\"Resource.findFirst\",\"Resource.findFirstOrThrow\",\"Resource.findMany\",\"data\",\"Resource.createOne\",\"Resource.createMany\",\"Resource.createManyAndReturn\",\"Resource.updateOne\",\"Resource.updateMany\",\"Resource.updateManyAndReturn\",\"create\",\"update\",\"Resource.upsertOne\",\"Resource.deleteOne\",\"Resource.deleteMany\",\"having\",\"_avg\",\"_sum\",\"_min\",\"_max\",\"Resource.groupBy\",\"Resource.aggregate\",\"Booking.findUnique\",\"Booking.findUniqueOrThrow\",\"Booking.findFirst\",\"Booking.findFirstOrThrow\",\"Booking.findMany\",\"Booking.createOne\",\"Booking.createMany\",\"Booking.createManyAndReturn\",\"Booking.updateOne\",\"Booking.updateMany\",\"Booking.updateManyAndReturn\",\"Booking.upsertOne\",\"Booking.deleteOne\",\"Booking.deleteMany\",\"Booking.groupBy\",\"Booking.aggregate\",\"IdempotencyKey.findUnique\",\"IdempotencyKey.findUniqueOrThrow\",\"IdempotencyKey.findFirst\",\"IdempotencyKey.findFirstOrThrow\",\"IdempotencyKey.findMany\",\"IdempotencyKey.createOne\",\"IdempotencyKey.createMany\",\"IdempotencyKey.createManyAndReturn\",\"IdempotencyKey.updateOne\",\"IdempotencyKey.updateMany\",\"IdempotencyKey.updateManyAndReturn\",\"IdempotencyKey.upsertOne\",\"IdempotencyKey.deleteOne\",\"IdempotencyKey.deleteMany\",\"IdempotencyKey.groupBy\",\"IdempotencyKey.aggregate\",\"PaymentEvent.findUnique\",\"PaymentEvent.findUniqueOrThrow\",\"PaymentEvent.findFirst\",\"PaymentEvent.findFirstOrThrow\",\"PaymentEvent.findMany\",\"PaymentEvent.createOne\",\"PaymentEvent.createMany\",\"PaymentEvent.createManyAndReturn\",\"PaymentEvent.updateOne\",\"PaymentEvent.updateMany\",\"PaymentEvent.updateManyAndReturn\",\"PaymentEvent.upsertOne\",\"PaymentEvent.deleteOne\",\"PaymentEvent.deleteMany\",\"PaymentEvent.groupBy\",\"PaymentEvent.aggregate\",\"OutboxEvent.findUnique\",\"OutboxEvent.findUniqueOrThrow\",\"OutboxEvent.findFirst\",\"OutboxEvent.findFirstOrThrow\",\"OutboxEvent.findMany\",\"OutboxEvent.createOne\",\"OutboxEvent.createMany\",\"OutboxEvent.createManyAndReturn\",\"OutboxEvent.updateOne\",\"OutboxEvent.updateMany\",\"OutboxEvent.updateManyAndReturn\",\"OutboxEvent.upsertOne\",\"OutboxEvent.deleteOne\",\"OutboxEvent.deleteMany\",\"OutboxEvent.groupBy\",\"OutboxEvent.aggregate\",\"ProcessedJob.findUnique\",\"ProcessedJob.findUniqueOrThrow\",\"ProcessedJob.findFirst\",\"ProcessedJob.findFirstOrThrow\",\"ProcessedJob.findMany\",\"ProcessedJob.createOne\",\"ProcessedJob.createMany\",\"ProcessedJob.createManyAndReturn\",\"ProcessedJob.updateOne\",\"ProcessedJob.updateMany\",\"ProcessedJob.updateManyAndReturn\",\"ProcessedJob.upsertOne\",\"ProcessedJob.deleteOne\",\"ProcessedJob.deleteMany\",\"ProcessedJob.groupBy\",\"ProcessedJob.aggregate\",\"AND\",\"OR\",\"NOT\",\"key\",\"processedAt\",\"equals\",\"in\",\"notIn\",\"lt\",\"lte\",\"gt\",\"gte\",\"not\",\"contains\",\"startsWith\",\"endsWith\",\"id\",\"type\",\"payload\",\"createdAt\",\"publishedAt\",\"string_contains\",\"string_starts_with\",\"string_ends_with\",\"array_starts_with\",\"array_ends_with\",\"array_contains\",\"paymentId\",\"providerCreatedAt\",\"receivedAt\",\"PaymentEventOutcome\",\"outcome\",\"userId\",\"requestHash\",\"IdempotencyStatus\",\"status\",\"responseStatus\",\"responseBody\",\"expiresAt\",\"resourceId\",\"startsAt\",\"endsAt\",\"exclusive\",\"BookingStatus\",\"holdExpiresAt\",\"paymentLastEventAt\",\"version\",\"updatedAt\",\"ResourceKind\",\"kind\",\"name\",\"capacity\",\"priceCents\",\"every\",\"some\",\"none\",\"is\",\"isNot\",\"connectOrCreate\",\"upsert\",\"createMany\",\"set\",\"disconnect\",\"delete\",\"connect\",\"updateMany\",\"deleteMany\",\"increment\",\"decrement\",\"multiply\",\"divide\"]"),
+-  graph: "lgI4YAsEAADVAQAgbgAA0gEAMG8AAAkAEHAAANIBADB-AQAAAAGBAUAAowEAIZwBAgDUAQAhnwEAANMBnwEioAEBAKIBACGhAQIA1AEAIaIBAgDUAQAhAQAAAAEAIBEDAADZAQAgbgAA1gEAMG8AAAMAEHAAANYBADB-AQCiAQAhgQFAAKMBACGJAQEA2gEAIY4BAQCiAQAhkQEAANgBmgEilQEBAKIBACGWAUAAowEAIZcBQACjAQAhmAEgANcBACGaAUAArQEAIZsBQACtAQAhnAECANQBACGdAUAAowEAIQQDAACQAgAgiQEAAOABACCaAQAA4AEAIJsBAADgAQAgEQMAANkBACBuAADWAQAwbwAAAwAQcAAA1gEAMH4BAAAAAYEBQACjAQAhiQEBAAAAAY4BAQCiAQAhkQEAANgBmgEilQEBAKIBACGWAUAAowEAIZcBQACjAQAhmAEgANcBACGaAUAArQEAIZsBQACtAQAhnAECANQBACGdAUAAowEAIQMAAAADACABAAAEADACAAAFACABAAAAAwAgAQAAAAEAIAsEAADVAQAgbgAA0gEAMG8AAAkAEHAAANIBADB-AQCiAQAhgQFAAKMBACGcAQIA1AEAIZ8BAADTAZ8BIqABAQCiAQAhoQECANQBACGiAQIA1AEAIQEEAACPAgAgAwAAAAkAIAEAAAoAMAIAAAEAIAMAAAAJACABAAAKADACAAABACADAAAACQAgAQAACgAwAgAAAQAgCAQAAI4CACB-AQAAAAGBAUAAAAABnAECAAAAAZ8BAAAAnwECoAEBAAAAAaEBAgAAAAGiAQIAAAABAQsAAA4AIAd-AQAAAAGBAUAAAAABnAECAAAAAZ8BAAAAnwECoAEBAAAAAaEBAgAAAAGiAQIAAAABAQsAABAAMAELAAAQADAIBAAAgQIAIH4BAN4BACGBAUAA3wEAIZwBAgD4AQAhnwEAAIACnwEioAEBAN4BACGhAQIA-AEAIaIBAgD4AQAhAgAAAAEAIAsAABMAIAd-AQDeAQAhgQFAAN8BACGcAQIA-AEAIZ8BAACAAp8BIqABAQDeAQAhoQECAPgBACGiAQIA-AEAIQIAAAAJACALAAAVACACAAAACQAgCwAAFQAgAwAAAAEAIBIAAA4AIBMAABMAIAEAAAABACABAAAACQAgBQUAAPsBACAYAAD8AQAgGQAA_wEAIBoAAP4BACAbAAD9AQAgCm4AAM4BADBvAAAcABBwAADOAQAwfgEAmgEAIYEBQACbAQAhnAECAMUBACGfAQAAzwGfASKgAQEAmgEAIaEBAgDFAQAhogECAMUBACEDAAAACQAgAQAAGwAwFwAAHAAgAwAAAAkAIAEAAAoAMAIAAAEAIAEAAAAFACABAAAABQAgAwAAAAMAIAEAAAQAMAIAAAUAIAMAAAADACABAAAEADACAAAFACADAAAAAwAgAQAABAAwAgAABQAgDgMAAPoBACB-AQAAAAGBAUAAAAABiQEBAAAAAY4BAQAAAAGRAQAAAJoBApUBAQAAAAGWAUAAAAABlwFAAAAAAZgBIAAAAAGaAUAAAAABmwFAAAAAAZwBAgAAAAGdAUAAAAABAQsAACQAIA1-AQAAAAGBAUAAAAABiQEBAAAAAY4BAQAAAAGRAQAAAJoBApUBAQAAAAGWAUAAAAABlwFAAAAAAZgBIAAAAAGaAUAAAAABmwFAAAAAAZwBAgAAAAGdAUAAAAABAQsAACYAMAELAAAmADAOAwAA-QEAIH4BAN4BACGBAUAA3wEAIYkBAQD3AQAhjgEBAN4BACGRAQAA9gGaASKVAQEA3gEAIZYBQADfAQAhlwFAAN8BACGYASAA9QEAIZoBQADkAQAhmwFAAOQBACGcAQIA-AEAIZ0BQADfAQAhAgAAAAUAIAsAACkAIA1-AQDeAQAhgQFAAN8BACGJAQEA9wEAIY4BAQDeAQAhkQEAAPYBmgEilQEBAN4BACGWAUAA3wEAIZcBQADfAQAhmAEgAPUBACGaAUAA5AEAIZsBQADkAQAhnAECAPgBACGdAUAA3wEAIQIAAAADACALAAArACACAAAAAwAgCwAAKwAgAwAAAAUAIBIAACQAIBMAACkAIAEAAAAFACABAAAAAwAgCAUAAPABACAYAADxAQAgGQAA9AEAIBoAAPMBACAbAADyAQAgiQEAAOABACCaAQAA4AEAIJsBAADgAQAgEG4AAMEBADBvAAAyABBwAADBAQAwfgEAmgEAIYEBQACbAQAhiQEBAMQBACGOAQEAmgEAIZEBAADDAZoBIpUBAQCaAQAhlgFAAJsBACGXAUAAmwEAIZgBIADCAQAhmgFAAKYBACGbAUAApgEAIZwBAgDFAQAhnQFAAJsBACEDAAAAAwAgAQAAMQAwFwAAMgAgAwAAAAMAIAEAAAQAMAIAAAUAIAtuAAC9AQAwbwAAOAAQcAAAvQEAMHEBAAAAAYEBQACjAQAhjgEBAKIBACGPAQEAogEAIZEBAAC-AZEBIpIBAgC_AQAhkwEAAMABACCUAUAAowEAIQEAAAA1ACABAAAANQAgC24AAL0BADBvAAA4ABBwAAC9AQAwcQEAogEAIYEBQACjAQAhjgEBAKIBACGPAQEAogEAIZEBAAC-AZEBIpIBAgC_AQAhkwEAAMABACCUAUAAowEAIQKSAQAA4AEAIJMBAADgAQAgAwAAADgAIAEAADkAMAIAADUAIAMAAAA4ACABAAA5ADACAAA1ACADAAAAOAAgAQAAOQAwAgAANQAgCHEBAAAAAYEBQAAAAAGOAQEAAAABjwEBAAAAAZEBAAAAkQECkgECAAAAAZMBgAAAAAGUAUAAAAABAQsAAD0AIAhxAQAAAAGBAUAAAAABjgEBAAAAAY8BAQAAAAGRAQAAAJEBApIBAgAAAAGTAYAAAAABlAFAAAAAAQELAAA_ADABCwAAPwAwCHEBAN4BACGBAUAA3wEAIY4BAQDeAQAhjwEBAN4BACGRAQAA7gGRASKSAQIA7wEAIZMBgAAAAAGUAUAA3wEAIQIAAAA1ACALAABCACAIcQEA3gEAIYEBQADfAQAhjgEBAN4BACGPAQEA3gEAIZEBAADuAZEBIpIBAgDvAQAhkwGAAAAAAZQBQADfAQAhAgAAADgAIAsAAEQAIAIAAAA4ACALAABEACADAAAANQAgEgAAPQAgEwAAQgAgAQAAADUAIAEAAAA4ACAHBQAA6QEAIBgAAOoBACAZAADtAQAgGgAA7AEAIBsAAOsBACCSAQAA4AEAIJMBAADgAQAgC24AALQBADBvAABLABBwAAC0AQAwcQEAmgEAIYEBQACbAQAhjgEBAJoBACGPAQEAmgEAIZEBAAC1AZEBIpIBAgC2AQAhkwEAALcBACCUAUAAmwEAIQMAAAA4ACABAABKADAXAABLACADAAAAOAAgAQAAOQAwAgAANQAgCW4AALIBADBvAABRABBwAACyAQAwfgEAAAABfwEAogEAIYkBAQCiAQAhigFAAKMBACGLAUAAowEAIY0BAACzAY0BIgEAAABOACABAAAATgAgCW4AALIBADBvAABRABBwAACyAQAwfgEAogEAIX8BAKIBACGJAQEAogEAIYoBQACjAQAhiwFAAKMBACGNAQAAswGNASIAAwAAAFEAIAEAAFIAMAIAAE4AIAMAAABRACABAABSADACAABOACADAAAAUQAgAQAAUgAwAgAATgAgBn4BAAAAAX8BAAAAAYkBAQAAAAGKAUAAAAABiwFAAAAAAY0BAAAAjQECAQsAAFYAIAZ-AQAAAAF_AQAAAAGJAQEAAAABigFAAAAAAYsBQAAAAAGNAQAAAI0BAgELAABYADABCwAAWAAwBn4BAN4BACF_AQDeAQAhiQEBAN4BACGKAUAA3wEAIYsBQADfAQAhjQEAAOgBjQEiAgAAAE4AIAsAAFsAIAZ-AQDeAQAhfwEA3gEAIYkBAQDeAQAhigFAAN8BACGLAUAA3wEAIY0BAADoAY0BIgIAAABRACALAABdACACAAAAUQAgCwAAXQAgAwAAAE4AIBIAAFYAIBMAAFsAIAEAAABOACABAAAAUQAgAwUAAOUBACAaAADnAQAgGwAA5gEAIAluAACuAQAwbwAAZAAQcAAArgEAMH4BAJoBACF_AQCaAQAhiQEBAJoBACGKAUAAmwEAIYsBQACbAQAhjQEAAK8BjQEiAwAAAFEAIAEAAGMAMBcAAGQAIAMAAABRACABAABSADACAABOACAIbgAAqwEAMG8AAGoAEHAAAKsBADB-AQAAAAF_AQCiAQAhgAEAAKwBACCBAUAAowEAIYIBQACtAQAhAQAAAGcAIAEAAABnACAIbgAAqwEAMG8AAGoAEHAAAKsBADB-AQCiAQAhfwEAogEAIYABAACsAQAggQFAAKMBACGCAUAArQEAIQGCAQAA4AEAIAMAAABqACABAABrADACAABnACADAAAAagAgAQAAawAwAgAAZwAgAwAAAGoAIAEAAGsAMAIAAGcAIAV-AQAAAAF_AQAAAAGAAYAAAAABgQFAAAAAAYIBQAAAAAEBCwAAbwAgBX4BAAAAAX8BAAAAAYABgAAAAAGBAUAAAAABggFAAAAAAQELAABxADABCwAAcQAwBX4BAN4BACF_AQDeAQAhgAGAAAAAAYEBQADfAQAhggFAAOQBACECAAAAZwAgCwAAdAAgBX4BAN4BACF_AQDeAQAhgAGAAAAAAYEBQADfAQAhggFAAOQBACECAAAAagAgCwAAdgAgAgAAAGoAIAsAAHYAIAMAAABnACASAABvACATAAB0ACABAAAAZwAgAQAAAGoAIAQFAADhAQAgGgAA4wEAIBsAAOIBACCCAQAA4AEAIAhuAACkAQAwbwAAfQAQcAAApAEAMH4BAJoBACF_AQCaAQAhgAEAAKUBACCBAUAAmwEAIYIBQACmAQAhAwAAAGoAIAEAAHwAMBcAAH0AIAMAAABqACABAABrADACAABnACAFbgAAoQEAMG8AAIMBABBwAAChAQAwcQEAAAABckAAowEAIQEAAACAAQAgAQAAAIABACAFbgAAoQEAMG8AAIMBABBwAAChAQAwcQEAogEAIXJAAKMBACEAAwAAAIMBACABAACEAQAwAgAAgAEAIAMAAACDAQAgAQAAhAEAMAIAAIABACADAAAAgwEAIAEAAIQBADACAACAAQAgAnEBAAAAAXJAAAAAAQELAACIAQAgAnEBAAAAAXJAAAAAAQELAACKAQAwAQsAAIoBADACcQEA3gEAIXJAAN8BACECAAAAgAEAIAsAAI0BACACcQEA3gEAIXJAAN8BACECAAAAgwEAIAsAAI8BACACAAAAgwEAIAsAAI8BACADAAAAgAEAIBIAAIgBACATAACNAQAgAQAAAIABACABAAAAgwEAIAMFAADbAQAgGgAA3QEAIBsAANwBACAFbgAAmQEAMG8AAJYBABBwAACZAQAwcQEAmgEAIXJAAJsBACEDAAAAgwEAIAEAAJUBADAXAACWAQAgAwAAAIMBACABAACEAQAwAgAAgAEAIAVuAACZAQAwbwAAlgEAEHAAAJkBADBxAQCaAQAhckAAmwEAIQ4FAACdAQAgGgAAoAEAIBsAAKABACBzAQAAAAF0AQAAAAR1AQAAAAR2AQAAAAF3AQAAAAF4AQAAAAF5AQAAAAF6AQCfAQAhewEAAAABfAEAAAABfQEAAAABCwUAAJ0BACAaAACeAQAgGwAAngEAIHNAAAAAAXRAAAAABHVAAAAABHZAAAAAAXdAAAAAAXhAAAAAAXlAAAAAAXpAAJwBACELBQAAnQEAIBoAAJ4BACAbAACeAQAgc0AAAAABdEAAAAAEdUAAAAAEdkAAAAABd0AAAAABeEAAAAABeUAAAAABekAAnAEAIQhzAgAAAAF0AgAAAAR1AgAAAAR2AgAAAAF3AgAAAAF4AgAAAAF5AgAAAAF6AgCdAQAhCHNAAAAAAXRAAAAABHVAAAAABHZAAAAAAXdAAAAAAXhAAAAAAXlAAAAAAXpAAJ4BACEOBQAAnQEAIBoAAKABACAbAACgAQAgcwEAAAABdAEAAAAEdQEAAAAEdgEAAAABdwEAAAABeAEAAAABeQEAAAABegEAnwEAIXsBAAAAAXwBAAAAAX0BAAAAAQtzAQAAAAF0AQAAAAR1AQAAAAR2AQAAAAF3AQAAAAF4AQAAAAF5AQAAAAF6AQCgAQAhewEAAAABfAEAAAABfQEAAAABBW4AAKEBADBvAACDAQAQcAAAoQEAMHEBAKIBACFyQACjAQAhC3MBAAAAAXQBAAAABHUBAAAABHYBAAAAAXcBAAAAAXgBAAAAAXkBAAAAAXoBAKABACF7AQAAAAF8AQAAAAF9AQAAAAEIc0AAAAABdEAAAAAEdUAAAAAEdkAAAAABd0AAAAABeEAAAAABeUAAAAABekAAngEAIQhuAACkAQAwbwAAfQAQcAAApAEAMH4BAJoBACF_AQCaAQAhgAEAAKUBACCBAUAAmwEAIYIBQACmAQAhDwUAAJ0BACAaAACqAQAgGwAAqgEAIHOAAAAAAXaAAAAAAXeAAAAAAXiAAAAAAXmAAAAAAXqAAAAAAYMBAQAAAAGEAQEAAAABhQEBAAAAAYYBgAAAAAGHAYAAAAABiAGAAAAAAQsFAACoAQAgGgAAqQEAIBsAAKkBACBzQAAAAAF0QAAAAAV1QAAAAAV2QAAAAAF3QAAAAAF4QAAAAAF5QAAAAAF6QACnAQAhCwUAAKgBACAaAACpAQAgGwAAqQEAIHNAAAAAAXRAAAAABXVAAAAABXZAAAAAAXdAAAAAAXhAAAAAAXlAAAAAAXpAAKcBACEIcwIAAAABdAIAAAAFdQIAAAAFdgIAAAABdwIAAAABeAIAAAABeQIAAAABegIAqAEAIQhzQAAAAAF0QAAAAAV1QAAAAAV2QAAAAAF3QAAAAAF4QAAAAAF5QAAAAAF6QACpAQAhDHOAAAAAAXaAAAAAAXeAAAAAAXiAAAAAAXmAAAAAAXqAAAAAAYMBAQAAAAGEAQEAAAABhQEBAAAAAYYBgAAAAAGHAYAAAAABiAGAAAAAAQhuAACrAQAwbwAAagAQcAAAqwEAMH4BAKIBACF_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-TyE_UCFAUyFBVCFCVSFDVyFEWQRFWiJGXCFHXgRIXyNJYCFKYSFLYgRMZSRNZihOaClPaSlQbClRbSlSbilTcClUcgRVcypWdSlXdwRYeCtZeSlaeilbewRcfixdfzBegQExX4IBMWCFATFhhgExYocBMWOJATFkiwEEZYwBMmaOATFnkAEEaJEBM2mSATFqkwExa5QBBGyXATRtmAE4"
++  strings: JSON.parse("[\"where\",\"orderBy\",\"cursor\",\"resource\",\"bookings\",\"_count\",\"Resource.findUnique\",\"Resource.findUniqueOrThrow\",\"Resource.findFirst\",\"Resource.findFirstOrThrow\",\"Resource.findMany\",\"data\",\"Resource.createOne\",\"Resource.createMany\",\"Resource.createManyAndReturn\",\"Resource.updateOne\",\"Resource.updateMany\",\"Resource.updateManyAndReturn\",\"create\",\"update\",\"Resource.upsertOne\",\"Resource.deleteOne\",\"Resource.deleteMany\",\"having\",\"_avg\",\"_sum\",\"_min\",\"_max\",\"Resource.groupBy\",\"Resource.aggregate\",\"Booking.findUnique\",\"Booking.findUniqueOrThrow\",\"Booking.findFirst\",\"Booking.findFirstOrThrow\",\"Booking.findMany\",\"Booking.createOne\",\"Booking.createMany\",\"Booking.createManyAndReturn\",\"Booking.updateOne\",\"Booking.updateMany\",\"Booking.updateManyAndReturn\",\"Booking.upsertOne\",\"Booking.deleteOne\",\"Booking.deleteMany\",\"Booking.groupBy\",\"Booking.aggregate\",\"IdempotencyKey.findUnique\",\"IdempotencyKey.findUniqueOrThrow\",\"IdempotencyKey.findFirst\",\"IdempotencyKey.findFirstOrThrow\",\"IdempotencyKey.findMany\",\"IdempotencyKey.createOne\",\"IdempotencyKey.createMany\",\"IdempotencyKey.createManyAndReturn\",\"IdempotencyKey.updateOne\",\"IdempotencyKey.updateMany\",\"IdempotencyKey.updateManyAndReturn\",\"IdempotencyKey.upsertOne\",\"IdempotencyKey.deleteOne\",\"IdempotencyKey.deleteMany\",\"IdempotencyKey.groupBy\",\"IdempotencyKey.aggregate\",\"PaymentEvent.findUnique\",\"PaymentEvent.findUniqueOrThrow\",\"PaymentEvent.findFirst\",\"PaymentEvent.findFirstOrThrow\",\"PaymentEvent.findMany\",\"PaymentEvent.createOne\",\"PaymentEvent.createMany\",\"PaymentEvent.createManyAndReturn\",\"PaymentEvent.updateOne\",\"PaymentEvent.updateMany\",\"PaymentEvent.updateManyAndReturn\",\"PaymentEvent.upsertOne\",\"PaymentEvent.deleteOne\",\"PaymentEvent.deleteMany\",\"PaymentEvent.groupBy\",\"PaymentEvent.aggregate\",\"OutboxEvent.findUnique\",\"OutboxEvent.findUniqueOrThrow\",\"OutboxEvent.findFirst\",\"OutboxEvent.findFirstOrThrow\",\"OutboxEvent.findMany\",\"OutboxEvent.createOne\",\"OutboxEvent.createMany\",\"OutboxEvent.createManyAndReturn\",\"OutboxEvent.updateOne\",\"OutboxEvent.updateMany\",\"OutboxEvent.updateManyAndReturn\",\"OutboxEvent.upsertOne\",\"OutboxEvent.deleteOne\",\"OutboxEvent.deleteMany\",\"OutboxEvent.groupBy\",\"OutboxEvent.aggregate\",\"ProcessedJob.findUnique\",\"ProcessedJob.findUniqueOrThrow\",\"ProcessedJob.findFirst\",\"ProcessedJob.findFirstOrThrow\",\"ProcessedJob.findMany\",\"ProcessedJob.createOne\",\"ProcessedJob.createMany\",\"ProcessedJob.createManyAndReturn\",\"ProcessedJob.updateOne\",\"ProcessedJob.updateMany\",\"ProcessedJob.updateManyAndReturn\",\"ProcessedJob.upsertOne\",\"ProcessedJob.deleteOne\",\"ProcessedJob.deleteMany\",\"ProcessedJob.groupBy\",\"ProcessedJob.aggregate\",\"AND\",\"OR\",\"NOT\",\"key\",\"processedAt\",\"equals\",\"in\",\"notIn\",\"lt\",\"lte\",\"gt\",\"gte\",\"not\",\"contains\",\"startsWith\",\"endsWith\",\"id\",\"type\",\"payload\",\"createdAt\",\"publishedAt\",\"string_contains\",\"string_starts_with\",\"string_ends_with\",\"array_starts_with\",\"array_ends_with\",\"array_contains\",\"paymentId\",\"providerCreatedAt\",\"receivedAt\",\"PaymentEventOutcome\",\"outcome\",\"userId\",\"requestHash\",\"IdempotencyStatus\",\"status\",\"responseStatus\",\"responseBody\",\"expiresAt\",\"resourceId\",\"startsAt\",\"endsAt\",\"exclusive\",\"BookingStatus\",\"holdExpiresAt\",\"amountCents\",\"paymentLastEventAt\",\"version\",\"updatedAt\",\"ResourceKind\",\"kind\",\"name\",\"capacity\",\"priceCents\",\"every\",\"some\",\"none\",\"is\",\"isNot\",\"connectOrCreate\",\"upsert\",\"createMany\",\"set\",\"disconnect\",\"delete\",\"connect\",\"updateMany\",\"deleteMany\",\"increment\",\"decrement\",\"multiply\",\"divide\"]"),
++  graph: "lgI4YAsEAADWAQAgbgAA0wEAMG8AAAkAEHAAANMBADB-AQAAAAGBAUAAowEAIZ0BAgDVAQAhoAEAANQBoAEioQEBAKIBACGiAQIA1QEAIaMBAgDVAQAhAQAAAAEAIBIDAADaAQAgbgAA1wEAMG8AAAMAEHAAANcBADB-AQCiAQAhgQFAAKMBACGJAQEAtgEAIY4BAQCiAQAhkQEAANkBmgEilQEBAKIBACGWAUAAowEAIZcBQACjAQAhmAEgANgBACGaAUAArQEAIZsBAgDVAQAhnAFAAK0BACGdAQIA1QEAIZ4BQACjAQAhBAMAAJACACCJAQAA4AEAIJoBAADgAQAgnAEAAOABACASAwAA2gEAIG4AANcBADBvAAADABBwAADXAQAwfgEAAAABgQFAAKMBACGJAQEAAAABjgEBAKIBACGRAQAA2QGaASKVAQEAogEAIZYBQACjAQAhlwFAAKMBACGYASAA2AEAIZoBQACtAQAhmwECANUBACGcAUAArQEAIZ0BAgDVAQAhngFAAKMBACEDAAAAAwAgAQAABAAwAgAABQAgAQAAAAMAIAEAAAABACALBAAA1gEAIG4AANMBADBvAAAJABBwAADTAQAwfgEAogEAIYEBQACjAQAhnQECANUBACGgAQAA1AGgASKhAQEAogEAIaIBAgDVAQAhowECANUBACEBBAAAjwIAIAMAAAAJACABAAAKADACAAABACADAAAACQAgAQAACgAwAgAAAQAgAwAAAAkAIAEAAAoAMAIAAAEAIAgEAACOAgAgfgEAAAABgQFAAAAAAZ0BAgAAAAGgAQAAAKABAqEBAQAAAAGiAQIAAAABowECAAAAAQELAAAOACAHfgEAAAABgQFAAAAAAZ0BAgAAAAGgAQAAAKABAqEBAQAAAAGiAQIAAAABowECAAAAAQELAAAQADABCwAAEAAwCAQAAIECACB-AQDeAQAhgQFAAN8BACGdAQIA-AEAIaABAACAAqABIqEBAQDeAQAhogECAPgBACGjAQIA-AEAIQIAAAABACALAAATACAHfgEA3gEAIYEBQADfAQAhnQECAPgBACGgAQAAgAKgASKhAQEA3gEAIaIBAgD4AQAhowECAPgBACECAAAACQAgCwAAFQAgAgAAAAkAIAsAABUAIAMAAAABACASAAAOACATAAATACABAAAAAQAgAQAAAAkAIAUFAAD7AQAgGAAA_AEAIBkAAP8BACAaAAD-AQAgGwAA_QEAIApuAADPAQAwbwAAHAAQcAAAzwEAMH4BAJoBACGBAUAAmwEAIZ0BAgDIAQAhoAEAANABoAEioQEBAJoBACGiAQIAyAEAIaMBAgDIAQAhAwAAAAkAIAEAABsAMBcAABwAIAMAAAAJACABAAAKADACAAABACABAAAABQAgAQAAAAUAIAMAAAADACABAAAEADACAAAFACADAAAAAwAgAQAABAAwAgAABQAgAwAAAAMAIAEAAAQAMAIAAAUAIA8DAAD6AQAgfgEAAAABgQFAAAAAAYkBAQAAAAGOAQEAAAABkQEAAACaAQKVAQEAAAABlgFAAAAAAZcBQAAAAAGYASAAAAABmgFAAAAAAZsBAgAAAAGcAUAAAAABnQECAAAAAZ4BQAAAAAEBCwAAJAAgDn4BAAAAAYEBQAAAAAGJAQEAAAABjgEBAAAAAZEBAAAAmgEClQEBAAAAAZYBQAAAAAGXAUAAAAABmAEgAAAAAZoBQAAAAAGbAQIAAAABnAFAAAAAAZ0BAgAAAAGeAUAAAAABAQsAACYAMAELAAAmADAPAwAA-QEAIH4BAN4BACGBAUAA3wEAIYkBAQDoAQAhjgEBAN4BACGRAQAA9wGaASKVAQEA3gEAIZYBQADfAQAhlwFAAN8BACGYASAA9gEAIZoBQADkAQAhmwECAPgBACGcAUAA5AEAIZ0BAgD4AQAhngFAAN8BACECAAAABQAgCwAAKQAgDn4BAN4BACGBAUAA3wEAIYkBAQDoAQAhjgEBAN4BACGRAQAA9wGaASKVAQEA3gEAIZYBQADfAQAhlwFAAN8BACGYASAA9gEAIZoBQADkAQAhmwECAPgBACGcAUAA5AEAIZ0BAgD4AQAhngFAAN8BACECAAAAAwAgCwAAKwAgAgAAAAMAIAsAACsAIAMAAAAFACASAAAkACATAAApACABAAAABQAgAQAAAAMAIAgFAADxAQAgGAAA8gEAIBkAAPUBACAaAAD0AQAgGwAA8wEAIIkBAADgAQAgmgEAAOABACCcAQAA4AEAIBFuAADFAQAwbwAAMgAQcAAAxQEAMH4BAJoBACGBAUAAmwEAIYkBAQCvAQAhjgEBAJoBACGRAQAAxwGaASKVAQEAmgEAIZYBQACbAQAhlwFAAJsBACGYASAAxgEAIZoBQACmAQAhmwECAMgBACGcAUAApgEAIZ0BAgDIAQAhngFAAJsBACEDAAAAAwAgAQAAMQAwFwAAMgAgAwAAAAMAIAEAAAQAMAIAAAUAIAtuAADBAQAwbwAAOAAQcAAAwQEAMHEBAAAAAYEBQACjAQAhjgEBAKIBACGPAQEAogEAIZEBAADCAZEBIpIBAgDDAQAhkwEAAMQBACCUAUAAowEAIQEAAAA1ACABAAAANQAgC24AAMEBADBvAAA4ABBwAADBAQAwcQEAogEAIYEBQACjAQAhjgEBAKIBACGPAQEAogEAIZEBAADCAZEBIpIBAgDDAQAhkwEAAMQBACCUAUAAowEAIQKSAQAA4AEAIJMBAADgAQAgAwAAADgAIAEAADkAMAIAADUAIAMAAAA4ACABAAA5ADACAAA1ACADAAAAOAAgAQAAOQAwAgAANQAgCHEBAAAAAYEBQAAAAAGOAQEAAAABjwEBAAAAAZEBAAAAkQECkgECAAAAAZMBgAAAAAGUAUAAAAABAQsAAD0AIAhxAQAAAAGBAUAAAAABjgEBAAAAAY8BAQAAAAGRAQAAAJEBApIBAgAAAAGTAYAAAAABlAFAAAAAAQELAAA_ADABCwAAPwAwCHEBAN4BACGBAUAA3wEAIY4BAQDeAQAhjwEBAN4BACGRAQAA7wGRASKSAQIA8AEAIZMBgAAAAAGUAUAA3wEAIQIAAAA1ACALAABCACAIcQEA3gEAIYEBQADfAQAhjgEBAN4BACGPAQEA3gEAIZEBAADvAZEBIpIBAgDwAQAhkwGAAAAAAZQBQADfAQAhAgAAADgAIAsAAEQAIAIAAAA4ACALAABEACADAAAANQAgEgAAPQAgEwAAQgAgAQAAADUAIAEAAAA4ACAHBQAA6gEAIBgAAOsBACAZAADuAQAgGgAA7QEAIBsAAOwBACCSAQAA4AEAIJMBAADgAQAgC24AALgBADBvAABLABBwAAC4AQAwcQEAmgEAIYEBQACbAQAhjgEBAJoBACGPAQEAmgEAIZEBAAC5AZEBIpIBAgC6AQAhkwEAALsBACCUAUAAmwEAIQMAAAA4ACABAABKADAXAABLACADAAAAOAAgAQAAOQAwAgAANQAgCW4AALUBADBvAABRABBwAAC1AQAwfgEAAAABfwEAogEAIYkBAQC2AQAhigFAAKMBACGLAUAAowEAIY0BAAC3AY0BIgEAAABOACABAAAATgAgCW4AALUBADBvAABRABBwAAC1AQAwfgEAogEAIX8BAKIBACGJAQEAtgEAIYoBQACjAQAhiwFAAKMBACGNAQAAtwGNASIBiQEAAOABACADAAAAUQAgAQAAUgAwAgAATgAgAwAAAFEAIAEAAFIAMAIAAE4AIAMAAABRACABAABSADACAABOACAGfgEAAAABfwEAAAABiQEBAAAAAYoBQAAAAAGLAUAAAAABjQEAAACNAQIBCwAAVgAgBn4BAAAAAX8BAAAAAYkBAQAAAAGKAUAAAAABiwFAAAAAAY0BAAAAjQECAQsAAFgAMAELAABYADAGfgEA3gEAIX8BAN4BACGJAQEA6AEAIYoBQADfAQAhiwFAAN8BACGNAQAA6QGNASICAAAATgAgCwAAWwAgBn4BAN4BACF_AQDeAQAhiQEBAOgBACGKAUAA3wEAIYsBQADfAQAhjQEAAOkBjQEiAgAAAFEAIAsAAF0AIAIAAABRACALAABdACADAAAATgAgEgAAVgAgEwAAWwAgAQAAAE4AIAEAAABRACAEBQAA5QEAIBoAAOcBACAbAADmAQAgiQEAAOABACAJbgAArgEAMG8AAGQAEHAAAK4BADB-AQCaAQAhfwEAmgEAIYkBAQCvAQAhigFAAJsBACGLAUAAmwEAIY0BAACwAY0BIgMAAABRACABAABjADAXAABkACADAAAAUQAgAQAAUgAwAgAATgAgCG4AAKsBADBvAABqABBwAACrAQAwfgEAAAABfwEAogEAIYABAACsAQAggQFAAKMBACGCAUAArQEAIQEAAABnACABAAAAZwAgCG4AAKsBADBvAABqABBwAACrAQAwfgEAogEAIX8BAKIBACGAAQAArAEAIIEBQACjAQAhggFAAK0BACEBggEAAOABACADAAAAagAgAQAAawAwAgAAZwAgAwAAAGoAIAEAAGsAMAIAAGcAIAMAAABqACABAABrADACAABnACAFfgEAAAABfwEAAAABgAGAAAAAAYEBQAAAAAGCAUAAAAABAQsAAG8AIAV-AQAAAAF_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_AQCaAQAhiQEBAK8BACGKAUAAmwEAIYsBQACbAQAhjQEAALABjQEiDgUAAKgBACAaAAC0AQAgGwAAtAEAIHMBAAAAAXQBAAAABXUBAAAABXYBAAAAAXcBAAAAAXgBAAAAAXkBAAAAAXoBALMBACF7AQAAAAF8AQAAAAF9AQAAAAEHBQAAnQEAIBoAALIBACAbAACyAQAgcwAAAI0BAnQAAACNAQh1AAAAjQEIegAAsQGNASIHBQAAnQEAIBoAALIBACAbAACyAQAgcwAAAI0BAnQAAACNAQh1AAAAjQEIegAAsQGNASIEcwAAAI0BAnQAAACNAQh1AAAAjQEIegAAsgGNASIOBQAAqAEAIBoAALQBACAbAAC0AQAgcwEAAAABdAEAAAAFdQEAAAAFdgEAAAABdwEAAAABeAEAAAABeQEAAAABegEAswEAIXsBAAAAAXwBAAAAAX0BAAAAAQtzAQAAAAF0AQAAAAV1AQAAAAV2AQAAAAF3AQAAAAF4AQAAAAF5AQAAAAF6AQC0AQAhewEAAAABfAEAAAABfQEAAAABCW4AALUBADBvAABRABBwAAC1AQAwfgEAogEAIX8BAKIBACGJAQEAtgEAIYoBQACjAQAhiwFAAKMBACGNAQAAtwGNASILcwEAAAABdAEAAAAFdQEAAAAFdgEAAAABdwEAAAABeAEAAAABeQEAAAABegEAtAEAIXsBAAAAAXwBAAAAAX0BAAAAAQRzAAAAjQECdAAAAI0BCHUAAACNAQh6AACyAY0BIgtuAAC4AQAwbwAASwAQcAAAuAEAMHEBAJoBACGBAUAAmwEAIY4BAQCaAQAhjwEBAJoBACGRAQAAuQGRASKSAQIAugEAIZMBAAC7AQAglAFAAJsBACEHBQAAnQEAIBoAAMABACAbAADAAQAgcwAAAJEBAnQAAACRAQh1AAAAkQEIegAAvwGRASINBQAAqAEAIBgAAL4BACAZAACoAQAgGgAAqAEAIBsAAKgBACBzAgAAAAF0AgAAAAV1AgAAAAV2AgAAAAF3AgAAAAF4AgAAAAF5AgAAAAF6AgC9AQAhDwUAAKgBACAaAAC8AQAgGwAAvAEAIHOAAAAAAXaAAAAAAXeAAAAAAXiAAAAAAXmAAAAAAXqAAAAAAYMBAQAAAAGEAQEAAAABhQEBAAAAAYYBgAAAAAGHAYAAAAABiAGAAAAAAQxzgAAAAAF2gAAAAAF3gAAAAAF4gAAAAAF5gAAAAAF6gAAAAAGDAQEAAAABhAEBAAAAAYUBAQAAAAGGAYAAAAABhwGAAAAAAYgBgAAAAAENBQAAqAEAIBgAAL4BACAZAACoAQAgGgAAqAEAIBsAAKgBACBzAgAAAAF0AgAAAAV1AgAAAAV2AgAAAAF3AgAAAAF4AgAAAAF5AgAAAAF6AgC9AQAhCHMIAAAAAXQIAAAABXUIAAAABXYIAAAAAXcIAAAAAXgIAAAAAXkIAAAAAXoIAL4BACEHBQAAnQEAIBoAAMABACAbAADAAQAgcwAAAJEBAnQAAACRAQh1AAAAkQEIegAAvwGRASIEcwAAAJEBAnQAAACRAQh1AAAAkQEIegAAwAGRASILbgAAwQEAMG8AADgAEHAAAMEBADBxAQCiAQAhgQFAAKMBACGOAQEAogEAIY8BAQCiAQAhkQEAAMIBkQEikgECAMMBACGTAQAAxAEAIJQBQACjAQAhBHMAAACRAQJ0AAAAkQEIdQAAAJEBCHoAAMABkQEiCHMCAAAAAXQCAAAABXUCAAAABXYCAAAAAXcCAAAAAXgCAAAAAXkCAAAAAXoCAKgBACEMc4AAAAABdoAAAAABd4AAAAABeIAAAAABeYAAAAABeoAAAAABgwEBAAAAAYQBAQAAAAGFAQEAAAABhgGAAAAAAYcBgAAAAAGIAYAAAAABEW4AAMUBADBvAAAyABBwAADFAQAwfgEAmgEAIYEBQACbAQAhiQEBAK8BACGOAQEAmgEAIZEBAADHAZoBIpUBAQCaAQAhlgFAAJsBACGXAUAAmwEAIZgBIADGAQAhmgFAAKYBACGbAQIAyAEAIZwBQACmAQAhnQECAMgBACGeAUAAmwEAIQUFAACdAQAgGgAAzgEAIBsAAM4BACBzIAAAAAF6IADNAQAhBwUAAJ0BACAaAADMAQAgGwAAzAEAIHMAAACaAQJ0AAAAmgEIdQAAAJoBCHoAAMsBmgEiDQUAAJ0BACAYAADKAQAgGQAAnQEAIBoAAJ0BACAbAACdAQAgcwIAAAABdAIAAAAEdQIAAAAEdgIAAAABdwIAAAABeAIAAAABeQIAAAABegIAyQEAIQ0FAACdAQAgGAAAygEAIBkAAJ0BACAaAACdAQAgGwAAnQEAIHMCAAAAAXQCAAAABHUCAAAABHYCAAAAAXcCAAAAAXgCAAAAAXkCAAAAAXoCAMkBACEIcwgAAAABdAgAAAAEdQgAAAAEdggAAAABdwgAAAABeAgAAAABeQgAAAABeggAygEAIQcFAACdAQAgGgAAzAEAIBsAAMwBACBzAAAAmgECdAAAAJoBCHUAAACaAQh6AADLAZoBIgRzAAAAmgECdAAAAJoBCHUAAACaAQh6AADMAZoBIgUFAACdAQAgGgAAzgEAIBsAAM4BACBzIAAAAAF6IADNAQAhAnMgAAAAAXogAM4BACEKbgAAzwEAMG8AABwAEHAAAM8BADB-AQCaAQAhgQFAAJsBACGdAQIAyAEAIaABAADQAaABIqEBAQCaAQAhogECAMgBACGjAQIAyAEAIQcFAACdAQAgGgAA0gEAIBsAANIBACBzAAAAoAECdAAAAKABCHUAAACgAQh6AADRAaABIgcFAACdAQAgGgAA0gEAIBsAANIBACBzAAAAoAECdAAAAKABCHUAAACgAQh6AADRAaABIgRzAAAAoAECdAAAAKABCHUAAACgAQh6AADSAaABIgsEAADWAQAgbgAA0wEAMG8AAAkAEHAAANMBADB-AQCiAQAhgQFAAKMBACGdAQIA1QEAIaABAADUAaABIqEBAQCiAQAhogECANUBACGjAQIA1QEAIQRzAAAAoAECdAAAAKABCHUAAACgAQh6AADSAaABIghzAgAAAAF0AgAAAAR1AgAAAAR2AgAAAAF3AgAAAAF4AgAAAAF5AgAAAAF6AgCdAQAhA6QBAAADACClAQAAAwAgpgEAAAMAIBIDAADaAQAgbgAA1wEAMG8AAAMAEHAAANcBADB-AQCiAQAhgQFAAKMBACGJAQEAtgEAIY4BAQCiAQAhkQEAANkBmgEilQEBAKIBACGWAUAAowEAIZcBQACjAQAhmAEgANgBACGaAUAArQEAIZsBAgDVAQAhnAFAAK0BACGdAQIA1QEAIZ4BQACjAQAhAnMgAAAAAXogAM4BACEEcwAAAJoBAnQAAACaAQh1AAAAmgEIegAAzAGaASINBAAA1gEAIG4AANMBADBvAAAJABBwAADTAQAwfgEAogEAIYEBQACjAQAhnQECANUBACGgAQAA1AGgASKhAQEAogEAIaIBAgDVAQAhowECANUBACGnAQAACQAgqAEAAAkAIAAAAAGsAQEAAAABAawBQAAAAAEAAAAAAawBQAAAAAEAAAABrAEBAAAAAQGsAQAAAI0BAgAAAAAAAawBAAAAkQECBawBAgAAAAGyAQIAAAABswECAAAAAbQBAgAAAAG1AQIAAAABAAAAAAABrAEgAAAAAQGsAQAAAJoBAgWsAQIAAAABsgECAAAAAbMBAgAAAAG0AQIAAAABtQECAAAAAQUSAACSAgAgEwAAlQIAIKkBAACTAgAgqgEAAJQCACCvAQAAAQAgAxIAAJICACCpAQAAkwIAIK8BAAABACAAAAAAAAGsAQAAAKABAgsSAACCAgAwEwAAhwIAMKkBAACDAgAwqgEAAIQCADCrAQAAhQIAIKwBAACGAgAwrQEAAIYCADCuAQAAhgIAMK8BAACGAgAwsAEAAIgCADCxAQAAiQIAMA1-AQAAAAGBAUAAAAABiQEBAAAAAY4BAQAAAAGRAQAAAJoBApYBQAAAAAGXAUAAAAABmAEgAAAAAZoBQAAAAAGbAQIAAAABnAFAAAAAAZ0BAgAAAAGeAUAAAAABAgAAAAUAIBIAAI0CACADAAAABQAgEgAAjQIAIBMAAIwCACABCwAAkQIAMBIDAADaAQAgbgAA1wEAMG8AAAMAEHAAANcBADB-AQAAAAGBAUAAowEAIYkBAQAAAAGOAQEAogEAIZEBAADZAZoBIpUBAQCiAQAhlgFAAKMBACGXAUAAowEAIZgBIADYAQAhmgFAAK0BACGbAQIA1QEAIZwBQACtAQAhnQECANUBACGeAUAAowEAIQIAAAAFACALAACMAgAgAgAAAIoCACALAACLAgAgEW4AAIkCADBvAACKAgAQcAAAiQIAMH4BAKIBACGBAUAAowEAIYkBAQC2AQAhjgEBAKIBACGRAQAA2QGaASKVAQEAogEAIZYBQACjAQAhlwFAAKMBACGYASAA2AEAIZoBQACtAQAhmwECANUBACGcAUAArQEAIZ0BAgDVAQAhngFAAKMBACERbgAAiQIAMG8AAIoCABBwAACJAgAwfgEAogEAIYEBQACjAQAhiQEBALYBACGOAQEAogEAIZEBAADZAZoBIpUBAQCiAQAhlgFAAKMBACGXAUAAowEAIZgBIADYAQAhmgFAAK0BACGbAQIA1QEAIZwBQACtAQAhnQECANUBACGeAUAAowEAIQ1-AQDeAQAhgQFAAN8BACGJAQEA6AEAIY4BAQDeAQAhkQEAAPcBmgEilgFAAN8BACGXAUAA3wEAIZgBIAD2AQAhmgFAAOQBACGbAQIA-AEAIZwBQADkAQAhnQECAPgBACGeAUAA3wEAIQ1-AQDeAQAhgQFAAN8BACGJAQEA6AEAIY4BAQDeAQAhkQEAAPcBmgEilgFAAN8BACGXAUAA3wEAIZgBIAD2AQAhmgFAAOQBACGbAQIA-AEAIZwBQADkAQAhnQECAPgBACGeAUAA3wEAIQ1-AQAAAAGBAUAAAAABiQEBAAAAAY4BAQAAAAGRAQAAAJoBApYBQAAAAAGXAUAAAAABmAEgAAAAAZoBQAAAAAGbAQIAAAABnAFAAAAAAZ0BAgAAAAGeAUAAAAABBBIAAIICADCpAQAAgwIAMKsBAACFAgAgrwEAAIYCADAAAQQAAI8CACANfgEAAAABgQFAAAAAAYkBAQAAAAGOAQEAAAABkQEAAACaAQKWAUAAAAABlwFAAAAAAZgBIAAAAAGaAUAAAAABmwECAAAAAZwBQAAAAAGdAQIAAAABngFAAAAAAQd-AQAAAAGBAUAAAAABnQECAAAAAaABAAAAoAECoQEBAAAAAaIBAgAAAAGjAQIAAAABAgAAAAEAIBIAAJICACADAAAACQAgEgAAkgIAIBMAAJYCACAJAAAACQAgCwAAlgIAIH4BAN4BACGBAUAA3wEAIZ0BAgD4AQAhoAEAAIACoAEioQEBAN4BACGiAQIA-AEAIaMBAgD4AQAhB34BAN4BACGBAUAA3wEAIZ0BAgD4AQAhoAEAAIACoAEioQEBAN4BACGiAQIA-AEAIaMBAgD4AQAhAgQGAgUAAwEDAAEBBAcAAAAABQUACBgACRkAChoACxsADAAAAAAABQUACBgACRkAChoACxsADAEDAAEBAwABBQUAERgAEhkAExoAFBsAFQAAAAAABQUAERgAEhkAExoAFBsAFQAAAAUFABsYABwZAB0aAB4bAB8AAAAAAAUFABsYABwZAB0aAB4bAB8AAAADBQAlGgAmGwAnAAAAAwUAJRoAJhsAJwAAAAMFAC0aAC4bAC8AAAADBQAtGgAuGwAvAAAAAwUANRoANhsANwAAAAMFADUaADYbADcGAgEHCAEICwEJDAEKDQEMDwENEQQOEgUPFAEQFgQRFwYUGAEVGQEWGgQcHQcdHg0eHwIfIAIgIQIhIgIiIwIjJQIkJwQlKA4mKgInLAQoLQ8pLgIqLwIrMAQsMxAtNBYuNhcvNxcwOhcxOxcyPBczPhc0QAQ1QRg2Qxc3RQQ4Rhk5Rxc6SBc7SQQ8TBo9TSA-TyE_UCFAUyFBVCFCVSFDVyFEWQRFWiJGXCFHXgRIXyNJYCFKYSFLYgRMZSRNZihOaClPaSlQbClRbSlSbilTcClUcgRVcypWdSlXdwRYeCtZeSlaeilbewRcfixdfzBegQExX4IBMWCFATFhhgExYocBMWOJATFkiwEEZYwBMmaOATFnkAEEaJEBM2mSATFqkwExa5QBBGyXATRtmAE4"
+ }
+ 
+ async function decodeBase64AsWasm(wasmBase64: string): Promise<WebAssembly.Module> {
+diff --git a/src/generated/prisma/internal/prismaNamespace.ts b/src/generated/prisma/internal/prismaNamespace.ts
+index da222e4..93fb761 100644
+--- a/src/generated/prisma/internal/prismaNamespace.ts
++++ b/src/generated/prisma/internal/prismaNamespace.ts
+@@ -927,6 +927,7 @@ export const BookingScalarFieldEnum = {
+   exclusive: 'exclusive',
+   status: 'status',
+   holdExpiresAt: 'holdExpiresAt',
++  amountCents: 'amountCents',
+   paymentId: 'paymentId',
+   paymentLastEventAt: 'paymentLastEventAt',
+   version: 'version',
+diff --git a/src/generated/prisma/internal/prismaNamespaceBrowser.ts b/src/generated/prisma/internal/prismaNamespaceBrowser.ts
+index 221a4c0..5032df0 100644
+--- a/src/generated/prisma/internal/prismaNamespaceBrowser.ts
++++ b/src/generated/prisma/internal/prismaNamespaceBrowser.ts
+@@ -97,6 +97,7 @@ export const BookingScalarFieldEnum = {
+   exclusive: 'exclusive',
+   status: 'status',
+   holdExpiresAt: 'holdExpiresAt',
++  amountCents: 'amountCents',
+   paymentId: 'paymentId',
+   paymentLastEventAt: 'paymentLastEventAt',
+   version: 'version',
+diff --git a/src/generated/prisma/models/Booking.ts b/src/generated/prisma/models/Booking.ts
+index 8550ee6..9c3546e 100644
+--- a/src/generated/prisma/models/Booking.ts
++++ b/src/generated/prisma/models/Booking.ts
+@@ -27,10 +27,12 @@ export type AggregateBooking = {
+ }
+ 
+ export type BookingAvgAggregateOutputType = {
++  amountCents: number | null
+   version: number | null
+ }
+ 
+ export type BookingSumAggregateOutputType = {
++  amountCents: number | null
+   version: number | null
+ }
+ 
+@@ -43,6 +45,7 @@ export type BookingMinAggregateOutputType = {
+   exclusive: boolean | null
+   status: $Enums.BookingStatus | null
+   holdExpiresAt: Date | null
++  amountCents: number | null
+   paymentId: string | null
+   paymentLastEventAt: Date | null
+   version: number | null
+@@ -59,6 +62,7 @@ export type BookingMaxAggregateOutputType = {
+   exclusive: boolean | null
+   status: $Enums.BookingStatus | null
+   holdExpiresAt: Date | null
++  amountCents: number | null
+   paymentId: string | null
+   paymentLastEventAt: Date | null
+   version: number | null
+@@ -75,6 +79,7 @@ export type BookingCountAggregateOutputType = {
+   exclusive: number
+   status: number
+   holdExpiresAt: number
++  amountCents: number
+   paymentId: number
+   paymentLastEventAt: number
+   version: number
+@@ -85,10 +90,12 @@ export type BookingCountAggregateOutputType = {
+ 
+ 
+ export type BookingAvgAggregateInputType = {
++  amountCents?: true
+   version?: true
+ }
+ 
+ export type BookingSumAggregateInputType = {
++  amountCents?: true
+   version?: true
+ }
+ 
+@@ -101,6 +108,7 @@ export type BookingMinAggregateInputType = {
+   exclusive?: true
+   status?: true
+   holdExpiresAt?: true
++  amountCents?: true
+   paymentId?: true
+   paymentLastEventAt?: true
+   version?: true
+@@ -117,6 +125,7 @@ export type BookingMaxAggregateInputType = {
+   exclusive?: true
+   status?: true
+   holdExpiresAt?: true
++  amountCents?: true
+   paymentId?: true
+   paymentLastEventAt?: true
+   version?: true
+@@ -133,6 +142,7 @@ export type BookingCountAggregateInputType = {
+   exclusive?: true
+   status?: true
+   holdExpiresAt?: true
++  amountCents?: true
+   paymentId?: true
+   paymentLastEventAt?: true
+   version?: true
+@@ -236,6 +246,7 @@ export type BookingGroupByOutputType = {
+   exclusive: boolean
+   status: $Enums.BookingStatus
+   holdExpiresAt: Date | null
++  amountCents: number
+   paymentId: string | null
+   paymentLastEventAt: Date | null
+   version: number
+@@ -275,6 +286,7 @@ export type BookingWhereInput = {
+   exclusive?: Prisma.BoolFilter<"Booking"> | boolean
+   status?: Prisma.EnumBookingStatusFilter<"Booking"> | $Enums.BookingStatus
+   holdExpiresAt?: Prisma.DateTimeNullableFilter<"Booking"> | Date | string | null
++  amountCents?: Prisma.IntFilter<"Booking"> | number
+   paymentId?: Prisma.StringNullableFilter<"Booking"> | string | null
+   paymentLastEventAt?: Prisma.DateTimeNullableFilter<"Booking"> | Date | string | null
+   version?: Prisma.IntFilter<"Booking"> | number
+@@ -292,6 +304,7 @@ export type BookingOrderByWithRelationInput = {
+   exclusive?: Prisma.SortOrder
+   status?: Prisma.SortOrder
+   holdExpiresAt?: Prisma.SortOrderInput | Prisma.SortOrder
++  amountCents?: Prisma.SortOrder
+   paymentId?: Prisma.SortOrderInput | Prisma.SortOrder
+   paymentLastEventAt?: Prisma.SortOrderInput | Prisma.SortOrder
+   version?: Prisma.SortOrder
+@@ -313,6 +326,7 @@ export type BookingWhereUniqueInput = Prisma.AtLeast<{
+   exclusive?: Prisma.BoolFilter<"Booking"> | boolean
+   status?: Prisma.EnumBookingStatusFilter<"Booking"> | $Enums.BookingStatus
+   holdExpiresAt?: Prisma.DateTimeNullableFilter<"Booking"> | Date | string | null
++  amountCents?: Prisma.IntFilter<"Booking"> | number
+   paymentLastEventAt?: Prisma.DateTimeNullableFilter<"Booking"> | Date | string | null
+   version?: Prisma.IntFilter<"Booking"> | number
+   createdAt?: Prisma.DateTimeFilter<"Booking"> | Date | string
+@@ -329,6 +343,7 @@ export type BookingOrderByWithAggregationInput = {
+   exclusive?: Prisma.SortOrder
+   status?: Prisma.SortOrder
+   holdExpiresAt?: Prisma.SortOrderInput | Prisma.SortOrder
++  amountCents?: Prisma.SortOrder
+   paymentId?: Prisma.SortOrderInput | Prisma.SortOrder
+   paymentLastEventAt?: Prisma.SortOrderInput | Prisma.SortOrder
+   version?: Prisma.SortOrder
+@@ -353,6 +368,7 @@ export type BookingScalarWhereWithAggregatesInput = {
+   exclusive?: Prisma.BoolWithAggregatesFilter<"Booking"> | boolean
+   status?: Prisma.EnumBookingStatusWithAggregatesFilter<"Booking"> | $Enums.BookingStatus
+   holdExpiresAt?: Prisma.DateTimeNullableWithAggregatesFilter<"Booking"> | Date | string | null
++  amountCents?: Prisma.IntWithAggregatesFilter<"Booking"> | number
+   paymentId?: Prisma.StringNullableWithAggregatesFilter<"Booking"> | string | null
+   paymentLastEventAt?: Prisma.DateTimeNullableWithAggregatesFilter<"Booking"> | Date | string | null
+   version?: Prisma.IntWithAggregatesFilter<"Booking"> | number
+@@ -368,6 +384,7 @@ export type BookingCreateInput = {
+   exclusive: boolean
+   status?: $Enums.BookingStatus
+   holdExpiresAt?: Date | string | null
++  amountCents?: number
+   paymentId?: string | null
+   paymentLastEventAt?: Date | string | null
+   version?: number
+@@ -385,6 +402,7 @@ export type BookingUncheckedCreateInput = {
+   exclusive: boolean
+   status?: $Enums.BookingStatus
+   holdExpiresAt?: Date | string | null
++  amountCents?: number
+   paymentId?: string | null
+   paymentLastEventAt?: Date | string | null
+   version?: number
+@@ -400,6 +418,7 @@ export type BookingUpdateInput = {
+   exclusive?: Prisma.BoolFieldUpdateOperationsInput | boolean
+   status?: Prisma.EnumBookingStatusFieldUpdateOperationsInput | $Enums.BookingStatus
+   holdExpiresAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
++  amountCents?: Prisma.IntFieldUpdateOperationsInput | number
+   paymentId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+   paymentLastEventAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
+   version?: Prisma.IntFieldUpdateOperationsInput | number
+@@ -417,6 +436,7 @@ export type BookingUncheckedUpdateInput = {
+   exclusive?: Prisma.BoolFieldUpdateOperationsInput | boolean
+   status?: Prisma.EnumBookingStatusFieldUpdateOperationsInput | $Enums.BookingStatus
+   holdExpiresAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
++  amountCents?: Prisma.IntFieldUpdateOperationsInput | number
+   paymentId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+   paymentLastEventAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
+   version?: Prisma.IntFieldUpdateOperationsInput | number
+@@ -433,6 +453,7 @@ export type BookingCreateManyInput = {
+   exclusive: boolean
+   status?: $Enums.BookingStatus
+   holdExpiresAt?: Date | string | null
++  amountCents?: number
+   paymentId?: string | null
+   paymentLastEventAt?: Date | string | null
+   version?: number
+@@ -448,6 +469,7 @@ export type BookingUpdateManyMutationInput = {
+   exclusive?: Prisma.BoolFieldUpdateOperationsInput | boolean
+   status?: Prisma.EnumBookingStatusFieldUpdateOperationsInput | $Enums.BookingStatus
+   holdExpiresAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
++  amountCents?: Prisma.IntFieldUpdateOperationsInput | number
+   paymentId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+   paymentLastEventAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
+   version?: Prisma.IntFieldUpdateOperationsInput | number
+@@ -464,6 +486,7 @@ export type BookingUncheckedUpdateManyInput = {
+   exclusive?: Prisma.BoolFieldUpdateOperationsInput | boolean
+   status?: Prisma.EnumBookingStatusFieldUpdateOperationsInput | $Enums.BookingStatus
+   holdExpiresAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
++  amountCents?: Prisma.IntFieldUpdateOperationsInput | number
+   paymentId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+   paymentLastEventAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
+   version?: Prisma.IntFieldUpdateOperationsInput | number
+@@ -490,6 +513,7 @@ export type BookingCountOrderByAggregateInput = {
+   exclusive?: Prisma.SortOrder
+   status?: Prisma.SortOrder
+   holdExpiresAt?: Prisma.SortOrder
++  amountCents?: Prisma.SortOrder
+   paymentId?: Prisma.SortOrder
+   paymentLastEventAt?: Prisma.SortOrder
+   version?: Prisma.SortOrder
+@@ -498,6 +522,7 @@ export type BookingCountOrderByAggregateInput = {
+ }
+ 
+ export type BookingAvgOrderByAggregateInput = {
++  amountCents?: Prisma.SortOrder
+   version?: Prisma.SortOrder
+ }
+ 
+@@ -510,6 +535,7 @@ export type BookingMaxOrderByAggregateInput = {
+   exclusive?: Prisma.SortOrder
+   status?: Prisma.SortOrder
+   holdExpiresAt?: Prisma.SortOrder
++  amountCents?: Prisma.SortOrder
+   paymentId?: Prisma.SortOrder
+   paymentLastEventAt?: Prisma.SortOrder
+   version?: Prisma.SortOrder
+@@ -526,6 +552,7 @@ export type BookingMinOrderByAggregateInput = {
+   exclusive?: Prisma.SortOrder
+   status?: Prisma.SortOrder
+   holdExpiresAt?: Prisma.SortOrder
++  amountCents?: Prisma.SortOrder
+   paymentId?: Prisma.SortOrder
+   paymentLastEventAt?: Prisma.SortOrder
+   version?: Prisma.SortOrder
+@@ -534,6 +561,7 @@ export type BookingMinOrderByAggregateInput = {
+ }
+ 
+ export type BookingSumOrderByAggregateInput = {
++  amountCents?: Prisma.SortOrder
+   version?: Prisma.SortOrder
+ }
+ 
+@@ -603,6 +631,7 @@ export type BookingCreateWithoutResourceInput = {
+   exclusive: boolean
+   status?: $Enums.BookingStatus
+   holdExpiresAt?: Date | string | null
++  amountCents?: number
+   paymentId?: string | null
+   paymentLastEventAt?: Date | string | null
+   version?: number
+@@ -618,6 +647,7 @@ export type BookingUncheckedCreateWithoutResourceInput = {
+   exclusive: boolean
+   status?: $Enums.BookingStatus
+   holdExpiresAt?: Date | string | null
++  amountCents?: number
+   paymentId?: string | null
+   paymentLastEventAt?: Date | string | null
+   version?: number
+@@ -663,6 +693,7 @@ export type BookingScalarWhereInput = {
+   exclusive?: Prisma.BoolFilter<"Booking"> | boolean
+   status?: Prisma.EnumBookingStatusFilter<"Booking"> | $Enums.BookingStatus
+   holdExpiresAt?: Prisma.DateTimeNullableFilter<"Booking"> | Date | string | null
++  amountCents?: Prisma.IntFilter<"Booking"> | number
+   paymentId?: Prisma.StringNullableFilter<"Booking"> | string | null
+   paymentLastEventAt?: Prisma.DateTimeNullableFilter<"Booking"> | Date | string | null
+   version?: Prisma.IntFilter<"Booking"> | number
+@@ -678,6 +709,7 @@ export type BookingCreateManyResourceInput = {
+   exclusive: boolean
+   status?: $Enums.BookingStatus
+   holdExpiresAt?: Date | string | null
++  amountCents?: number
+   paymentId?: string | null
+   paymentLastEventAt?: Date | string | null
+   version?: number
+@@ -693,6 +725,7 @@ export type BookingUpdateWithoutResourceInput = {
+   exclusive?: Prisma.BoolFieldUpdateOperationsInput | boolean
+   status?: Prisma.EnumBookingStatusFieldUpdateOperationsInput | $Enums.BookingStatus
+   holdExpiresAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
++  amountCents?: Prisma.IntFieldUpdateOperationsInput | number
+   paymentId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+   paymentLastEventAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
+   version?: Prisma.IntFieldUpdateOperationsInput | number
+@@ -708,6 +741,7 @@ export type BookingUncheckedUpdateWithoutResourceInput = {
+   exclusive?: Prisma.BoolFieldUpdateOperationsInput | boolean
+   status?: Prisma.EnumBookingStatusFieldUpdateOperationsInput | $Enums.BookingStatus
+   holdExpiresAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
++  amountCents?: Prisma.IntFieldUpdateOperationsInput | number
+   paymentId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+   paymentLastEventAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
+   version?: Prisma.IntFieldUpdateOperationsInput | number
+@@ -723,6 +757,7 @@ export type BookingUncheckedUpdateManyWithoutResourceInput = {
+   exclusive?: Prisma.BoolFieldUpdateOperationsInput | boolean
+   status?: Prisma.EnumBookingStatusFieldUpdateOperationsInput | $Enums.BookingStatus
+   holdExpiresAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
++  amountCents?: Prisma.IntFieldUpdateOperationsInput | number
+   paymentId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+   paymentLastEventAt?: Prisma.NullableDateTimeFieldUpdateOperationsInput | Date | string | null
+   version?: Prisma.IntFieldUpdateOperationsInput | number
+@@ -741,6 +776,7 @@ export type BookingSelect<ExtArgs extends runtime.Types.Extensions.InternalArgs
+   exclusive?: boolean
+   status?: boolean
+   holdExpiresAt?: boolean
++  amountCents?: boolean
+   paymentId?: boolean
+   paymentLastEventAt?: boolean
+   version?: boolean
+@@ -758,6 +794,7 @@ export type BookingSelectCreateManyAndReturn<ExtArgs extends runtime.Types.Exten
+   exclusive?: boolean
+   status?: boolean
+   holdExpiresAt?: boolean
++  amountCents?: boolean
+   paymentId?: boolean
+   paymentLastEventAt?: boolean
+   version?: boolean
+@@ -775,6 +812,7 @@ export type BookingSelectUpdateManyAndReturn<ExtArgs extends runtime.Types.Exten
+   exclusive?: boolean
+   status?: boolean
+   holdExpiresAt?: boolean
++  amountCents?: boolean
+   paymentId?: boolean
+   paymentLastEventAt?: boolean
+   version?: boolean
+@@ -792,6 +830,7 @@ export type BookingSelectScalar = {
+   exclusive?: boolean
+   status?: boolean
+   holdExpiresAt?: boolean
++  amountCents?: boolean
+   paymentId?: boolean
+   paymentLastEventAt?: boolean
+   version?: boolean
+@@ -799,7 +838,7 @@ export type BookingSelectScalar = {
+   updatedAt?: boolean
+ }
+ 
+-export type BookingOmit<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = runtime.Types.Extensions.GetOmit<"id" | "resourceId" | "userId" | "startsAt" | "endsAt" | "exclusive" | "status" | "holdExpiresAt" | "paymentId" | "paymentLastEventAt" | "version" | "createdAt" | "updatedAt", ExtArgs["result"]["booking"]>
++export type BookingOmit<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = runtime.Types.Extensions.GetOmit<"id" | "resourceId" | "userId" | "startsAt" | "endsAt" | "exclusive" | "status" | "holdExpiresAt" | "amountCents" | "paymentId" | "paymentLastEventAt" | "version" | "createdAt" | "updatedAt", ExtArgs["result"]["booking"]>
+ export type BookingInclude<ExtArgs extends runtime.Types.Extensions.InternalArgs = runtime.Types.Extensions.DefaultArgs> = {
+   resource?: boolean | Prisma.ResourceDefaultArgs<ExtArgs>
+ }
+@@ -827,6 +866,7 @@ export type $BookingPayload<ExtArgs extends runtime.Types.Extensions.InternalArg
+     exclusive: boolean
+     status: $Enums.BookingStatus
+     holdExpiresAt: Date | null
++    amountCents: number
+     paymentId: string | null
+     /**
+      * Provider timestamp of the last payment event applied; older events are stale.
+@@ -1267,6 +1307,7 @@ export interface BookingFieldRefs {
+   readonly exclusive: Prisma.FieldRef<"Booking", 'Boolean'>
+   readonly status: Prisma.FieldRef<"Booking", 'BookingStatus'>
+   readonly holdExpiresAt: Prisma.FieldRef<"Booking", 'DateTime'>
++  readonly amountCents: Prisma.FieldRef<"Booking", 'Int'>
+   readonly paymentId: Prisma.FieldRef<"Booking", 'String'>
+   readonly paymentLastEventAt: Prisma.FieldRef<"Booking", 'DateTime'>
+   readonly version: Prisma.FieldRef<"Booking", 'Int'>
+diff --git a/src/generated/prisma/models/PaymentEvent.ts b/src/generated/prisma/models/PaymentEvent.ts
+index ac183bf..28f30c2 100644
+--- a/src/generated/prisma/models/PaymentEvent.ts
++++ b/src/generated/prisma/models/PaymentEvent.ts
+@@ -155,7 +155,7 @@ export type PaymentEventGroupByArgs<ExtArgs extends runtime.Types.Extensions.Int
+ 
+ export type PaymentEventGroupByOutputType = {
+   id: string
+-  paymentId: string
++  paymentId: string | null
+   type: string
+   providerCreatedAt: Date
+   receivedAt: Date
+@@ -185,7 +185,7 @@ export type PaymentEventWhereInput = {
+   OR?: Prisma.PaymentEventWhereInput[]
+   NOT?: Prisma.PaymentEventWhereInput | Prisma.PaymentEventWhereInput[]
+   id?: Prisma.StringFilter<"PaymentEvent"> | string
+-  paymentId?: Prisma.StringFilter<"PaymentEvent"> | string
++  paymentId?: Prisma.StringNullableFilter<"PaymentEvent"> | string | null
+   type?: Prisma.StringFilter<"PaymentEvent"> | string
+   providerCreatedAt?: Prisma.DateTimeFilter<"PaymentEvent"> | Date | string
+   receivedAt?: Prisma.DateTimeFilter<"PaymentEvent"> | Date | string
+@@ -194,7 +194,7 @@ export type PaymentEventWhereInput = {
+ 
+ export type PaymentEventOrderByWithRelationInput = {
+   id?: Prisma.SortOrder
+-  paymentId?: Prisma.SortOrder
++  paymentId?: Prisma.SortOrderInput | Prisma.SortOrder
+   type?: Prisma.SortOrder
+   providerCreatedAt?: Prisma.SortOrder
+   receivedAt?: Prisma.SortOrder
+@@ -206,7 +206,7 @@ export type PaymentEventWhereUniqueInput = Prisma.AtLeast<{
+   AND?: Prisma.PaymentEventWhereInput | Prisma.PaymentEventWhereInput[]
+   OR?: Prisma.PaymentEventWhereInput[]
+   NOT?: Prisma.PaymentEventWhereInput | Prisma.PaymentEventWhereInput[]
+-  paymentId?: Prisma.StringFilter<"PaymentEvent"> | string
++  paymentId?: Prisma.StringNullableFilter<"PaymentEvent"> | string | null
+   type?: Prisma.StringFilter<"PaymentEvent"> | string
+   providerCreatedAt?: Prisma.DateTimeFilter<"PaymentEvent"> | Date | string
+   receivedAt?: Prisma.DateTimeFilter<"PaymentEvent"> | Date | string
+@@ -215,7 +215,7 @@ export type PaymentEventWhereUniqueInput = Prisma.AtLeast<{
+ 
+ export type PaymentEventOrderByWithAggregationInput = {
+   id?: Prisma.SortOrder
+-  paymentId?: Prisma.SortOrder
++  paymentId?: Prisma.SortOrderInput | Prisma.SortOrder
+   type?: Prisma.SortOrder
+   providerCreatedAt?: Prisma.SortOrder
+   receivedAt?: Prisma.SortOrder
+@@ -230,7 +230,7 @@ export type PaymentEventScalarWhereWithAggregatesInput = {
+   OR?: Prisma.PaymentEventScalarWhereWithAggregatesInput[]
+   NOT?: Prisma.PaymentEventScalarWhereWithAggregatesInput | Prisma.PaymentEventScalarWhereWithAggregatesInput[]
+   id?: Prisma.StringWithAggregatesFilter<"PaymentEvent"> | string
+-  paymentId?: Prisma.StringWithAggregatesFilter<"PaymentEvent"> | string
++  paymentId?: Prisma.StringNullableWithAggregatesFilter<"PaymentEvent"> | string | null
+   type?: Prisma.StringWithAggregatesFilter<"PaymentEvent"> | string
+   providerCreatedAt?: Prisma.DateTimeWithAggregatesFilter<"PaymentEvent"> | Date | string
+   receivedAt?: Prisma.DateTimeWithAggregatesFilter<"PaymentEvent"> | Date | string
+@@ -239,7 +239,7 @@ export type PaymentEventScalarWhereWithAggregatesInput = {
+ 
+ export type PaymentEventCreateInput = {
+   id: string
+-  paymentId: string
++  paymentId?: string | null
+   type: string
+   providerCreatedAt: Date | string
+   receivedAt?: Date | string
+@@ -248,7 +248,7 @@ export type PaymentEventCreateInput = {
+ 
+ export type PaymentEventUncheckedCreateInput = {
+   id: string
+-  paymentId: string
++  paymentId?: string | null
+   type: string
+   providerCreatedAt: Date | string
+   receivedAt?: Date | string
+@@ -257,7 +257,7 @@ export type PaymentEventUncheckedCreateInput = {
+ 
+ export type PaymentEventUpdateInput = {
+   id?: Prisma.StringFieldUpdateOperationsInput | string
+-  paymentId?: Prisma.StringFieldUpdateOperationsInput | string
++  paymentId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+   type?: Prisma.StringFieldUpdateOperationsInput | string
+   providerCreatedAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
+   receivedAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
+@@ -266,7 +266,7 @@ export type PaymentEventUpdateInput = {
+ 
+ export type PaymentEventUncheckedUpdateInput = {
+   id?: Prisma.StringFieldUpdateOperationsInput | string
+-  paymentId?: Prisma.StringFieldUpdateOperationsInput | string
++  paymentId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+   type?: Prisma.StringFieldUpdateOperationsInput | string
+   providerCreatedAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
+   receivedAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
+@@ -275,7 +275,7 @@ export type PaymentEventUncheckedUpdateInput = {
+ 
+ export type PaymentEventCreateManyInput = {
+   id: string
+-  paymentId: string
++  paymentId?: string | null
+   type: string
+   providerCreatedAt: Date | string
+   receivedAt?: Date | string
+@@ -284,7 +284,7 @@ export type PaymentEventCreateManyInput = {
+ 
+ export type PaymentEventUpdateManyMutationInput = {
+   id?: Prisma.StringFieldUpdateOperationsInput | string
+-  paymentId?: Prisma.StringFieldUpdateOperationsInput | string
++  paymentId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+   type?: Prisma.StringFieldUpdateOperationsInput | string
+   providerCreatedAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
+   receivedAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
+@@ -293,7 +293,7 @@ export type PaymentEventUpdateManyMutationInput = {
+ 
+ export type PaymentEventUncheckedUpdateManyInput = {
+   id?: Prisma.StringFieldUpdateOperationsInput | string
+-  paymentId?: Prisma.StringFieldUpdateOperationsInput | string
++  paymentId?: Prisma.NullableStringFieldUpdateOperationsInput | string | null
+   type?: Prisma.StringFieldUpdateOperationsInput | string
+   providerCreatedAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
+   receivedAt?: Prisma.DateTimeFieldUpdateOperationsInput | Date | string
+@@ -376,7 +376,7 @@ export type $PaymentEventPayload<ExtArgs extends runtime.Types.Extensions.Intern
+   objects: {}
+   scalars: runtime.Types.Extensions.GetPayloadResult<{
+     id: string
+-    paymentId: string
++    paymentId: string | null
+     type: string
+     providerCreatedAt: Date
+     receivedAt: Date
+diff --git a/src/main.ts b/src/main.ts
+index 46ce8b0..0de54ce 100644
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -10,7 +10,7 @@ export async function createApp(config?: Config): Promise<NestFastifyApplication
+   const app = await NestFactory.create<NestFastifyApplication>(
+     AppModule.forRoot(config),
+     new FastifyAdapter({ trustProxy: true }),
+-    { bufferLogs: true },
++    { bufferLogs: true, rawBody: true },
+   );
+   app.useLogger(app.get(Logger));
+   app.useGlobalFilters(new HttpExceptionFilter(app.get(Logger)));
+diff --git a/src/payments/fake-psp.controller.ts b/src/payments/fake-psp.controller.ts
+new file mode 100644
+index 0000000..d19ce6e
+--- /dev/null
++++ b/src/payments/fake-psp.controller.ts
+@@ -0,0 +1,77 @@
++import { Body, Controller, HttpCode, Inject, NotFoundException, Param, Post } from '@nestjs/common';
++import { ApiOperation, ApiTags } from '@nestjs/swagger';
++import { z } from 'zod';
++import { ZodValidationPipe } from '../common/zod-validation.pipe';
++import { type FakeOutcome, FakePaymentProvider, type SignedEvent } from './fake.provider';
++import { PAYMENT_PROVIDER, type PaymentProvider } from './payment.provider';
++import { type AppliedEvent, PaymentEventsService } from './payment-events.service';
++
++const paySchema = z.object({
++  outcome: z.enum(['succeeded', 'canceled']).default('succeeded'),
++  /** `stripe` is the order Stripe creates them in; `reversed` and `shuffled` are the bad days. */
++  order: z.enum(['stripe', 'reversed', 'shuffled']).default('shuffled'),
++  /** Deliver the final event twice, as a retrying provider would. */
++  duplicate: z.boolean().default(true),
++});
++type Pay = z.infer<typeof paySchema>;
++
++export interface Delivery {
++  type: string;
++  createdAt: string;
++  outcome: AppliedEvent['outcome'];
++  status?: string;
++}
++
++/**
++ * The "customer paid" button of the in-process PSP (404 when Stripe is the provider): generates
++ * the signed events Stripe would send and delivers them through the same verification and
++ * application path as the real webhook — in the order you ask for, duplicates included.
++ */
++@ApiTags('fake-psp')
++@Controller('fake-psp')
++export class FakePspController {
++  constructor(
++    @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
++    private readonly events: PaymentEventsService,
++  ) {}
++
++  @Post('payments/:paymentId/pay')
++  @HttpCode(200)
++  @ApiOperation({ summary: 'Simulate the customer paying (or the intent being canceled)' })
++  async pay(
++    @Param('paymentId') paymentId: string,
++    @Body(new ZodValidationPipe(paySchema)) body: Pay,
++  ): Promise<{ delivered: Delivery[] }> {
++    if (!(this.provider instanceof FakePaymentProvider)) {
++      throw new NotFoundException({ code: 'not_found', message: 'the fake PSP is not active' });
++    }
++    const events = order(this.provider.pay(paymentId, body.outcome as FakeOutcome), body.order);
++    if (body.duplicate) {
++      const last = events.find((e) => e.type === `payment_intent.${body.outcome}`);
++      if (last) events.push(last);
++    }
++    const delivered: Delivery[] = [];
++    for (const event of events) {
++      const parsed = this.provider.constructEvent(event.payload, event.signature);
++      const result = await this.events.apply(parsed);
++      delivered.push({
++        type: event.type,
++        createdAt: event.createdAt.toISOString(),
++        outcome: result.outcome,
++        ...(result.status ? { status: result.status } : {}),
++      });
++    }
++    return { delivered };
++  }
++}
++
++function order(events: SignedEvent[], how: Pay['order']): SignedEvent[] {
++  if (how === 'stripe') return [...events];
++  if (how === 'reversed') return [...events].reverse();
++  const shuffled = [...events];
++  for (let i = shuffled.length - 1; i > 0; i -= 1) {
++    const j = Math.floor(Math.random() * (i + 1));
++    [shuffled[i], shuffled[j]] = [shuffled[j] as SignedEvent, shuffled[i] as SignedEvent];
++  }
++  return shuffled;
++}
+diff --git a/src/payments/fake.provider.ts b/src/payments/fake.provider.ts
+new file mode 100644
+index 0000000..84c6575
+--- /dev/null
++++ b/src/payments/fake.provider.ts
+@@ -0,0 +1,105 @@
++import { randomUUID } from 'node:crypto';
++import { Injectable } from '@nestjs/common';
++import Stripe from 'stripe';
++import type {
++  CreateIntentInput,
++  PaymentIntentRef,
++  PaymentProvider,
++  ProviderEvent,
++} from './payment.provider';
++import { parseStripeEvent } from './stripe.provider';
++
++export interface SignedEvent {
++  /** The JSON body exactly as it must be delivered — the signature covers these bytes. */
++  payload: string;
++  signature: string;
++  id: string;
++  type: string;
++  createdAt: Date;
++}
++
++export type FakeOutcome = 'succeeded' | 'canceled';
++
++/**
++ * An in-process PSP: intents live in memory and "paying" produces Stripe-shaped events signed
++ * with the real Stripe scheme (so the webhook endpoint runs the same verification either way).
++ * The events come with the timestamps Stripe would give them; delivering them shuffled and
++ * duplicated is the caller's job — that is the point of the exercise.
++ */
++@Injectable()
++export class FakePaymentProvider implements PaymentProvider {
++  readonly name = 'fake' as const;
++  private readonly stripe = new Stripe('sk_test_slotlock_fake');
++  private readonly intents = new Map<
++    string,
++    { bookingId: string; amountCents: number; status: string }
++  >();
++
++  constructor(private readonly webhookSecret: string) {}
++
++  async createIntent(input: CreateIntentInput): Promise<PaymentIntentRef> {
++    const id = `pi_fake_${randomUUID().replaceAll('-', '').slice(0, 24)}`;
++    this.intents.set(id, {
++      bookingId: input.bookingId,
++      amountCents: input.amountCents,
++      status: 'requires_payment_method',
++    });
++    return { id, clientSecret: `${id}_secret_fake` };
++  }
++
++  async cancelIntent(paymentId: string): Promise<void> {
++    const intent = this.intents.get(paymentId);
++    if (intent) intent.status = 'canceled';
++  }
++
++  constructEvent(rawBody: Buffer | string, signature: string | undefined): ProviderEvent {
++    return parseStripeEvent(this.stripe, rawBody, signature, this.webhookSecret);
++  }
++
++  /**
++   * What Stripe would send for a payment attempt, in the order it would create them:
++   * `payment_intent.created` at t, `payment_intent.processing` at t+1 s, then the outcome at t+2 s.
++   */
++  pay(paymentId: string, outcome: FakeOutcome, at = new Date()): SignedEvent[] {
++    const intent = this.intents.get(paymentId);
++    if (intent) intent.status = outcome;
++    const t = Math.floor(at.getTime() / 1000);
++    return [
++      this.sign(paymentId, 'payment_intent.created', t),
++      this.sign(paymentId, 'payment_intent.processing', t + 1),
++      this.sign(paymentId, `payment_intent.${outcome}`, t + 2),
++    ];
++  }
++
++  /** One signed event of any type — tests use it for stale, unknown and malformed cases. */
++  sign(
++    paymentId: string,
++    type: string,
++    createdSeconds: number,
++    id = `evt_fake_${randomUUID().replaceAll('-', '').slice(0, 24)}`,
++  ): SignedEvent {
++    const intent = this.intents.get(paymentId);
++    const payload = JSON.stringify({
++      id,
++      object: 'event',
++      type,
++      created: createdSeconds,
++      livemode: false,
++      data: {
++        object: {
++          id: paymentId,
++          object: 'payment_intent',
++          amount: intent?.amountCents ?? 0,
++          currency: 'usd',
++          status: type.replace('payment_intent.', ''),
++          metadata: intent ? { bookingId: intent.bookingId } : {},
++        },
++      },
++    });
++    const signature = this.stripe.webhooks.generateTestHeaderString({
++      payload,
++      secret: this.webhookSecret,
++    });
++    return { payload, signature, id, type, createdAt: new Date(createdSeconds * 1000) };
++  }
++}
+diff --git a/src/payments/payment-events.service.ts b/src/payments/payment-events.service.ts
+new file mode 100644
+index 0000000..efe596e
+--- /dev/null
++++ b/src/payments/payment-events.service.ts
+@@ -0,0 +1,98 @@
++import { Injectable } from '@nestjs/common';
++import { onPayment, signalOf } from '../bookings/booking.state';
++import type { Tx } from '../bookings/strategies/reserve.strategy';
++import { PG, pgCode } from '../common/errors';
++import { retryOnConflict } from '../common/retry';
++import type { BookingStatus, PaymentEventOutcome } from '../generated/prisma/enums';
++import { PrismaService } from '../prisma/prisma.service';
++import type { ProviderEvent } from './payment.provider';
++
++export interface AppliedEvent {
++  outcome: PaymentEventOutcome;
++  bookingId?: string;
++  status?: BookingStatus;
++}
++
++/**
++ * Applies provider events to bookings so that any delivery order, with any duplicates, converges
++ * on the same state (ADR 0003):
++ * - the booking row is locked for the duration, so deliveries of one payment run one at a time;
++ * - an event id seen before is a DUPLICATE, whether it arrives after or during the first delivery;
++ * - an event older than the last one applied is STALE — Stripe timestamps, not arrival, order them;
++ * - the state machine in booking.state.ts decides the rest.
++ */
++@Injectable()
++export class PaymentEventsService {
++  constructor(private readonly prisma: PrismaService) {}
++
++  async apply(event: ProviderEvent): Promise<AppliedEvent> {
++    try {
++      return await retryOnConflict(() => this.transaction(event));
++    } catch (error) {
++      // two deliveries of one event racing on a booking-less payment collide on the primary key
++      if (pgCode(error) === PG.uniqueViolation) return { outcome: 'DUPLICATE' };
++      throw error;
++    }
++  }
++
++  private transaction(event: ProviderEvent): Promise<AppliedEvent> {
++    return this.prisma.$transaction(async (tx) => {
++      const booking = event.paymentId ? await lockBooking(tx, event.paymentId) : null;
++      if (await tx.paymentEvent.findUnique({ where: { id: event.id } })) {
++        return { outcome: 'DUPLICATE' };
++      }
++      const result = await this.decide(tx, event, booking);
++      await tx.paymentEvent.create({
++        data: {
++          id: event.id,
++          paymentId: event.paymentId ?? null,
++          type: event.type,
++          providerCreatedAt: event.createdAt,
++          outcome: result.outcome,
++        },
++      });
++      return result;
++    });
++  }
++
++  private async decide(
++    tx: Tx,
++    event: ProviderEvent,
++    booking: LockedBooking | null,
++  ): Promise<AppliedEvent> {
++    if (!event.paymentId) return { outcome: 'IGNORED' };
++    if (!booking) return { outcome: 'UNKNOWN' };
++    const signal = signalOf(event.type);
++    if (!signal) return { outcome: 'IGNORED', bookingId: booking.id, status: booking.status };
++    if (booking.paymentLastEventAt && event.createdAt < booking.paymentLastEventAt) {
++      return { outcome: 'STALE', bookingId: booking.id, status: booking.status };
++    }
++    const decision = onPayment(booking.status, signal);
++    if (decision.outcome !== 'APPLIED') {
++      return { outcome: decision.outcome, bookingId: booking.id, status: booking.status };
++    }
++    await tx.booking.update({
++      where: { id: booking.id },
++      data: {
++        status: decision.next,
++        paymentLastEventAt: event.createdAt,
++        ...(decision.next === 'CONFIRMED' ? { holdExpiresAt: null } : {}),
++        version: { increment: 1 },
++      },
++    });
++    return { outcome: 'APPLIED', bookingId: booking.id, status: decision.next };
++  }
++}
++
++interface LockedBooking {
++  id: string;
++  status: BookingStatus;
++  paymentLastEventAt: Date | null;
++}
++
++async function lockBooking(tx: Tx, paymentId: string): Promise<LockedBooking | null> {
++  const rows = await tx.$queryRaw<LockedBooking[]>`
++    SELECT id, status, "paymentLastEventAt"
++    FROM bookings WHERE "paymentId" = ${paymentId} FOR UPDATE`;
++  return rows[0] ?? null;
++}
+diff --git a/src/payments/payment.provider.ts b/src/payments/payment.provider.ts
+new file mode 100644
+index 0000000..b54f405
+--- /dev/null
++++ b/src/payments/payment.provider.ts
+@@ -0,0 +1,29 @@
++/** What a payment service provider has to offer for a hold to be paid and confirmed. */
++export interface PaymentProvider {
++  readonly name: 'stripe' | 'fake';
++  createIntent(input: CreateIntentInput): Promise<PaymentIntentRef>;
++  cancelIntent(paymentId: string): Promise<void>;
++  /** Verifies the signature and parses the raw webhook body; throws InvalidSignatureError. */
++  constructEvent(rawBody: Buffer | string, signature: string | undefined): ProviderEvent;
++}
++
++export interface CreateIntentInput {
++  bookingId: string;
++  amountCents: number;
++  currency: string;
++}
++
++export interface PaymentIntentRef {
++  id: string;
++  clientSecret: string | null;
++}
++
++/** The subset of a PSP event that ordering and the state machine need; `raw` for the log. */
++export interface ProviderEvent {
++  id: string;
++  type: string;
++  paymentId: string | undefined;
++  createdAt: Date;
++}
++
++export const PAYMENT_PROVIDER = Symbol('PAYMENT_PROVIDER');
+diff --git a/src/payments/payments.module.ts b/src/payments/payments.module.ts
+new file mode 100644
+index 0000000..74d8d64
+--- /dev/null
++++ b/src/payments/payments.module.ts
+@@ -0,0 +1,40 @@
++import { Inject, Module, OnModuleInit } from '@nestjs/common';
++import { Logger } from 'nestjs-pino';
++import Stripe from 'stripe';
++import { CONFIG, type Config } from '../config';
++import { FakePaymentProvider } from './fake.provider';
++import { FakePspController } from './fake-psp.controller';
++import { PAYMENT_PROVIDER, type PaymentProvider } from './payment.provider';
++import { PaymentEventsService } from './payment-events.service';
++import { StripeProvider } from './stripe.provider';
++import { WebhooksController } from './webhooks.controller';
++
++/**
++ * Stripe when STRIPE_SECRET_KEY is set, otherwise the in-process fake — the same signed-webhook
++ * path either way. The fake PSP's endpoint answers 404 under Stripe.
++ */
++@Module({
++  controllers: [WebhooksController, FakePspController],
++  providers: [
++    PaymentEventsService,
++    {
++      provide: PAYMENT_PROVIDER,
++      inject: [CONFIG],
++      useFactory: (cfg: Config): PaymentProvider =>
++        cfg.STRIPE_SECRET_KEY
++          ? new StripeProvider(new Stripe(cfg.STRIPE_SECRET_KEY), cfg.STRIPE_WEBHOOK_SECRET)
++          : new FakePaymentProvider(cfg.STRIPE_WEBHOOK_SECRET),
++    },
++  ],
++  exports: [PAYMENT_PROVIDER, PaymentEventsService],
++})
++export class PaymentsModule implements OnModuleInit {
++  constructor(
++    @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
++    private readonly logger: Logger,
++  ) {}
++
++  onModuleInit(): void {
++    this.logger.log(`payments: ${this.provider.name} provider`, PaymentsModule.name);
++  }
++}
+diff --git a/src/payments/stripe.provider.ts b/src/payments/stripe.provider.ts
+new file mode 100644
+index 0000000..845c958
+--- /dev/null
++++ b/src/payments/stripe.provider.ts
+@@ -0,0 +1,62 @@
++import { Injectable } from '@nestjs/common';
++import Stripe from 'stripe';
++import { InvalidSignatureError } from '../common/errors';
++import type {
++  CreateIntentInput,
++  PaymentIntentRef,
++  PaymentProvider,
++  ProviderEvent,
++} from './payment.provider';
++
++/** Stripe PaymentIntents and signed webhooks; the only file that talks to Stripe's API. */
++@Injectable()
++export class StripeProvider implements PaymentProvider {
++  readonly name = 'stripe' as const;
++
++  constructor(
++    private readonly stripe: Stripe,
++    private readonly webhookSecret: string,
++  ) {}
++
++  async createIntent(input: CreateIntentInput): Promise<PaymentIntentRef> {
++    const intent = await this.stripe.paymentIntents.create({
++      amount: input.amountCents,
++      currency: input.currency,
++      metadata: { bookingId: input.bookingId },
++      automatic_payment_methods: { enabled: true },
++    });
++    return { id: intent.id, clientSecret: intent.client_secret };
++  }
++
++  async cancelIntent(paymentId: string): Promise<void> {
++    await this.stripe.paymentIntents.cancel(paymentId);
++  }
++
++  constructEvent(rawBody: Buffer | string, signature: string | undefined): ProviderEvent {
++    return parseStripeEvent(this.stripe, rawBody, signature, this.webhookSecret);
++  }
++}
++
++/** Shared with the fake provider, which signs with the same scheme. */
++export function parseStripeEvent(
++  stripe: Stripe,
++  rawBody: Buffer | string,
++  signature: string | undefined,
++  secret: string,
++): ProviderEvent {
++  if (!signature) throw new InvalidSignatureError('missing Stripe-Signature header');
++  let event: Stripe.Event;
++  try {
++    event = stripe.webhooks.constructEvent(rawBody, signature, secret);
++  } catch (error) {
++    throw new InvalidSignatureError(error instanceof Error ? error.message : String(error));
++  }
++  const object = event.data.object as { id?: unknown; object?: unknown };
++  return {
++    id: event.id,
++    type: event.type,
++    paymentId:
++      object.object === 'payment_intent' && typeof object.id === 'string' ? object.id : undefined,
++    createdAt: new Date(event.created * 1000),
++  };
++}
+diff --git a/src/payments/webhooks.controller.ts b/src/payments/webhooks.controller.ts
+new file mode 100644
+index 0000000..9ae571f
+--- /dev/null
++++ b/src/payments/webhooks.controller.ts
+@@ -0,0 +1,33 @@
++import { Controller, Headers, HttpCode, Inject, Post, RawBodyRequest, Req } from '@nestjs/common';
++import { ApiBadRequestResponse, ApiOkResponse, ApiOperation, ApiTags } from '@nestjs/swagger';
++import type { FastifyRequest } from 'fastify';
++import { PAYMENT_PROVIDER, type PaymentProvider } from './payment.provider';
++import { type AppliedEvent, PaymentEventsService } from './payment-events.service';
++
++@ApiTags('payments')
++@Controller('webhooks')
++export class WebhooksController {
++  constructor(
++    @Inject(PAYMENT_PROVIDER) private readonly provider: PaymentProvider,
++    private readonly events: PaymentEventsService,
++  ) {}
++
++  @Post('payments')
++  @HttpCode(200)
++  @ApiOperation({
++    summary: 'Payment provider webhook (Stripe signature scheme)',
++    description:
++      'Idempotent and order-independent: the response reports whether the event was APPLIED, ' +
++      'STALE (older than one already applied), DUPLICATE, ORPHANED (money for a booking that no ' +
++      'longer holds its seat), IGNORED (a type that changes nothing) or UNKNOWN (no such payment).',
++  })
++  @ApiOkResponse({ description: 'The event was recorded; `outcome` says what it did.' })
++  @ApiBadRequestResponse({ description: 'invalid_signature' })
++  payments(
++    @Req() request: RawBodyRequest<FastifyRequest>,
++    @Headers('stripe-signature') signature?: string,
++  ): Promise<AppliedEvent> {
++    const event = this.provider.constructEvent(request.rawBody ?? '', signature);
++    return this.events.apply(event);
++  }
++}
+diff --git a/test/integration/webhooks.test.ts b/test/integration/webhooks.test.ts
+new file mode 100644
+index 0000000..6ee98b8
+--- /dev/null
++++ b/test/integration/webhooks.test.ts
+@@ -0,0 +1,248 @@
++import type { NestFastifyApplication } from '@nestjs/platform-fastify';
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
++import type { FakePaymentProvider, SignedEvent } from '../../src/payments/fake.provider';
++import { PAYMENT_PROVIDER } from '../../src/payments/payment.provider';
++import { PrismaService } from '../../src/prisma/prisma.service';
++import { createTestApp, resetDatabase } from './harness';
++
++const SLOT = { startsAt: '2026-10-01T09:00:00.000Z', endsAt: '2026-10-01T10:00:00.000Z' };
++
++let app: NestFastifyApplication;
++let psp: FakePaymentProvider;
++let prisma: PrismaService;
++
++beforeAll(async () => {
++  app = await createTestApp();
++  psp = app.get<FakePaymentProvider>(PAYMENT_PROVIDER);
++  prisma = app.get(PrismaService);
++});
++afterAll(async () => {
++  await app.close();
++});
++beforeEach(async () => {
++  await resetDatabase(app);
++});
++
++async function hold(resourceId = 'room-1', slot = SLOT, userId = 'alice') {
++  const response = await app.inject({
++    method: 'POST',
++    url: '/bookings',
++    headers: {
++      'idempotency-key': `${userId}-${resourceId}-${slot.startsAt}-${Math.random()}`,
++      'x-user-id': userId,
++    },
++    payload: { resourceId, ...slot },
++  });
++  expect(response.statusCode).toBe(201);
++  return response.json<{
++    id: string;
++    amountCents: number;
++    payment: { id: string; provider: string; clientSecret: string };
++  }>();
++}
++
++function deliver(event: SignedEvent) {
++  return app.inject({
++    method: 'POST',
++    url: '/webhooks/payments',
++    headers: { 'content-type': 'application/json', 'stripe-signature': event.signature },
++    payload: event.payload,
++  });
++}
++
++const status = async (id: string) =>
++  (await prisma.booking.findUniqueOrThrow({ where: { id } })).status;
++
++describe('POST /bookings creates a payment intent', () => {
++  it('returns the intent and the pro-rated amount', async () => {
++    const booking = await hold();
++    expect(booking.payment).toMatchObject({
++      provider: 'fake',
++      id: expect.stringMatching(/^pi_fake_/),
++    });
++    expect(booking.amountCents).toBe(2500);
++    const half = await hold('room-2', {
++      startsAt: SLOT.startsAt,
++      endsAt: '2026-10-01T09:30:00.000Z',
++    });
++    expect(half.amountCents).toBe(1250);
++    expect(await prisma.booking.findUniqueOrThrow({ where: { id: booking.id } })).toMatchObject({
++      paymentId: booking.payment.id,
++    });
++  });
++
++  it('releases the hold and the idempotency key when the provider fails, so a retry can reserve again', async () => {
++    const original = psp.createIntent.bind(psp);
++    psp.createIntent = () => Promise.reject(new Error('psp down'));
++    const headers = { 'idempotency-key': 'k-psp', 'x-user-id': 'alice' };
++    try {
++      const failed = await app.inject({
++        method: 'POST',
++        url: '/bookings',
++        headers,
++        payload: { resourceId: 'room-1', ...SLOT },
++      });
++      expect(failed.statusCode).toBe(502);
++      expect(failed.json()).toMatchObject({ code: 'payment_provider_unavailable' });
++      expect(await prisma.booking.count({ where: { status: 'HELD' } })).toBe(0);
++    } finally {
++      psp.createIntent = original;
++    }
++    const retry = await app.inject({
++      method: 'POST',
++      url: '/bookings',
++      headers,
++      payload: { resourceId: 'room-1', ...SLOT },
++    });
++    expect(retry.statusCode).toBe(201);
++    expect(retry.headers['idempotency-replayed']).toBeUndefined();
++  });
++});
++
++describe('POST /webhooks/payments', () => {
++  it("confirms a hold when the events arrive in Stripe's order", async () => {
++    const booking = await hold();
++    const events = psp.pay(booking.payment.id, 'succeeded');
++    const outcomes: string[] = [];
++    for (const event of events) {
++      const response = await deliver(event);
++      expect(response.statusCode).toBe(200);
++      outcomes.push(response.json().outcome);
++    }
++    expect(outcomes).toEqual(['IGNORED', 'IGNORED', 'APPLIED']);
++    const row = await prisma.booking.findUniqueOrThrow({ where: { id: booking.id } });
++    expect(row.status).toBe('CONFIRMED');
++    expect(row.holdExpiresAt).toBeNull();
++    expect(row.paymentLastEventAt?.toISOString()).toBe(events[2]?.createdAt.toISOString());
++  });
++
++  it('converges on the same state when the events arrive reversed, and a late cancel is stale', async () => {
++    const booking = await hold();
++    const [created, processing, succeeded] = psp.pay(booking.payment.id, 'succeeded');
++    if (!created || !processing || !succeeded) throw new Error('events');
++    expect((await deliver(succeeded)).json()).toMatchObject({
++      outcome: 'APPLIED',
++      status: 'CONFIRMED',
++    });
++    expect((await deliver(processing)).json()).toMatchObject({ outcome: 'IGNORED' });
++    expect((await deliver(created)).json()).toMatchObject({ outcome: 'IGNORED' });
++    // a cancel older than the success we applied
++    const staleCancel = psp.sign(
++      booking.payment.id,
++      'payment_intent.canceled',
++      Math.floor(succeeded.createdAt.getTime() / 1000) - 1,
++    );
++    expect((await deliver(staleCancel)).json()).toMatchObject({
++      outcome: 'STALE',
++      status: 'CONFIRMED',
++    });
++    // and one newer than it: CONFIRMED is terminal for payments
++    const lateCancel = psp.sign(
++      booking.payment.id,
++      'payment_intent.canceled',
++      Math.floor(succeeded.createdAt.getTime() / 1000) + 60,
++    );
++    expect((await deliver(lateCancel)).json()).toMatchObject({
++      outcome: 'STALE',
++      status: 'CONFIRMED',
++    });
++    expect(await status(booking.id)).toBe('CONFIRMED');
++  });
++
++  it('records a redelivered event as DUPLICATE, also when the redeliveries race', async () => {
++    const booking = await hold();
++    const [, , succeeded] = psp.pay(booking.payment.id, 'succeeded');
++    if (!succeeded) throw new Error('events');
++    const responses = await Promise.all(Array.from({ length: 10 }, () => deliver(succeeded)));
++    const outcomes = responses.map((r) => r.json().outcome).sort();
++    expect(outcomes.filter((o) => o === 'APPLIED')).toHaveLength(1);
++    expect(outcomes.filter((o) => o === 'DUPLICATE')).toHaveLength(9);
++    expect((await deliver(succeeded)).json()).toMatchObject({ outcome: 'DUPLICATE' });
++    expect(await prisma.paymentEvent.count({ where: { paymentId: booking.payment.id } })).toBe(1);
++  });
++
++  it('converges when whole sequences are delivered concurrently and shuffled', async () => {
++    const booking = await hold();
++    const events = psp.pay(booking.payment.id, 'succeeded');
++    const shuffled = [...events, ...events, ...events].sort(() => Math.random() - 0.5);
++    const responses = await Promise.all(shuffled.map((e) => deliver(e)));
++    expect(responses.every((r) => r.statusCode === 200)).toBe(true);
++    const outcomes = responses.map((r) => r.json().outcome);
++    expect(outcomes.filter((o) => o === 'APPLIED')).toHaveLength(1);
++    expect(outcomes.filter((o) => o === 'DUPLICATE')).toHaveLength(6);
++    expect(await status(booking.id)).toBe('CONFIRMED');
++  });
++
++  it('cancels a hold on payment_intent.canceled and frees the seat', async () => {
++    const booking = await hold();
++    const [, , canceled] = psp.pay(booking.payment.id, 'canceled');
++    if (!canceled) throw new Error('events');
++    expect((await deliver(canceled)).json()).toMatchObject({
++      outcome: 'APPLIED',
++      status: 'CANCELLED',
++    });
++    const again = await hold('room-1', SLOT, 'bob');
++    expect(again.id).not.toBe(booking.id);
++  });
++
++  it('marks money for a booking that no longer holds its seat as ORPHANED', async () => {
++    const booking = await hold();
++    await prisma.booking.update({ where: { id: booking.id }, data: { status: 'EXPIRED' } });
++    const [, , succeeded] = psp.pay(booking.payment.id, 'succeeded');
++    if (!succeeded) throw new Error('events');
++    expect((await deliver(succeeded)).json()).toMatchObject({
++      outcome: 'ORPHANED',
++      status: 'EXPIRED',
++    });
++    expect(await status(booking.id)).toBe('EXPIRED');
++    expect(
++      await prisma.paymentEvent.findUniqueOrThrow({ where: { id: succeeded.id } }),
++    ).toMatchObject({ outcome: 'ORPHANED' });
++  });
++
++  it('answers 200 UNKNOWN for a payment it never created, and 400 for a bad signature', async () => {
++    const stranger = psp.sign('pi_stranger', 'payment_intent.succeeded', 1_800_000_000);
++    expect((await deliver(stranger)).json()).toMatchObject({ outcome: 'UNKNOWN' });
++    const tampered = await deliver({
++      ...stranger,
++      payload: stranger.payload.replace('pi_stranger', 'pi_forged'),
++    });
++    expect(tampered.statusCode).toBe(400);
++    expect(tampered.json()).toMatchObject({ code: 'invalid_signature' });
++    const unsigned = await app.inject({
++      method: 'POST',
++      url: '/webhooks/payments',
++      headers: { 'content-type': 'application/json' },
++      payload: stranger.payload,
++    });
++    expect(unsigned.statusCode).toBe(400);
++    expect(await prisma.paymentEvent.count()).toBe(1);
++  });
++});
++
++describe('POST /fake-psp/payments/:id/pay', () => {
++  it('delivers the shuffled, duplicated sequence through the webhook path and the booking ends CONFIRMED', async () => {
++    const booking = await hold();
++    const response = await app.inject({
++      method: 'POST',
++      url: `/fake-psp/payments/${booking.payment.id}/pay`,
++      payload: { order: 'shuffled', duplicate: true },
++    });
++    expect(response.statusCode).toBe(200);
++    const { delivered } = response.json<{ delivered: { type: string; outcome: string }[] }>();
++    expect(delivered).toHaveLength(4);
++    expect(delivered.filter((d) => d.outcome === 'APPLIED')).toHaveLength(1);
++    expect(delivered.filter((d) => d.outcome === 'DUPLICATE')).toHaveLength(1);
++    expect(await status(booking.id)).toBe('CONFIRMED');
++  });
++
++  it('can cancel instead', async () => {
++    const booking = await hold();
++    await app.inject({
++      method: 'POST',
++      url: `/fake-psp/payments/${booking.payment.id}/pay`,
++      payload: { outcome: 'canceled', order: 'stripe', duplicate: false },
++    });
++    expect(await status(booking.id)).toBe('CANCELLED');
++  });
++});
+diff --git a/test/unit/booking.state.test.ts b/test/unit/booking.state.test.ts
+new file mode 100644
+index 0000000..396c1e5
+--- /dev/null
++++ b/test/unit/booking.state.test.ts
+@@ -0,0 +1,36 @@
++import { describe, expect, it } from 'vitest';
++import { onPayment, signalOf } from '../../src/bookings/booking.state';
++
++describe('signalOf', () => {
++  it('maps only the two Stripe events that move a booking', () => {
++    expect(signalOf('payment_intent.succeeded')).toBe('succeeded');
++    expect(signalOf('payment_intent.canceled')).toBe('canceled');
++    expect(signalOf('payment_intent.payment_failed')).toBeUndefined(); // the customer may retry
++    expect(signalOf('payment_intent.created')).toBeUndefined();
++    expect(signalOf('charge.refunded')).toBeUndefined();
++  });
++});
++
++describe('onPayment', () => {
++  it.each([
++    ['HELD', 'succeeded', { outcome: 'APPLIED', next: 'CONFIRMED' }],
++    ['HELD', 'canceled', { outcome: 'APPLIED', next: 'CANCELLED' }],
++    ['CONFIRMED', 'succeeded', { outcome: 'STALE' }],
++    ['CONFIRMED', 'canceled', { outcome: 'STALE' }],
++    ['CANCELLED', 'succeeded', { outcome: 'ORPHANED' }],
++    ['CANCELLED', 'canceled', { outcome: 'STALE' }],
++    ['EXPIRED', 'succeeded', { outcome: 'ORPHANED' }],
++    ['EXPIRED', 'canceled', { outcome: 'STALE' }],
++  ] as const)('%s + %s → %o', (status, signal, expected) => {
++    expect(onPayment(status, signal)).toEqual(expected);
++  });
++
++  it('never leaves CONFIRMED and never confirms a booking that released its seat', () => {
++    for (const signal of ['succeeded', 'canceled'] as const) {
++      expect(onPayment('CONFIRMED', signal).outcome).toBe('STALE');
++      for (const dead of ['CANCELLED', 'EXPIRED'] as const) {
++        expect(onPayment(dead, signal).outcome).not.toBe('APPLIED');
++      }
++    }
++  });
++});
+diff --git a/test/unit/fake.provider.test.ts b/test/unit/fake.provider.test.ts
+new file mode 100644
+index 0000000..027e1e5
+--- /dev/null
++++ b/test/unit/fake.provider.test.ts
+@@ -0,0 +1,44 @@
++import { describe, expect, it } from 'vitest';
++import { FakePaymentProvider } from '../../src/payments/fake.provider';
++
++const SECRET = 'whsec_test_secret';
++
++describe('FakePaymentProvider', () => {
++  it('creates intents and produces the three events Stripe would, in order, a second apart', async () => {
++    const psp = new FakePaymentProvider(SECRET);
++    const intent = await psp.createIntent({ bookingId: 'b1', amountCents: 2500, currency: 'usd' });
++    expect(intent.id).toMatch(/^pi_fake_/);
++    expect(intent.clientSecret).toContain('_secret_');
++    const events = psp.pay(intent.id, 'succeeded', new Date('2026-10-01T09:00:00Z'));
++    expect(events.map((e) => e.type)).toEqual([
++      'payment_intent.created',
++      'payment_intent.processing',
++      'payment_intent.succeeded',
++    ]);
++    expect(events.map((e) => e.createdAt.toISOString())).toEqual([
++      '2026-10-01T09:00:00.000Z',
++      '2026-10-01T09:00:01.000Z',
++      '2026-10-01T09:00:02.000Z',
++    ]);
++  });
++
++  it('signs with the Stripe scheme, so the same verification accepts it and rejects tampering', async () => {
++    const psp = new FakePaymentProvider(SECRET);
++    const intent = await psp.createIntent({ bookingId: 'b1', amountCents: 2500, currency: 'usd' });
++    const [event] = psp.pay(intent.id, 'succeeded');
++    if (!event) throw new Error('no event');
++    const parsed = psp.constructEvent(event.payload, event.signature);
++    expect(parsed).toMatchObject({
++      id: event.id,
++      type: 'payment_intent.created',
++      paymentId: intent.id,
++    });
++    expect(() =>
++      psp.constructEvent(event.payload.replace(intent.id, 'pi_other'), event.signature),
++    ).toThrow(/signature/);
++    expect(() => psp.constructEvent(event.payload, undefined)).toThrow(/signature/);
++    expect(() =>
++      new FakePaymentProvider('whsec_other').constructEvent(event.payload, event.signature),
++    ).toThrow(/signature/);
++  });
++});
+diff --git a/test/unit/price.test.ts b/test/unit/price.test.ts
+new file mode 100644
+index 0000000..73c0d46
+--- /dev/null
++++ b/test/unit/price.test.ts
+@@ -0,0 +1,17 @@
++import { describe, expect, it } from 'vitest';
++import { priceFor } from '../../src/bookings/bookings.service';
++
++const at = (h: number, m = 0) => new Date(Date.UTC(2026, 9, 1, h, m));
++
++describe('priceFor', () => {
++  it('charges the hourly price pro rata to the minute', () => {
++    expect(priceFor(2500, at(9), at(10))).toBe(2500);
++    expect(priceFor(2500, at(9), at(9, 30))).toBe(1250);
++    expect(priceFor(2500, at(9), at(9, 15))).toBe(625);
++    expect(priceFor(3000, at(9), at(17))).toBe(24000);
++  });
++
++  it('rounds to the cent', () => {
++    expect(priceFor(1000, at(9), at(9, 1))).toBe(17); // 16.67
++  });
++});
+diff --git a/test/unit/strategy-selection.test.ts b/test/unit/strategy-selection.test.ts
+index b767baa..d55c896 100644
+--- a/test/unit/strategy-selection.test.ts
++++ b/test/unit/strategy-selection.test.ts
+@@ -41,39 +41,41 @@ describe('ExclusionStrategy', () => {
+ 
+   it('delegates pools to the advisory strategy because a constraint cannot count to N', async () => {
+     const advisory = { reserve: vi.fn().mockResolvedValue({ id: 'b' }) };
+-    const prisma = { booking: { create: vi.fn() } };
++    const prisma = { $queryRaw: vi.fn() };
+     const strategy = new ExclusionStrategy(prisma as never, advisory as never);
+     await strategy.reserve(input(false));
+     expect(advisory.reserve).toHaveBeenCalledOnce();
+-    expect(prisma.booking.create).not.toHaveBeenCalled();
++    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+   });
+ 
+-  it('turns the constraint violation into a 409 no_capacity', async () => {
++  it('turns an insert that returned no row (ON CONFLICT DO NOTHING) into a 409 no_capacity', async () => {
+     const advisory = { reserve: vi.fn() };
+-    const violation = Object.assign(
+-      new Error('conflicting key value violates exclusion constraint "booking_no_overlap"'),
+-      { code: 'P2010', meta: { code: '23P01' } },
+-    );
+-    const prisma = { booking: { create: vi.fn().mockRejectedValue(violation) } };
++    const prisma = { $queryRaw: vi.fn().mockResolvedValue([]) };
+     const strategy = new ExclusionStrategy(prisma as never, advisory as never);
+     await expect(strategy.reserve(input(true))).rejects.toMatchObject({ status: 409 });
+     expect(advisory.reserve).not.toHaveBeenCalled();
+   });
+ 
+-  it('retries a deadlock victim, which then sees the winner and gets its 409', async () => {
+-    const deadlock = Object.assign(new Error('deadlock detected'), {
++  it('retries a serialization victim and gives up with a 503 eventually', async () => {
++    const conflict = Object.assign(new Error('deadlock detected'), {
+       cause: { kind: 'TransactionWriteConflict' },
+     });
+-    const violation = Object.assign(new Error('23P01'), {
+-      cause: { kind: 'postgres', code: '23P01' },
+-    });
+-    const create = vi.fn().mockRejectedValueOnce(deadlock).mockRejectedValueOnce(violation);
++    const queryRaw = vi
++      .fn()
++      .mockRejectedValueOnce(conflict)
++      .mockResolvedValueOnce([{ id: 'b' }]);
+     const strategy = new ExclusionStrategy(
+-      { booking: { create } } as never,
++      { $queryRaw: queryRaw } as never,
+       { reserve: vi.fn() } as never,
+     );
+-    await expect(strategy.reserve(input(true))).rejects.toMatchObject({ status: 409 });
+-    expect(create).toHaveBeenCalledTimes(2);
+-    expect(strategy.deadlocks).toBe(1);
++    await expect(strategy.reserve(input(true))).resolves.toMatchObject({ id: 'b' });
++    expect(queryRaw).toHaveBeenCalledTimes(2);
++    expect(strategy.retries).toBe(1);
++
++    const exhausted = new ExclusionStrategy(
++      { $queryRaw: vi.fn().mockRejectedValue(conflict) } as never,
++      { reserve: vi.fn() } as never,
++    );
++    await expect(exhausted.reserve(input(true))).rejects.toMatchObject({ status: 503 });
+   });
+ });

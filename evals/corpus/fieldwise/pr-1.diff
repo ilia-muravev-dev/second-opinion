@@ -1,0 +1,2781 @@
+diff --git a/.github/dependabot.yml b/.github/dependabot.yml
+index 4e31a6d..2d22228 100644
+--- a/.github/dependabot.yml
++++ b/.github/dependabot.yml
+@@ -11,7 +11,7 @@ updates:
+     directory: /
+     schedule:
+       interval: monthly
+-  - package-ecosystem: docker
++  - package-ecosystem: docker-compose
+     directory: /
+     schedule:
+       interval: monthly
+diff --git a/backend/alembic.ini b/backend/alembic.ini
+new file mode 100644
+index 0000000..20f48c6
+--- /dev/null
++++ b/backend/alembic.ini
+@@ -0,0 +1,36 @@
++[alembic]
++script_location = src/fieldwise/db/migrations
++prepend_sys_path = src
++file_template = %%(rev)s_%%(slug)s
++
++[loggers]
++keys = root,sqlalchemy,alembic
++
++[handlers]
++keys = console
++
++[formatters]
++keys = generic
++
++[logger_root]
++level = WARNING
++handlers = console
++
++[logger_sqlalchemy]
++level = WARNING
++handlers =
++qualname = sqlalchemy.engine
++
++[logger_alembic]
++level = INFO
++handlers =
++qualname = alembic
++
++[handler_console]
++class = StreamHandler
++args = (sys.stderr,)
++level = NOTSET
++formatter = generic
++
++[formatter_generic]
++format = %(levelname)-5.5s [%(name)s] %(message)s
+diff --git a/backend/pyproject.toml b/backend/pyproject.toml
+index c571c4e..538834e 100644
+--- a/backend/pyproject.toml
++++ b/backend/pyproject.toml
+@@ -16,6 +16,12 @@ dependencies = [
+   "typer>=0.27,<1",
+   "rich>=15,<16",
+   "structlog>=26,<27",
++  "pgvector>=0.5,<1",
++  "pypdfium2>=5.13,<6",
++  "pillow>=12,<13",
++  "pyarrow>=25,<26",
++  "huggingface-hub>=0.35,<2",
++  "boto3>=1.43,<2",
+ ]
+ 
+ [project.scripts]
+@@ -29,6 +35,9 @@ dev = [
+   "pytest-cov>=7,<8",
+   "httpx2>=2.13,<3",
+   "testcontainers[postgres]>=4.15,<5",
++  "moto[s3]>=5,<6",
++  "boto3-stubs[s3]>=1.43,<2",
++  "pyarrow-stubs>=20",
+ ]
+ 
+ [build-system]
+@@ -44,7 +53,7 @@ target-version = "py312"
+ src = ["src", "tests"]
+ 
+ [tool.ruff.lint]
+-select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF", "PT", "ANN", "TCH", "PL", "S"]
++select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF", "PT", "ANN", "PL", "S"]
+ ignore = [
+   "PLR0913", # many arguments are fine for explicit pipelines
+   "PLR2004", # magic numbers in tests and pricing tables
+@@ -65,7 +74,7 @@ packages = ["fieldwise"]
+ plugins = ["pydantic.mypy"]
+ 
+ [[tool.mypy.overrides]]
+-module = ["testcontainers.*"]
++module = ["testcontainers.*", "pypdfium2.*"]
+ ignore_missing_imports = true
+ 
+ [tool.pytest.ini_options]
+diff --git a/backend/scripts/make_fixtures.py b/backend/scripts/make_fixtures.py
+new file mode 100644
+index 0000000..aa385d0
+--- /dev/null
++++ b/backend/scripts/make_fixtures.py
+@@ -0,0 +1,39 @@
++"""Copies a few CORD v2 validation receipts into tests/fixtures/cord (downscaled) so unit tests
++can exercise OCR, prompts and matchers on real receipts without the dataset.
++
++Usage: uv run python scripts/make_fixtures.py
++"""
++
++import json
++from pathlib import Path
++
++from fieldwise.documents.cord_import import download_split, iter_rows
++from fieldwise.documents.render import downscale_jpeg
++
++FIXTURE_DIR = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "cord"
++WANTED = 3
++MAX_EDGE = 900
++
++
++def main() -> None:
++    FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
++    picked = 0
++    for row in iter_rows("validation", download_split("validation")):
++        menu = row.gt_parse.get("menu")
++        items = menu if isinstance(menu, list) else [menu] if menu else []
++        # Prefer receipts with a few line items and a total, so the fixture is representative.
++        if len(items) < 2 or not row.gt_parse.get("total", {}).get("total_price"):
++            continue
++        stem = row.external_id.replace("/", "_")
++        (FIXTURE_DIR / f"{stem}.jpg").write_bytes(downscale_jpeg(row.image, MAX_EDGE, quality=80))
++        (FIXTURE_DIR / f"{stem}.json").write_text(
++            json.dumps(row.gt_parse, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
++        )
++        picked += 1
++        if picked == WANTED:
++            break
++    print(f"wrote {picked} fixtures to {FIXTURE_DIR}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/backend/src/fieldwise/cli.py b/backend/src/fieldwise/cli.py
+index 9098b79..99cb695 100644
+--- a/backend/src/fieldwise/cli.py
++++ b/backend/src/fieldwise/cli.py
+@@ -1,17 +1,34 @@
+-"""Command-line interface: ingestion, extraction, evals and reports."""
++"""Command-line interface: database, schemas, ingestion, extraction, evals and reports."""
++
++from typing import Annotated
+ 
+ import typer
+ from rich.console import Console
++from rich.table import Table
+ 
+ from fieldwise import __version__
++from fieldwise.config import get_settings
++from fieldwise.db import migrate
++from fieldwise.db.engine import get_engine, session_factory
++from fieldwise.documents.cord_import import import_split
++from fieldwise.logging import configure_logging
++from fieldwise.schemas.registry import compile_builtin, sync_builtins
++from fieldwise.storage import get_storage
+ 
+ app = typer.Typer(help="fieldwise — document extraction workbench.", no_args_is_help=True)
++db_app = typer.Typer(help="Database migrations.", no_args_is_help=True)
++schemas_app = typer.Typer(help="Extraction schemas.", no_args_is_help=True)
++ingest_app = typer.Typer(help="Import documents and golden labels.", no_args_is_help=True)
++app.add_typer(db_app, name="db")
++app.add_typer(schemas_app, name="schemas")
++app.add_typer(ingest_app, name="ingest")
+ console = Console()
+ 
+ 
+ @app.callback()
+ def main() -> None:
+     """fieldwise — document extraction workbench."""
++    configure_logging(get_settings().log_level)
+ 
+ 
+ @app.command()
+@@ -20,5 +37,63 @@ def version() -> None:
+     console.print(f"fieldwise {__version__}")
+ 
+ 
++@db_app.command("upgrade")
++def db_upgrade(revision: str = "head") -> None:
++    """Apply migrations up to REVISION (default: head)."""
++    migrate.upgrade(get_engine(), revision)
++    console.print(f"[green]database at {revision}[/green]")
++
++
++@db_app.command("downgrade")
++def db_downgrade(revision: str = "base") -> None:
++    """Roll migrations back down to REVISION (default: base — drops everything)."""
++    migrate.downgrade(get_engine(), revision)
++    console.print(f"[yellow]database at {revision}[/yellow]")
++
++
++@schemas_app.command("sync")
++def schemas_sync() -> None:
++    """Store the built-in schemas (a new version is created when a schema changed)."""
++    with session_factory()() as session:
++        stored = sync_builtins(session)
++        session.commit()
++        for schema in stored:
++            console.print(f"{schema.name} v{schema.version}  ({len(schema.field_meta)} fields)")
++
++
++@schemas_app.command("show")
++def schemas_show(name: str) -> None:
++    """Print the fields of a built-in schema with their matchers."""
++    compiled = compile_builtin(name)
++    table = Table(title=f"schema {compiled.name}")
++    table.add_column("field")
++    table.add_column("type")
++    table.add_column("matcher")
++    table.add_column("description", overflow="fold")
++    for field in compiled.fields:
++        table.add_row(field.path, field.type, field.matcher, field.description)
++    console.print(table)
++
++
++@ingest_app.command("cord")
++def ingest_cord(
++    split: Annotated[
++        list[str] | None, typer.Option(help="Dataset split(s): test, validation, train.")
++    ] = None,
++    limit: Annotated[int | None, typer.Option(help="Stop after N rows per split.")] = None,
++) -> None:
++    """Import CORD v2 receipts (CC BY 4.0) with golden labels for the receipt schema."""
++    with session_factory()() as session:
++        for name in split or ["test", "validation"]:
++            console.print(f"[bold]cord-v2/{name}[/bold]: downloading and importing …")
++            stats = import_split(session, get_storage(), name, limit=limit)
++            console.print(
++                f"  seen {stats.seen} · created {stats.created} · skipped {stats.skipped}"
++                f" · labelled {stats.labelled} · errors {len(stats.errors)}"
++            )
++            for error in stats.errors[:10]:
++                console.print(f"  [red]{error}[/red]")
++
++
+ if __name__ == "__main__":
+     app()
+diff --git a/backend/src/fieldwise/db/__init__.py b/backend/src/fieldwise/db/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/backend/src/fieldwise/db/engine.py b/backend/src/fieldwise/db/engine.py
+new file mode 100644
+index 0000000..4f4af14
+--- /dev/null
++++ b/backend/src/fieldwise/db/engine.py
+@@ -0,0 +1,31 @@
++"""SQLAlchemy engine and session factory (synchronous: psycopg 3)."""
++
++from collections.abc import Iterator
++from functools import lru_cache
++
++from sqlalchemy import Engine, create_engine
++from sqlalchemy.orm import Session, sessionmaker
++
++from fieldwise.config import get_settings
++
++
++@lru_cache
++def get_engine(url: str | None = None) -> Engine:
++    return create_engine(url or get_settings().database_url, pool_pre_ping=True, future=True)
++
++
++def session_factory(engine: Engine | None = None) -> sessionmaker[Session]:
++    return sessionmaker(bind=engine or get_engine(), expire_on_commit=False)
++
++
++def get_db() -> Iterator[Session]:
++    """FastAPI dependency: one session per request, committed on success."""
++    session = session_factory()()
++    try:
++        yield session
++        session.commit()
++    except Exception:
++        session.rollback()
++        raise
++    finally:
++        session.close()
+diff --git a/backend/src/fieldwise/db/migrate.py b/backend/src/fieldwise/db/migrate.py
+new file mode 100644
+index 0000000..19824cc
+--- /dev/null
++++ b/backend/src/fieldwise/db/migrate.py
+@@ -0,0 +1,35 @@
++"""Programmatic Alembic entry points (used by the CLI, tests and the compose `migrate` service)."""
++
++from collections.abc import Callable
++from pathlib import Path
++
++from alembic import command
++from alembic.config import Config
++from sqlalchemy import Connection, Engine
++
++MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
++
++
++def alembic_config(url: str | None = None) -> Config:
++    config = Config()
++    config.set_main_option("script_location", str(MIGRATIONS_DIR))
++    config.set_main_option("file_template", "%%(rev)s_%%(slug)s")
++    if url:
++        config.set_main_option("sqlalchemy.url", url)
++    return config
++
++
++def upgrade(engine: Engine, revision: str = "head") -> None:
++    with engine.begin() as connection:
++        _run(connection, lambda cfg: command.upgrade(cfg, revision))
++
++
++def downgrade(engine: Engine, revision: str = "base") -> None:
++    with engine.begin() as connection:
++        _run(connection, lambda cfg: command.downgrade(cfg, revision))
++
++
++def _run(connection: Connection, action: Callable[[Config], None]) -> None:
++    config = alembic_config()
++    config.attributes["connection"] = connection
++    action(config)
+diff --git a/backend/src/fieldwise/db/migrations/env.py b/backend/src/fieldwise/db/migrations/env.py
+new file mode 100644
+index 0000000..4587457
+--- /dev/null
++++ b/backend/src/fieldwise/db/migrations/env.py
+@@ -0,0 +1,48 @@
++"""Alembic environment: the URL comes from settings unless the caller injects a connection."""
++
++from logging.config import fileConfig
++
++from alembic import context
++from sqlalchemy import engine_from_config, pool
++
++from fieldwise.config import get_settings
++from fieldwise.db.models import Base
++
++config = context.config
++if config.config_file_name is not None:
++    fileConfig(config.config_file_name)
++
++target_metadata = Base.metadata
++
++
++def run_migrations_offline() -> None:
++    context.configure(
++        url=get_settings().database_url,
++        target_metadata=target_metadata,
++        literal_binds=True,
++        dialect_opts={"paramstyle": "named"},
++    )
++    with context.begin_transaction():
++        context.run_migrations()
++
++
++def run_migrations_online() -> None:
++    connectable = config.attributes.get("connection")
++    if connectable is None:
++        section = config.get_section(config.config_ini_section) or {}
++        section["sqlalchemy.url"] = get_settings().database_url
++        engine = engine_from_config(section, prefix="sqlalchemy.", poolclass=pool.NullPool)
++        with engine.connect() as connection:
++            context.configure(connection=connection, target_metadata=target_metadata)
++            with context.begin_transaction():
++                context.run_migrations()
++        return
++    context.configure(connection=connectable, target_metadata=target_metadata)
++    with context.begin_transaction():
++        context.run_migrations()
++
++
++if context.is_offline_mode():
++    run_migrations_offline()
++else:
++    run_migrations_online()
+diff --git a/backend/src/fieldwise/db/migrations/script.py.mako b/backend/src/fieldwise/db/migrations/script.py.mako
+new file mode 100644
+index 0000000..e67e889
+--- /dev/null
++++ b/backend/src/fieldwise/db/migrations/script.py.mako
+@@ -0,0 +1,25 @@
++"""${message}
++
++Revision ID: ${up_revision}
++Revises: ${down_revision | comma,n}
++Create Date: ${create_date}
++"""
++
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++${imports if imports else ""}
++
++revision: str = ${repr(up_revision)}
++down_revision: str | None = ${repr(down_revision)}
++branch_labels: str | Sequence[str] | None = ${repr(branch_labels)}
++depends_on: str | Sequence[str] | None = ${repr(depends_on)}
++
++
++def upgrade() -> None:
++    ${upgrades if upgrades else "pass"}
++
++
++def downgrade() -> None:
++    ${downgrades if downgrades else "pass"}
+diff --git a/backend/src/fieldwise/db/migrations/versions/0001_schemas_documents_golden.py b/backend/src/fieldwise/db/migrations/versions/0001_schemas_documents_golden.py
+new file mode 100644
+index 0000000..09415a0
+--- /dev/null
++++ b/backend/src/fieldwise/db/migrations/versions/0001_schemas_documents_golden.py
+@@ -0,0 +1,90 @@
++"""schemas, documents and golden labels
++
++Revision ID: 0001
++Revises:
++Create Date: 2026-09-18
++"""
++
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++from pgvector.sqlalchemy import Vector
++from sqlalchemy.dialects import postgresql
++
++revision: str = "0001"
++down_revision: str | None = None
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++
++def upgrade() -> None:
++    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
++
++    op.create_table(
++        "schemas",
++        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
++        sa.Column("name", sa.String(64), nullable=False),
++        sa.Column("version", sa.Integer(), nullable=False),
++        sa.Column("json_schema", postgresql.JSONB(), nullable=False),
++        sa.Column("field_meta", postgresql.JSONB(), nullable=False),
++        sa.Column(
++            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
++        ),
++        sa.UniqueConstraint("name", "version", name="uq_schemas_name_version"),
++    )
++
++    op.create_table(
++        "documents",
++        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
++        sa.Column("name", sa.String(255), nullable=False),
++        sa.Column("source", sa.String(16), nullable=False),
++        sa.Column("external_id", sa.String(128), nullable=True, unique=True),
++        sa.Column("split", sa.String(16), nullable=True),
++        sa.Column("mime", sa.String(64), nullable=False),
++        sa.Column("sha256", sa.String(64), nullable=False, unique=True),
++        sa.Column("storage_key", sa.String(255), nullable=False),
++        sa.Column("page_count", sa.Integer(), nullable=False),
++        sa.Column("pages", postgresql.JSONB(), nullable=False, server_default="[]"),
++        sa.Column("ocr_status", sa.String(16), nullable=False, server_default="pending"),
++        sa.Column("ocr_text", sa.Text(), nullable=True),
++        sa.Column("ocr_words", postgresql.JSONB(), nullable=True),
++        sa.Column("embedding", Vector(384), nullable=True),
++        sa.Column(
++            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
++        ),
++    )
++    op.create_index("ix_documents_split", "documents", ["split"])
++
++    op.create_table(
++        "golden_labels",
++        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
++        sa.Column(
++            "document_id",
++            postgresql.UUID(as_uuid=True),
++            sa.ForeignKey("documents.id", ondelete="CASCADE"),
++            nullable=False,
++        ),
++        sa.Column(
++            "schema_id",
++            postgresql.UUID(as_uuid=True),
++            sa.ForeignKey("schemas.id", ondelete="CASCADE"),
++            nullable=False,
++        ),
++        sa.Column("data", postgresql.JSONB(), nullable=False),
++        sa.Column("source", sa.String(16), nullable=False),
++        sa.Column(
++            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
++        ),
++        sa.UniqueConstraint(
++            "document_id", "schema_id", "source", name="uq_golden_doc_schema_source"
++        ),
++    )
++    op.create_index("ix_golden_labels_document_id", "golden_labels", ["document_id"])
++
++
++def downgrade() -> None:
++    op.drop_table("golden_labels")
++    op.drop_index("ix_documents_split", table_name="documents")
++    op.drop_table("documents")
++    op.drop_table("schemas")
+diff --git a/backend/src/fieldwise/db/models.py b/backend/src/fieldwise/db/models.py
+new file mode 100644
+index 0000000..fb4161b
+--- /dev/null
++++ b/backend/src/fieldwise/db/models.py
+@@ -0,0 +1,89 @@
++"""ORM models. Migrations live in fieldwise/db/migrations and are written by hand."""
++
++import uuid
++from datetime import UTC, datetime
++from typing import Any
++
++from pgvector.sqlalchemy import Vector
++from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
++from sqlalchemy.dialects.postgresql import JSONB, UUID
++from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
++
++EMBEDDING_DIM = 384  # BAAI/bge-small-en-v1.5 via fastembed
++
++
++def utcnow() -> datetime:
++    return datetime.now(UTC)
++
++
++class Base(DeclarativeBase):
++    pass
++
++
++class Schema(Base):
++    """A versioned extraction schema: the authored JSON Schema plus per-field matcher metadata."""
++
++    __tablename__ = "schemas"
++    __table_args__ = (UniqueConstraint("name", "version", name="uq_schemas_name_version"),)
++
++    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
++    name: Mapped[str] = mapped_column(String(64))
++    version: Mapped[int] = mapped_column(Integer)
++    json_schema: Mapped[dict[str, Any]] = mapped_column(JSONB)
++    field_meta: Mapped[dict[str, Any]] = mapped_column(JSONB)
++    created_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True), default=utcnow, server_default=func.now()
++    )
++
++    golden_labels: Mapped[list["GoldenLabel"]] = relationship(back_populates="schema")
++
++
++class Document(Base):
++    """An uploaded or imported document, its rendered pages and OCR output."""
++
++    __tablename__ = "documents"
++
++    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
++    name: Mapped[str] = mapped_column(String(255))
++    source: Mapped[str] = mapped_column(String(16))  # upload | cord
++    external_id: Mapped[str | None] = mapped_column(String(128), unique=True)
++    split: Mapped[str | None] = mapped_column(String(16))  # train | validation | test
++    mime: Mapped[str] = mapped_column(String(64))
++    sha256: Mapped[str] = mapped_column(String(64), unique=True)
++    storage_key: Mapped[str] = mapped_column(String(255))
++    page_count: Mapped[int] = mapped_column(Integer)
++    pages: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
++    ocr_status: Mapped[str] = mapped_column(String(16), default="pending")
++    ocr_text: Mapped[str | None] = mapped_column(Text)
++    ocr_words: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
++    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM))
++    created_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True), default=utcnow, server_default=func.now()
++    )
++
++    golden_labels: Mapped[list["GoldenLabel"]] = relationship(
++        back_populates="document", cascade="all, delete-orphan"
++    )
++
++
++class GoldenLabel(Base):
++    """Ground truth for a document under a schema: from the dataset, or a reviewer's correction."""
++
++    __tablename__ = "golden_labels"
++    __table_args__ = (
++        UniqueConstraint("document_id", "schema_id", "source", name="uq_golden_doc_schema_source"),
++    )
++
++    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
++    document_id: Mapped[uuid.UUID] = mapped_column(
++        ForeignKey("documents.id", ondelete="CASCADE"), index=True
++    )
++    schema_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("schemas.id", ondelete="CASCADE"))
++    data: Mapped[dict[str, Any]] = mapped_column(JSONB)
++    source: Mapped[str] = mapped_column(String(16))  # dataset | correction
++    created_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True), default=utcnow, server_default=func.now()
++    )
++
++    document: Mapped[Document] = relationship(back_populates="golden_labels")
++    schema: Mapped[Schema] = relationship(back_populates="golden_labels")
+diff --git a/backend/src/fieldwise/documents/__init__.py b/backend/src/fieldwise/documents/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/backend/src/fieldwise/documents/cord_import.py b/backend/src/fieldwise/documents/cord_import.py
+new file mode 100644
+index 0000000..5dc25e9
+--- /dev/null
++++ b/backend/src/fieldwise/documents/cord_import.py
+@@ -0,0 +1,209 @@
++"""Imports CORD v2 (naver-clova-ix/cord-v2, CC BY 4.0) receipts as documents with golden labels.
++
++CORD's `gt_parse` is mapped onto the built-in `receipt` schema; keys the schema does not model
++(`menu.num`, `sub_nm`, `void_menu`, ...) are dropped. Ground truth is normalised once at import
++with the same parsers the eval matchers use, so a golden "60.000" and a predicted 60000 agree.
++"""
++
++from __future__ import annotations
++
++import json
++from collections.abc import Iterator
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++import pyarrow.parquet as pq
++import structlog
++from huggingface_hub import HfApi, hf_hub_download
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from fieldwise.db.models import Document, GoldenLabel, Schema
++from fieldwise.documents.service import create_document
++from fieldwise.schemas.registry import get_schema
++from fieldwise.storage import Storage
++from fieldwise.values import parse_int, parse_money
++
++CORD_REPO = "naver-clova-ix/cord-v2"
++SPLITS = ("train", "validation", "test")
++
++log = structlog.get_logger(__name__)
++
++
++@dataclass(frozen=True)
++class CordRow:
++    split: str
++    index: int
++    image: bytes
++    gt_parse: dict[str, Any]
++
++    @property
++    def external_id(self) -> str:
++        return f"cord-v2/{self.split}/{self.index:04d}"
++
++
++@dataclass
++class ImportStats:
++    seen: int = 0
++    created: int = 0
++    skipped: int = 0
++    labelled: int = 0
++    errors: list[str] = field(default_factory=list)
++
++
++def list_split_files(split: str) -> list[str]:
++    files = HfApi().list_repo_files(CORD_REPO, repo_type="dataset")
++    return sorted(f for f in files if f.startswith(f"data/{split}-") and f.endswith(".parquet"))
++
++
++def download_split(split: str) -> list[Path]:
++    if split not in SPLITS:
++        raise ValueError(f"unknown split {split!r}; expected one of {SPLITS}")
++    return [
++        Path(hf_hub_download(CORD_REPO, filename=name, repo_type="dataset"))
++        for name in list_split_files(split)
++    ]
++
++
++def iter_rows(split: str, paths: list[Path]) -> Iterator[CordRow]:
++    index = 0
++    for path in paths:
++        parquet = pq.ParquetFile(path)
++        for batch in parquet.iter_batches(batch_size=8, columns=["image", "ground_truth"]):
++            for record in batch.to_pylist():
++                gt = json.loads(record["ground_truth"])
++                yield CordRow(
++                    split=split,
++                    index=index,
++                    image=record["image"]["bytes"],
++                    gt_parse=gt.get("gt_parse") or {},
++                )
++                index += 1
++
++
++def _first_dict(value: Any) -> dict[str, Any]:
++    if isinstance(value, dict):
++        return value
++    if isinstance(value, list):
++        merged: dict[str, Any] = {}
++        for item in value:
++            if isinstance(item, dict):
++                merged = {**item, **merged}  # earlier entries win
++        return merged
++    return {}
++
++
++def _text(value: Any) -> str | None:
++    if value is None:
++        return None
++    if isinstance(value, list):
++        value = " ".join(str(v) for v in value if v is not None)
++    text = " ".join(str(value).split())
++    return text or None
++
++
++def _money(value: Any) -> float | None:
++    parsed = parse_money(value)
++    return float(parsed) if parsed is not None else None
++
++
++def map_gt_parse(gt_parse: dict[str, Any]) -> dict[str, Any]:
++    """CORD gt_parse → receipt golden data (schema field order, normalised values)."""
++    menu = gt_parse.get("menu") or []
++    if isinstance(menu, dict):
++        menu = [menu]
++    items = []
++    for raw in menu:
++        if not isinstance(raw, dict):
++            continue
++        quantity = parse_int(raw.get("cnt"))
++        items.append(
++            {
++                "name": _text(raw.get("nm")),
++                "quantity": quantity if quantity is not None else 1,
++                "unit_price": _money(raw.get("unitprice")),
++                "line_total": _money(raw.get("price")),
++            }
++        )
++    sub_total = _first_dict(gt_parse.get("sub_total"))
++    total = _first_dict(gt_parse.get("total"))
++    return {
++        "line_items": items,
++        "subtotal": _money(sub_total.get("subtotal_price")),
++        "discount": _money(sub_total.get("discount_price")),
++        "service_charge": _money(sub_total.get("service_price")),
++        "tax": _money(sub_total.get("tax_price")),
++        "total": _money(total.get("total_price")),
++        "cash_paid": _money(total.get("cashprice")),
++        "change": _money(total.get("changeprice")),
++        "card_paid": _money(total.get("creditcardprice")),
++        "item_count": parse_int(total.get("menuqty_cnt")),
++    }
++
++
++def import_rows(
++    session: Session,
++    storage: Storage,
++    rows: Iterator[CordRow],
++    schema: Schema,
++    limit: int | None = None,
++) -> ImportStats:
++    stats = ImportStats()
++    for row in rows:
++        if limit is not None and stats.seen >= limit:
++            break
++        stats.seen += 1
++        existing = session.scalars(
++            select(Document).where(Document.external_id == row.external_id)
++        ).first()
++        if existing is not None:
++            stats.skipped += 1
++            continue
++        try:
++            document = create_document(
++                session,
++                storage,
++                data=row.image,
++                name=row.external_id,
++                source="cord",
++                split=row.split,
++                external_id=row.external_id,
++            )
++            has_label = session.scalars(
++                select(GoldenLabel.id).where(
++                    GoldenLabel.document_id == document.id,
++                    GoldenLabel.schema_id == schema.id,
++                    GoldenLabel.source == "dataset",
++                )
++            ).first()
++            if has_label is not None:  # same bytes already imported under another id
++                stats.skipped += 1
++                session.commit()
++                continue
++            session.add(
++                GoldenLabel(
++                    document_id=document.id,
++                    schema_id=schema.id,
++                    data=map_gt_parse(row.gt_parse),
++                    source="dataset",
++                )
++            )
++            session.commit()
++            stats.created += 1
++            stats.labelled += 1
++        except Exception as error:
++            session.rollback()
++            stats.errors.append(f"{row.external_id}: {error}")
++            log.warning("cord_import.row_failed", external_id=row.external_id, error=str(error))
++    return stats
++
++
++def import_split(
++    session: Session, storage: Storage, split: str, limit: int | None = None
++) -> ImportStats:
++    schema = get_schema(session, "receipt")
++    if schema is None:
++        raise RuntimeError("receipt schema missing from the database; run `fieldwise schemas sync`")
++    paths = download_split(split)
++    return import_rows(session, storage, iter_rows(split, paths), schema, limit=limit)
+diff --git a/backend/src/fieldwise/documents/render.py b/backend/src/fieldwise/documents/render.py
+new file mode 100644
+index 0000000..8abfd47
+--- /dev/null
++++ b/backend/src/fieldwise/documents/render.py
+@@ -0,0 +1,85 @@
++"""Page rendering: PDFs and images become JPEG page images of bounded size."""
++
++from dataclasses import dataclass
++from io import BytesIO
++
++import pypdfium2 as pdfium
++from PIL import Image, ImageOps
++
++MAX_EDGE_PX = 2000  # stored pages: enough for OCR and for the review UI
++JPEG_QUALITY = 90
++
++PDF_MIME = "application/pdf"
++IMAGE_MIMES = {"image/jpeg", "image/png", "image/webp", "image/tiff"}
++
++
++@dataclass(frozen=True)
++class PageImage:
++    page: int
++    jpeg: bytes
++    width: int
++    height: int
++
++
++class UnsupportedDocumentError(ValueError):
++    pass
++
++
++def sniff_mime(data: bytes) -> str:
++    if data.startswith(b"%PDF"):
++        return PDF_MIME
++    try:
++        with Image.open(BytesIO(data)) as image:
++            fmt = (image.format or "").lower()
++    except OSError as error:
++        raise UnsupportedDocumentError("not a PDF or a readable image") from error
++    return {
++        "jpeg": "image/jpeg",
++        "png": "image/png",
++        "webp": "image/webp",
++        "tiff": "image/tiff",
++    }.get(fmt, f"image/{fmt}")
++
++
++def render_pages(data: bytes, mime: str, max_edge: int = MAX_EDGE_PX) -> list[PageImage]:
++    if mime == PDF_MIME:
++        return _render_pdf(data, max_edge)
++    if mime in IMAGE_MIMES:
++        with Image.open(BytesIO(data)) as image:
++            return [_page_from_image(image, page=1, max_edge=max_edge)]
++    raise UnsupportedDocumentError(f"unsupported document type {mime!r}")
++
++
++def _render_pdf(data: bytes, max_edge: int) -> list[PageImage]:
++    pdf = pdfium.PdfDocument(data)
++    pages: list[PageImage] = []
++    try:
++        for index in range(len(pdf)):
++            page = pdf[index]
++            width_pt, height_pt = page.get_size()
++            scale = max_edge / max(width_pt, height_pt)
++            bitmap = page.render(scale=scale)
++            with bitmap.to_pil() as image:
++                pages.append(_page_from_image(image, page=index + 1, max_edge=max_edge))
++    finally:
++        pdf.close()
++    return pages
++
++
++def _page_from_image(image: Image.Image, page: int, max_edge: int) -> PageImage:
++    rgb = ImageOps.exif_transpose(image) or image
++    rgb = rgb.convert("RGB")
++    rgb.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
++    buffer = BytesIO()
++    rgb.save(buffer, format="JPEG", quality=JPEG_QUALITY, optimize=True)
++    return PageImage(page=page, jpeg=buffer.getvalue(), width=rgb.width, height=rgb.height)
++
++
++def downscale_jpeg(jpeg: bytes, max_edge: int, quality: int = 85) -> bytes:
++    """A smaller copy for the model: fewer image tokens, same content."""
++    with Image.open(BytesIO(jpeg)) as image:
++        rgb = image.convert("RGB")
++        rgb.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
++        buffer = BytesIO()
++        rgb.save(buffer, format="JPEG", quality=quality, optimize=True)
++        return buffer.getvalue()
+diff --git a/backend/src/fieldwise/documents/service.py b/backend/src/fieldwise/documents/service.py
+new file mode 100644
+index 0000000..92cbede
+--- /dev/null
++++ b/backend/src/fieldwise/documents/service.py
+@@ -0,0 +1,63 @@
++"""Creating documents: hashing, storing the original, rendering and storing pages."""
++
++import hashlib
++import uuid
++
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from fieldwise.db.models import Document
++from fieldwise.documents.render import PDF_MIME, render_pages, sniff_mime
++from fieldwise.storage import Storage
++
++EXTENSIONS = {PDF_MIME: "pdf", "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
++
++
++def page_key(document_id: uuid.UUID, page: int) -> str:
++    return f"documents/{document_id}/pages/{page}.jpg"
++
++
++def create_document(
++    session: Session,
++    storage: Storage,
++    *,
++    data: bytes,
++    name: str,
++    source: str,
++    split: str | None = None,
++    external_id: str | None = None,
++) -> Document:
++    """Stores the original and its rendered pages; returns the existing row for duplicate bytes."""
++    sha256 = hashlib.sha256(data).hexdigest()
++    existing = session.scalars(select(Document).where(Document.sha256 == sha256)).first()
++    if existing is not None:
++        return existing
++
++    mime = sniff_mime(data)
++    pages = render_pages(data, mime)
++    document_id = uuid.uuid4()
++    storage_key = f"documents/{document_id}/original.{EXTENSIONS.get(mime, 'bin')}"
++    storage.put(storage_key, data, mime)
++    page_records = []
++    for page in pages:
++        key = page_key(document_id, page.page)
++        storage.put(key, page.jpeg, "image/jpeg")
++        page_records.append(
++            {"page": page.page, "key": key, "width": page.width, "height": page.height}
++        )
++
++    document = Document(
++        id=document_id,
++        name=name,
++        source=source,
++        split=split,
++        external_id=external_id,
++        mime=mime,
++        sha256=sha256,
++        storage_key=storage_key,
++        page_count=len(pages),
++        pages=page_records,
++    )
++    session.add(document)
++    session.flush()
++    return document
+diff --git a/backend/src/fieldwise/schemas/__init__.py b/backend/src/fieldwise/schemas/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/backend/src/fieldwise/schemas/builtin/__init__.py b/backend/src/fieldwise/schemas/builtin/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/backend/src/fieldwise/schemas/builtin/receipt.json b/backend/src/fieldwise/schemas/builtin/receipt.json
+new file mode 100644
+index 0000000..14d3910
+--- /dev/null
++++ b/backend/src/fieldwise/schemas/builtin/receipt.json
+@@ -0,0 +1,81 @@
++{
++  "$schema": "https://json-schema.org/draft/2020-12/schema",
++  "title": "receipt",
++  "description": "A retail or restaurant receipt. Amounts are plain numbers in the receipt's currency, without thousands separators or currency symbols. Use null for anything that is not printed.",
++  "type": "object",
++  "properties": {
++    "line_items": {
++      "type": "array",
++      "description": "Purchased items in the order they are printed. One entry per printed line item; sub-items (toppings, modifiers) belong to their parent item and are not separate entries.",
++      "items": {
++        "type": "object",
++        "properties": {
++          "name": {
++            "type": "string",
++            "description": "Item name as printed, without the quantity, unit price or line total."
++          },
++          "quantity": {
++            "type": "integer",
++            "description": "Number of units on the line. 1 when no quantity is printed.",
++            "x-fieldwise": { "matcher": "integer" }
++          },
++          "unit_price": {
++            "type": "number",
++            "description": "Price of one unit, only when it is printed separately from the line total.",
++            "x-fieldwise": { "matcher": "money" }
++          },
++          "line_total": {
++            "type": "number",
++            "description": "Total printed for the line (quantity × unit price).",
++            "x-fieldwise": { "matcher": "money" }
++          }
++        }
++      }
++    },
++    "subtotal": {
++      "type": "number",
++      "description": "Sum of the line items before discounts, service charge and tax, when printed.",
++      "x-fieldwise": { "matcher": "money" }
++    },
++    "discount": {
++      "type": "number",
++      "description": "Total discount applied to the receipt, with the sign as printed (usually negative).",
++      "x-fieldwise": { "matcher": "money" }
++    },
++    "service_charge": {
++      "type": "number",
++      "description": "Service charge or gratuity line, when printed.",
++      "x-fieldwise": { "matcher": "money" }
++    },
++    "tax": {
++      "type": "number",
++      "description": "Tax amount (VAT, PB1, PPN, ...), when printed as an amount.",
++      "x-fieldwise": { "matcher": "money" }
++    },
++    "total": {
++      "type": "number",
++      "description": "The final amount to pay.",
++      "x-fieldwise": { "matcher": "money" }
++    },
++    "cash_paid": {
++      "type": "number",
++      "description": "Cash tendered by the customer, when printed.",
++      "x-fieldwise": { "matcher": "money" }
++    },
++    "change": {
++      "type": "number",
++      "description": "Change returned to the customer, when printed.",
++      "x-fieldwise": { "matcher": "money" }
++    },
++    "card_paid": {
++      "type": "number",
++      "description": "Amount paid by credit or debit card, when printed.",
++      "x-fieldwise": { "matcher": "money" }
++    },
++    "item_count": {
++      "type": "integer",
++      "description": "Total number of items printed as a count (e.g. 'Total Qty 3'), when printed.",
++      "x-fieldwise": { "matcher": "integer" }
++    }
++  }
++}
+diff --git a/backend/src/fieldwise/schemas/compiler.py b/backend/src/fieldwise/schemas/compiler.py
+new file mode 100644
+index 0000000..56cad1a
+--- /dev/null
++++ b/backend/src/fieldwise/schemas/compiler.py
+@@ -0,0 +1,151 @@
++"""Turns an authored JSON Schema into (a) the strict schema Claude's structured outputs require and
++(b) flat per-field metadata the eval matchers and the UI work from.
++
++Authoring rules (a small JSON Schema subset):
++- objects with `properties`; arrays of objects or of scalars; scalars string/number/integer/boolean
++- every leaf is optional to the author and *nullable* to the model — "not printed" is a first-class
++  answer, so the strict schema wraps each leaf in `anyOf: [<type>, null]`
++- `x-fieldwise: {"matcher": "money" | "integer" | "text" | "date"}` overrides the matcher derived
++  from the type (number → money, integer → integer, string → text, boolean → boolean)
++"""
++
++from copy import deepcopy
++from dataclasses import dataclass, field
++from typing import Any, Literal
++
++Matcher = Literal["text", "money", "number", "integer", "boolean", "date", "list", "object"]
++
++SCALAR_TYPES = {"string", "number", "integer", "boolean"}
++DEFAULT_MATCHERS: dict[str, Matcher] = {
++    "string": "text",
++    "number": "money",
++    "integer": "integer",
++    "boolean": "boolean",
++}
++
++
++class SchemaError(ValueError):
++    """The authored schema uses something outside the supported subset."""
++
++
++@dataclass(frozen=True)
++class FieldMeta:
++    """One addressable field. Paths use `[]` for array items, e.g. `line_items[].name`."""
++
++    path: str
++    type: str
++    matcher: Matcher
++    description: str = ""
++    children: tuple[str, ...] = field(default_factory=tuple)
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "path": self.path,
++            "type": self.type,
++            "matcher": self.matcher,
++            "description": self.description,
++            "children": list(self.children),
++        }
++
++
++@dataclass(frozen=True)
++class CompiledSchema:
++    name: str
++    strict: dict[str, Any]
++    fields: tuple[FieldMeta, ...]
++
++    @property
++    def leaf_paths(self) -> tuple[str, ...]:
++        return tuple(f.path for f in self.fields if f.matcher not in ("list", "object"))
++
++    def field_meta_dict(self) -> dict[str, Any]:
++        return {f.path: f.to_dict() for f in self.fields}
++
++
++def compile_schema(authored: dict[str, Any]) -> CompiledSchema:
++    name = str(authored.get("title") or "schema")
++    if authored.get("type") != "object" or not isinstance(authored.get("properties"), dict):
++        raise SchemaError("the root must be an object with properties")
++    fields: list[FieldMeta] = []
++    strict = _compile_object(authored, prefix="", fields=fields)
++    return CompiledSchema(name=name, strict=strict, fields=tuple(fields))
++
++
++def _compile_object(node: dict[str, Any], prefix: str, fields: list[FieldMeta]) -> dict[str, Any]:
++    properties: dict[str, Any] = node["properties"]
++    out_props: dict[str, Any] = {}
++    for key, child in properties.items():
++        path = f"{prefix}{key}"
++        out_props[key] = _compile_node(child, path=path, fields=fields)
++    result: dict[str, Any] = {
++        "type": "object",
++        "properties": out_props,
++        "required": list(out_props),
++        "additionalProperties": False,
++    }
++    if node.get("description"):
++        result["description"] = node["description"]
++    return result
++
++
++def _compile_node(node: dict[str, Any], path: str, fields: list[FieldMeta]) -> dict[str, Any]:
++    node_type = node.get("type")
++    description = str(node.get("description", ""))
++    if node_type == "object":
++        if not isinstance(node.get("properties"), dict):
++            raise SchemaError(f"{path}: objects need properties")
++        fields.append(
++            FieldMeta(
++                path=path,
++                type="object",
++                matcher="object",
++                description=description,
++                children=tuple(f"{path}.{k}" for k in node["properties"]),
++            )
++        )
++        return _compile_object(node, prefix=f"{path}.", fields=fields)
++    if node_type == "array":
++        items = node.get("items")
++        if not isinstance(items, dict):
++            raise SchemaError(f"{path}: arrays need items")
++        item_path = f"{path}[]"
++        children: tuple[str, ...] = ()
++        if items.get("type") == "object":
++            children = tuple(f"{item_path}.{k}" for k in items.get("properties", {}))
++        fields.append(
++            FieldMeta(
++                path=path, type="array", matcher="list", description=description, children=children
++            )
++        )
++        compiled_items = (
++            _compile_object(items, prefix=f"{item_path}.", fields=fields)
++            if items.get("type") == "object"
++            else _compile_node(items, path=item_path, fields=fields)
++        )
++        result: dict[str, Any] = {"type": "array", "items": compiled_items}
++        if description:
++            result["description"] = description
++        return result
++    if node_type in SCALAR_TYPES:
++        matcher = _matcher_for(node, path)
++        fields.append(
++            FieldMeta(path=path, type=node_type, matcher=matcher, description=description)
++        )
++        leaf: dict[str, Any] = {"type": node_type}
++        for key in ("enum", "format", "minimum", "maximum"):
++            if key in node:
++                leaf[key] = deepcopy(node[key])
++        nullable: dict[str, Any] = {"anyOf": [leaf, {"type": "null"}]}
++        if description:
++            nullable["description"] = description
++        return nullable
++    raise SchemaError(f"{path}: unsupported type {node_type!r}")
++
++
++def _matcher_for(node: dict[str, Any], path: str) -> Matcher:
++    override = node.get("x-fieldwise", {}).get("matcher")
++    if override is None:
++        return DEFAULT_MATCHERS[str(node["type"])]
++    if override not in ("text", "money", "number", "integer", "boolean", "date"):
++        raise SchemaError(f"{path}: unknown matcher {override!r}")
++    return override  # type: ignore[no-any-return]
+diff --git a/backend/src/fieldwise/schemas/registry.py b/backend/src/fieldwise/schemas/registry.py
+new file mode 100644
+index 0000000..34ca2b8
+--- /dev/null
++++ b/backend/src/fieldwise/schemas/registry.py
+@@ -0,0 +1,62 @@
++"""Built-in schemas shipped with the package, and their upsert into the database."""
++
++import json
++from importlib import resources
++from typing import Any
++
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from fieldwise.db.models import Schema
++from fieldwise.schemas.compiler import CompiledSchema, compile_schema
++
++BUILTIN_PACKAGE = "fieldwise.schemas.builtin"
++
++
++def load_builtin(name: str) -> dict[str, Any]:
++    text = resources.files(BUILTIN_PACKAGE).joinpath(f"{name}.json").read_text(encoding="utf-8")
++    data: dict[str, Any] = json.loads(text)
++    return data
++
++
++def builtin_names() -> list[str]:
++    return sorted(
++        p.name.removesuffix(".json")
++        for p in resources.files(BUILTIN_PACKAGE).iterdir()
++        if p.name.endswith(".json")
++    )
++
++
++def compile_builtin(name: str) -> CompiledSchema:
++    return compile_schema(load_builtin(name))
++
++
++def get_schema(session: Session, name: str, version: int | None = None) -> Schema | None:
++    stmt = select(Schema).where(Schema.name == name)
++    stmt = (
++        stmt.where(Schema.version == version)
++        if version is not None
++        else stmt.order_by(Schema.version.desc())
++    )
++    return session.scalars(stmt).first()
++
++
++def upsert_schema(session: Session, authored: dict[str, Any]) -> Schema:
++    """Stores the authored schema as a new version when it differs from the latest one."""
++    compiled = compile_schema(authored)
++    latest = get_schema(session, compiled.name)
++    if latest is not None and latest.json_schema == authored:
++        return latest
++    schema = Schema(
++        name=compiled.name,
++        version=(latest.version + 1) if latest else 1,
++        json_schema=authored,
++        field_meta=compiled.field_meta_dict(),
++    )
++    session.add(schema)
++    session.flush()
++    return schema
++
++
++def sync_builtins(session: Session) -> list[Schema]:
++    return [upsert_schema(session, load_builtin(name)) for name in builtin_names()]
+diff --git a/backend/src/fieldwise/storage.py b/backend/src/fieldwise/storage.py
+new file mode 100644
+index 0000000..a5636a1
+--- /dev/null
++++ b/backend/src/fieldwise/storage.py
+@@ -0,0 +1,98 @@
++"""Blob storage behind one small protocol: a local directory by default, S3-compatible when
++STORAGE_URL is s3://bucket[/prefix]. Keys are slash-separated paths."""
++
++from __future__ import annotations
++
++import os
++from functools import lru_cache
++from pathlib import Path
++from typing import TYPE_CHECKING, Protocol
++from urllib.parse import urlparse
++
++import boto3
++
++from fieldwise.config import get_settings
++
++if TYPE_CHECKING:
++    from mypy_boto3_s3 import S3Client
++
++
++class Storage(Protocol):
++    def put(self, key: str, data: bytes, content_type: str) -> None: ...
++    def get(self, key: str) -> bytes: ...
++    def exists(self, key: str) -> bool: ...
++    def delete(self, key: str) -> None: ...
++
++
++class LocalStorage:
++    def __init__(self, root: Path) -> None:
++        self.root = root
++
++    def _path(self, key: str) -> Path:
++        root = self.root.resolve()
++        path = (root / key).resolve()
++        if root not in path.parents:
++            raise ValueError(f"key escapes the storage root: {key!r}")
++        return path
++
++    def put(self, key: str, data: bytes, content_type: str) -> None:
++        path = self._path(key)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        tmp = path.with_suffix(path.suffix + ".tmp")
++        tmp.write_bytes(data)
++        os.replace(tmp, path)
++
++    def get(self, key: str) -> bytes:
++        return self._path(key).read_bytes()
++
++    def exists(self, key: str) -> bool:
++        return self._path(key).exists()
++
++    def delete(self, key: str) -> None:
++        path = self._path(key)
++        if path.exists():
++            path.unlink()
++
++
++class S3Storage:
++    def __init__(self, bucket: str, prefix: str = "", client: S3Client | None = None) -> None:
++        self.bucket = bucket
++        self.prefix = prefix.strip("/")
++        self.client: S3Client = client or boto3.client("s3")
++
++    def _key(self, key: str) -> str:
++        return f"{self.prefix}/{key}" if self.prefix else key
++
++    def put(self, key: str, data: bytes, content_type: str) -> None:
++        self.client.put_object(
++            Bucket=self.bucket, Key=self._key(key), Body=data, ContentType=content_type
++        )
++
++    def get(self, key: str) -> bytes:
++        return self.client.get_object(Bucket=self.bucket, Key=self._key(key))["Body"].read()
++
++    def exists(self, key: str) -> bool:
++        try:
++            self.client.head_object(Bucket=self.bucket, Key=self._key(key))
++        except self.client.exceptions.ClientError:
++            return False
++        return True
++
++    def delete(self, key: str) -> None:
++        self.client.delete_object(Bucket=self.bucket, Key=self._key(key))
++
++
++def storage_from_url(url: str) -> Storage:
++    parsed = urlparse(url)
++    if parsed.scheme == "file":
++        # file://./data/storage → relative; file:///abs/path → absolute
++        raw = (parsed.netloc + parsed.path) if parsed.netloc else parsed.path
++        return LocalStorage(Path(raw).expanduser())
++    if parsed.scheme == "s3":
++        return S3Storage(bucket=parsed.netloc, prefix=parsed.path)
++    raise ValueError(f"unsupported STORAGE_URL scheme: {parsed.scheme!r}")
++
++
++@lru_cache
++def get_storage() -> Storage:
++    return storage_from_url(get_settings().storage_url)
+diff --git a/backend/src/fieldwise/values.py b/backend/src/fieldwise/values.py
+new file mode 100644
+index 0000000..d8b491d
+--- /dev/null
++++ b/backend/src/fieldwise/values.py
+@@ -0,0 +1,84 @@
++"""Parsing and normalisation of printed values. Shared by the dataset importer (to normalise
++ground truth once) and the eval matchers (to normalise predictions the same way)."""
++
++import re
++from decimal import Decimal, InvalidOperation
++
++_MONEY_JUNK = re.compile(r"[^\d,.\-()]")
++_INT_IN_TEXT = re.compile(r"\d+")
++
++
++def parse_money(raw: object) -> Decimal | None:
++    """Turns printed amounts into a Decimal, or None when nothing numeric is there.
++
++    Handles currency symbols and words, thousands separators in either style ("60.000" and
++    "60,000" are both sixty thousand), decimal separators in either style ("12,50" and "12.50"),
++    negatives written as "-1.000" or "(1.000)", and lists (first parseable element wins).
++    """
++    if raw is None or isinstance(raw, bool):
++        return None
++    if isinstance(raw, int | float | Decimal):
++        return Decimal(str(raw))
++    if isinstance(raw, list | tuple):
++        return next((m for m in (parse_money(item) for item in raw) if m is not None), None)
++    return _parse_money_text(str(raw))
++
++
++def _parse_money_text(raw: str) -> Decimal | None:
++    text = _MONEY_JUNK.sub("", raw)
++    negative = text.startswith("-") or (text.startswith("(") and text.endswith(")"))
++    digits = text.strip("-()")
++    if not any(ch.isdigit() for ch in digits):
++        return None
++    try:
++        value = Decimal(_normalise_separators(digits))
++    except InvalidOperation:
++        return None
++    return -value if negative else value
++
++
++def _normalise_separators(digits: str) -> str:
++    has_dot, has_comma = "." in digits, "," in digits
++    if has_dot and has_comma:
++        # The last separator is the decimal one; everything else groups thousands.
++        last = max(digits.rfind("."), digits.rfind(","))
++        integer_part = re.sub(r"[.,]", "", digits[:last])
++        return f"{integer_part}.{digits[last + 1 :]}"
++    separator = "." if has_dot else "," if has_comma else None
++    if separator is None:
++        return digits
++    head, *groups = digits.split(separator)
++    if groups and all(len(g) == 3 for g in groups):
++        return head + "".join(groups)  # 60.000 or 1.234.567 → thousands
++    if len(groups) == 1 and len(groups[0]) in (1, 2):
++        return f"{head}.{groups[0]}"  # 12,5 or 12.50 → decimals
++    return head + "".join(groups)
++
++
++def parse_int(raw: object) -> int | None:
++    """First integer in the text: "2 x" → 2, "x2" → 2, "2.00" → 2, 3 → 3."""
++    if raw is None or isinstance(raw, bool):
++        return None
++    if isinstance(raw, int):
++        return raw
++    if isinstance(raw, float | Decimal):
++        return int(raw)
++    if isinstance(raw, list | tuple):
++        for item in raw:
++            parsed = parse_int(item)
++            if parsed is not None:
++                return parsed
++        return None
++    match = _INT_IN_TEXT.search(str(raw))
++    return int(match.group()) if match else None
++
++
++def normalise_text(raw: object) -> str:
++    """Case-folded, whitespace-collapsed, punctuation-light text for comparisons."""
++    if raw is None:
++        return ""
++    if isinstance(raw, list | tuple):
++        raw = " ".join(str(item) for item in raw)
++    text = str(raw).casefold()
++    text = re.sub(r"[^\w\s%&+/@-]", " ", text)
++    return " ".join(text.split())
+diff --git a/backend/tests/fixtures/cord/ATTRIBUTION.md b/backend/tests/fixtures/cord/ATTRIBUTION.md
+new file mode 100644
+index 0000000..7b738e5
+--- /dev/null
++++ b/backend/tests/fixtures/cord/ATTRIBUTION.md
+@@ -0,0 +1,9 @@
++# Fixture attribution
++
++The receipt images and ground-truth JSON files in this directory come from **CORD v2**
++(Park et al., "CORD: A Consolidated Receipt Dataset for Post-OCR Parsing", 2019), published by
++NAVER Clova on Hugging Face as `naver-clova-ix/cord-v2` under the **CC BY 4.0** license.
++
++They are downscaled copies of three validation-split receipts, used only to exercise OCR, prompt
++building and the eval matchers in the test suite. Regenerate with
++`uv run python scripts/make_fixtures.py`.
+diff --git a/backend/tests/fixtures/cord/cord-v2_validation_0000.jpg b/backend/tests/fixtures/cord/cord-v2_validation_0000.jpg
+new file mode 100644
+index 0000000..74d3ca4
+Binary files /dev/null and b/backend/tests/fixtures/cord/cord-v2_validation_0000.jpg differ
+diff --git a/backend/tests/fixtures/cord/cord-v2_validation_0000.json b/backend/tests/fixtures/cord/cord-v2_validation_0000.json
+new file mode 100644
+index 0000000..17177c9
+--- /dev/null
++++ b/backend/tests/fixtures/cord/cord-v2_validation_0000.json
+@@ -0,0 +1,24 @@
++{
++  "menu": [
++    {
++      "nm": "REAL GANACHE",
++      "cnt": "1",
++      "price": "16,500"
++    },
++    {
++      "nm": "EGG TART",
++      "cnt": "1",
++      "price": "13,000"
++    },
++    {
++      "nm": "PIZZA TOAST",
++      "cnt": "1",
++      "price": "16,000"
++    }
++  ],
++  "total": {
++    "total_price": "45,500",
++    "cashprice": "50,000",
++    "changeprice": "4,500"
++  }
++}
+diff --git a/backend/tests/fixtures/cord/cord-v2_validation_0006.jpg b/backend/tests/fixtures/cord/cord-v2_validation_0006.jpg
+new file mode 100644
+index 0000000..a7bf385
+Binary files /dev/null and b/backend/tests/fixtures/cord/cord-v2_validation_0006.jpg differ
+diff --git a/backend/tests/fixtures/cord/cord-v2_validation_0006.json b/backend/tests/fixtures/cord/cord-v2_validation_0006.json
+new file mode 100644
+index 0000000..ca23411
+--- /dev/null
++++ b/backend/tests/fixtures/cord/cord-v2_validation_0006.json
+@@ -0,0 +1,23 @@
++{
++  "menu": [
++    {
++      "nm": "POTATO SAUSAGE BREAD",
++      "cnt": "1",
++      "price": "19,000"
++    },
++    {
++      "nm": "OREO GREEN TEA SPREAD",
++      "cnt": "1",
++      "price": "52,000"
++    },
++    {
++      "nm": "WHITE CHOCO BANANA SPREAD",
++      "cnt": "1",
++      "price": "52,000"
++    }
++  ],
++  "total": {
++    "total_price": "123,000",
++    "creditcardprice": "123,000"
++  }
++}
+diff --git a/backend/tests/fixtures/cord/cord-v2_validation_0008.jpg b/backend/tests/fixtures/cord/cord-v2_validation_0008.jpg
+new file mode 100644
+index 0000000..b3f0251
+Binary files /dev/null and b/backend/tests/fixtures/cord/cord-v2_validation_0008.jpg differ
+diff --git a/backend/tests/fixtures/cord/cord-v2_validation_0008.json b/backend/tests/fixtures/cord/cord-v2_validation_0008.json
+new file mode 100644
+index 0000000..e1019e1
+--- /dev/null
++++ b/backend/tests/fixtures/cord/cord-v2_validation_0008.json
+@@ -0,0 +1,26 @@
++{
++  "menu": [
++    {
++      "nm": "TALAM UNGU",
++      "unitprice": "@6500",
++      "cnt": "3X",
++      "discountprice": "-7,800",
++      "price": "19,500"
++    },
++    {
++      "nm": "MIKA KECIL",
++      "unitprice": "@0",
++      "cnt": "1X",
++      "price": "0"
++    }
++  ],
++  "sub_total": {
++    "subtotal_price": "11,700"
++  },
++  "total": {
++    "total_price": "11,700",
++    "cashprice": "20,000",
++    "changeprice": "8,300",
++    "menuqty_cnt": "4.00xITEMs"
++  }
++}
+diff --git a/backend/tests/integration/conftest.py b/backend/tests/integration/conftest.py
+new file mode 100644
+index 0000000..d7a5d93
+--- /dev/null
++++ b/backend/tests/integration/conftest.py
+@@ -0,0 +1,43 @@
++"""A real Postgres with pgvector per test session; every test runs inside a rolled-back
++transaction so `session.commit()` in application code is harmless."""
++
++from collections.abc import Iterator
++from pathlib import Path
++
++import pytest
++from sqlalchemy import Engine, create_engine
++from sqlalchemy.orm import Session
++from testcontainers.community.postgres import PostgresContainer
++
++from fieldwise.db import migrate
++from fieldwise.storage import LocalStorage
++
++pytestmark = pytest.mark.integration
++
++
++@pytest.fixture(scope="session")
++def database_url() -> Iterator[str]:
++    with PostgresContainer("pgvector/pgvector:pg17", driver="psycopg") as postgres:
++        yield postgres.get_connection_url()
++
++
++@pytest.fixture(scope="session")
++def engine(database_url: str) -> Iterator[Engine]:
++    engine = create_engine(database_url, future=True)
++    migrate.upgrade(engine)
++    yield engine
++    engine.dispose()
++
++
++@pytest.fixture
++def session(engine: Engine) -> Iterator[Session]:
++    with engine.connect() as connection:
++        transaction = connection.begin()
++        with Session(bind=connection, join_transaction_mode="create_savepoint") as session:
++            yield session
++        transaction.rollback()
++
++
++@pytest.fixture
++def storage(tmp_path: Path) -> LocalStorage:
++    return LocalStorage(tmp_path / "storage")
+diff --git a/backend/tests/integration/test_documents.py b/backend/tests/integration/test_documents.py
+new file mode 100644
+index 0000000..dea7f00
+--- /dev/null
++++ b/backend/tests/integration/test_documents.py
+@@ -0,0 +1,76 @@
++from io import BytesIO
++
++import pytest
++from PIL import Image
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from fieldwise.db.models import Document, GoldenLabel
++from fieldwise.documents.cord_import import CordRow, import_rows
++from fieldwise.documents.service import create_document
++from fieldwise.schemas.registry import get_schema, load_builtin, sync_builtins, upsert_schema
++from fieldwise.storage import LocalStorage
++
++pytestmark = pytest.mark.integration
++
++
++def _jpeg(seed: int) -> bytes:
++    buffer = BytesIO()
++    Image.new("RGB", (120 + seed, 200), (seed * 20 % 255, 100, 100)).save(buffer, format="JPEG")
++    return buffer.getvalue()
++
++
++def test_sync_builtins_is_idempotent_and_versions_on_change(session: Session) -> None:
++    first = sync_builtins(session)
++    again = sync_builtins(session)
++    assert [s.version for s in first] == [1]
++    assert [s.id for s in again] == [s.id for s in first]
++
++    changed = load_builtin("receipt")
++    changed["properties"]["total"]["description"] = "changed"
++    bumped = upsert_schema(session, changed)
++    assert bumped.version == 2
++    assert get_schema(session, "receipt").version == 2  # type: ignore[union-attr]
++    assert get_schema(session, "receipt", version=1) is not None
++
++
++def test_create_document_stores_original_and_pages(session: Session, storage: LocalStorage) -> None:
++    document = create_document(session, storage, data=_jpeg(1), name="receipt.jpg", source="upload")
++    assert document.mime == "image/jpeg"
++    assert document.page_count == 1
++    assert storage.exists(document.storage_key)
++    assert storage.exists(document.pages[0]["key"])
++    assert document.pages[0]["width"] == 121
++
++    duplicate = create_document(session, storage, data=_jpeg(1), name="again.jpg", source="upload")
++    assert duplicate.id == document.id
++
++
++def test_import_rows_creates_documents_with_golden_labels(
++    session: Session, storage: LocalStorage
++) -> None:
++    schema = sync_builtins(session)[0]
++    rows = [
++        CordRow("validation", 0, _jpeg(10), {"menu": {"nm": "A", "price": "1.000"}}),
++        CordRow("validation", 1, _jpeg(11), {"total": {"total_price": "2.000"}}),
++        CordRow("validation", 2, _jpeg(12), {}),
++    ]
++
++    stats = import_rows(session, storage, iter(rows), schema, limit=2)
++    assert (stats.seen, stats.created, stats.skipped, stats.labelled) == (2, 2, 0, 2)
++
++    again = import_rows(session, storage, iter(rows), schema)
++    assert (again.seen, again.created, again.skipped) == (3, 1, 2)
++
++    documents = session.scalars(select(Document).order_by(Document.external_id)).all()
++    assert [d.external_id for d in documents] == [
++        "cord-v2/validation/0000",
++        "cord-v2/validation/0001",
++        "cord-v2/validation/0002",
++    ]
++    assert all(d.split == "validation" and d.source == "cord" for d in documents)
++    labels = session.scalars(select(GoldenLabel)).all()
++    assert len(labels) == 3
++    by_doc = {label.document_id: label.data for label in labels}
++    assert by_doc[documents[0].id]["line_items"][0]["line_total"] == 1000.0
++    assert by_doc[documents[1].id]["total"] == 2000.0
+diff --git a/backend/tests/integration/test_migrations.py b/backend/tests/integration/test_migrations.py
+new file mode 100644
+index 0000000..6ccdd15
+--- /dev/null
++++ b/backend/tests/integration/test_migrations.py
+@@ -0,0 +1,25 @@
++import pytest
++from sqlalchemy import Engine, create_engine, inspect, text
++
++from fieldwise.db import migrate
++
++pytestmark = pytest.mark.integration
++
++
++def test_upgrade_creates_tables_and_downgrade_removes_them(
++    database_url: str, engine: Engine
++) -> None:
++    names = set(inspect(engine).get_table_names())
++    assert {"schemas", "documents", "golden_labels", "alembic_version"} <= names
++    with engine.connect() as connection:
++        extensions = connection.execute(text("SELECT extname FROM pg_extension")).scalars().all()
++    assert "vector" in extensions
++
++    scratch = create_engine(database_url.replace("/test", "/test"), future=True)
++    try:
++        migrate.downgrade(scratch)
++        assert "documents" not in inspect(scratch).get_table_names()
++        migrate.upgrade(scratch)
++        assert "documents" in inspect(scratch).get_table_names()
++    finally:
++        scratch.dispose()
+diff --git a/backend/tests/unit/test_compiler.py b/backend/tests/unit/test_compiler.py
+new file mode 100644
+index 0000000..8e1525e
+--- /dev/null
++++ b/backend/tests/unit/test_compiler.py
+@@ -0,0 +1,95 @@
++from typing import Any
++
++import pytest
++
++from fieldwise.schemas.compiler import SchemaError, compile_schema
++from fieldwise.schemas.registry import builtin_names, compile_builtin, load_builtin
++
++
++def _walk(node: dict[str, Any]) -> list[dict[str, Any]]:
++    """Every object node in a compiled schema."""
++    found = []
++    if node.get("type") == "object":
++        found.append(node)
++        for child in node["properties"].values():
++            found.extend(_walk(child))
++    if node.get("type") == "array":
++        found.extend(_walk(node["items"]))
++    return found
++
++
++def test_receipt_is_a_builtin() -> None:
++    assert builtin_names() == ["receipt"]
++
++
++def test_every_object_is_strict_and_every_leaf_is_nullable() -> None:
++    compiled = compile_builtin("receipt")
++    for obj in _walk(compiled.strict):
++        assert obj["additionalProperties"] is False
++        assert obj["required"] == list(obj["properties"])
++    leaf = compiled.strict["properties"]["total"]
++    assert leaf["anyOf"] == [{"type": "number"}, {"type": "null"}]
++    assert "final amount" in leaf["description"]
++
++
++def test_field_paths_and_matchers() -> None:
++    compiled = compile_builtin("receipt")
++    meta = compiled.field_meta_dict()
++    assert meta["total"]["matcher"] == "money"
++    assert meta["item_count"]["matcher"] == "integer"
++    assert meta["line_items"]["matcher"] == "list"
++    assert meta["line_items"]["children"] == [
++        "line_items[].name",
++        "line_items[].quantity",
++        "line_items[].unit_price",
++        "line_items[].line_total",
++    ]
++    assert meta["line_items[].name"]["matcher"] == "text"
++    assert "line_items" not in compiled.leaf_paths
++    assert "line_items[].line_total" in compiled.leaf_paths
++
++
++def test_nested_objects_and_scalar_arrays() -> None:
++    compiled = compile_schema(
++        {
++            "title": "invoice",
++            "type": "object",
++            "properties": {
++                "seller": {
++                    "type": "object",
++                    "properties": {"name": {"type": "string"}, "vat_id": {"type": "string"}},
++                },
++                "tags": {"type": "array", "items": {"type": "string"}},
++                "paid": {"type": "boolean"},
++            },
++        }
++    )
++    paths = [f.path for f in compiled.fields]
++    assert paths == ["seller", "seller.name", "seller.vat_id", "tags", "tags[]", "paid"]
++    assert compiled.strict["properties"]["tags"]["items"]["anyOf"][0] == {"type": "string"}
++    assert compiled.field_meta_dict()["paid"]["matcher"] == "boolean"
++
++
++@pytest.mark.parametrize(
++    "authored",
++    [
++        {"title": "x", "type": "array", "items": {"type": "string"}},
++        {"title": "x", "type": "object", "properties": {"a": {"type": "date"}}},
++        {"title": "x", "type": "object", "properties": {"a": {"type": "array"}}},
++        {"title": "x", "type": "object", "properties": {"a": {"type": "object"}}},
++        {
++            "title": "x",
++            "type": "object",
++            "properties": {"a": {"type": "string", "x-fieldwise": {"matcher": "regex"}}},
++        },
++    ],
++)
++def test_unsupported_shapes_are_rejected(authored: dict[str, Any]) -> None:
++    with pytest.raises(SchemaError):
++        compile_schema(authored)
++
++
++def test_builtin_receipt_round_trips_through_json() -> None:
++    authored = load_builtin("receipt")
++    assert authored["title"] == "receipt"
++    assert compile_schema(authored).name == "receipt"
+diff --git a/backend/tests/unit/test_cord_import.py b/backend/tests/unit/test_cord_import.py
+new file mode 100644
+index 0000000..0284d23
+--- /dev/null
++++ b/backend/tests/unit/test_cord_import.py
+@@ -0,0 +1,89 @@
++import json
++from io import BytesIO
++from pathlib import Path
++
++import pyarrow as pa
++import pyarrow.parquet as pq
++from PIL import Image
++
++from fieldwise.documents.cord_import import iter_rows, map_gt_parse
++
++SAMPLE_GT = {
++    "menu": [
++        {"nm": "NASI GORENG", "cnt": "2 x", "unitprice": "25.000", "price": "50.000"},
++        {"nm": ["ES", "TEH"], "price": "8.000", "num": "2"},
++    ],
++    "sub_total": {"subtotal_price": "58.000", "tax_price": "5.800", "discount_price": "-5.000"},
++    "total": {
++        "total_price": "58.800",
++        "cashprice": "100.000",
++        "changeprice": "41.200",
++        "menuqty_cnt": "3",
++    },
++}
++
++
++def test_map_gt_parse_normalises_values_and_defaults_quantity() -> None:
++    golden = map_gt_parse(SAMPLE_GT)
++    assert golden["line_items"] == [
++        {"name": "NASI GORENG", "quantity": 2, "unit_price": 25000.0, "line_total": 50000.0},
++        {"name": "ES TEH", "quantity": 1, "unit_price": None, "line_total": 8000.0},
++    ]
++    assert golden["subtotal"] == 58000.0
++    assert golden["discount"] == -5000.0
++    assert golden["tax"] == 5800.0
++    assert golden["service_charge"] is None
++    assert golden["total"] == 58800.0
++    assert golden["cash_paid"] == 100000.0
++    assert golden["change"] == 41200.0
++    assert golden["card_paid"] is None
++    assert golden["item_count"] == 3
++
++
++def test_map_gt_parse_accepts_single_menu_dict_and_list_sections() -> None:
++    golden = map_gt_parse(
++        {
++            "menu": {"nm": "-TICKET CP", "cnt": "2", "price": "60.000"},
++            "sub_total": [{"subtotal_price": "60.000"}, {"tax_price": "5.455"}],
++            "total": {"total_price": "60.000", "creditcardprice": "60.000", "menuqty_cnt": "2.00"},
++        }
++    )
++    assert golden["line_items"] == [
++        {"name": "-TICKET CP", "quantity": 2, "unit_price": None, "line_total": 60000.0}
++    ]
++    assert golden["subtotal"] == 60000.0
++    assert golden["tax"] == 5455.0
++    assert golden["card_paid"] == 60000.0
++    assert golden["item_count"] == 2
++
++
++def test_map_gt_parse_of_empty_ground_truth() -> None:
++    golden = map_gt_parse({})
++    assert golden["line_items"] == []
++    assert all(golden[key] is None for key in golden if key != "line_items")
++
++
++def _jpeg() -> bytes:
++    buffer = BytesIO()
++    Image.new("RGB", (40, 60), "white").save(buffer, format="JPEG")
++    return buffer.getvalue()
++
++
++def test_iter_rows_reads_parquet_in_order(tmp_path: Path) -> None:
++    table = pa.table(
++        {
++            "image": [{"bytes": _jpeg(), "path": "a.jpg"}, {"bytes": _jpeg(), "path": "b.jpg"}],
++            "ground_truth": [
++                json.dumps({"gt_parse": SAMPLE_GT}),
++                json.dumps({"gt_parse": {"menu": {"nm": "X", "price": "1.000"}}}),
++            ],
++        }
++    )
++    path = tmp_path / "validation-00000.parquet"
++    pq.write_table(table, path)
++
++    rows = list(iter_rows("validation", [path]))
++
++    assert [r.external_id for r in rows] == ["cord-v2/validation/0000", "cord-v2/validation/0001"]
++    assert rows[0].gt_parse == SAMPLE_GT
++    assert rows[1].image.startswith(b"\xff\xd8")
+diff --git a/backend/tests/unit/test_render.py b/backend/tests/unit/test_render.py
+new file mode 100644
+index 0000000..0790d13
+--- /dev/null
++++ b/backend/tests/unit/test_render.py
+@@ -0,0 +1,58 @@
++from io import BytesIO
++
++import pytest
++from PIL import Image
++
++from fieldwise.documents.render import (
++    PDF_MIME,
++    UnsupportedDocumentError,
++    downscale_jpeg,
++    render_pages,
++    sniff_mime,
++)
++
++
++def _image_bytes(fmt: str, size: tuple[int, int] = (300, 500)) -> bytes:
++    buffer = BytesIO()
++    Image.new("RGB", size, "white").save(buffer, format=fmt)
++    return buffer.getvalue()
++
++
++def _pdf_bytes(pages: int = 2) -> bytes:
++    buffer = BytesIO()
++    images = [Image.new("RGB", (300, 500), "white") for _ in range(pages)]
++    images[0].save(buffer, format="PDF", save_all=True, append_images=images[1:])
++    return buffer.getvalue()
++
++
++def test_sniff_mime() -> None:
++    assert sniff_mime(_pdf_bytes()) == PDF_MIME
++    assert sniff_mime(_image_bytes("JPEG")) == "image/jpeg"
++    assert sniff_mime(_image_bytes("PNG")) == "image/png"
++    with pytest.raises(UnsupportedDocumentError):
++        sniff_mime(b"hello")
++
++
++def test_render_image_bounds_the_long_edge() -> None:
++    pages = render_pages(_image_bytes("PNG", (3000, 6000)), "image/png", max_edge=1000)
++    assert len(pages) == 1
++    assert (pages[0].width, pages[0].height) == (500, 1000)
++    assert pages[0].jpeg.startswith(b"\xff\xd8")
++
++
++def test_render_pdf_renders_every_page() -> None:
++    pages = render_pages(_pdf_bytes(pages=3), PDF_MIME, max_edge=800)
++    assert [p.page for p in pages] == [1, 2, 3]
++    assert all(max(p.width, p.height) == 800 for p in pages)
++
++
++def test_downscale_jpeg() -> None:
++    page = render_pages(_image_bytes("JPEG", (1600, 800)), "image/jpeg", max_edge=1600)[0]
++    smaller = downscale_jpeg(page.jpeg, max_edge=400)
++    with Image.open(BytesIO(smaller)) as image:
++        assert image.size == (400, 200)
++
++
++def test_unknown_mime_is_rejected() -> None:
++    with pytest.raises(UnsupportedDocumentError):
++        render_pages(b"...", "text/plain")
+diff --git a/backend/tests/unit/test_storage.py b/backend/tests/unit/test_storage.py
+new file mode 100644
+index 0000000..9cd8b67
+--- /dev/null
++++ b/backend/tests/unit/test_storage.py
+@@ -0,0 +1,51 @@
++from pathlib import Path
++
++import boto3
++import pytest
++from moto import mock_aws
++
++from fieldwise.storage import LocalStorage, S3Storage, storage_from_url
++
++
++def test_local_storage_round_trip(tmp_path: Path) -> None:
++    storage = LocalStorage(tmp_path / "store")
++    storage.put("documents/1/original.pdf", b"%PDF", "application/pdf")
++    assert storage.exists("documents/1/original.pdf")
++    assert storage.get("documents/1/original.pdf") == b"%PDF"
++    storage.delete("documents/1/original.pdf")
++    assert not storage.exists("documents/1/original.pdf")
++    storage.delete("documents/1/original.pdf")  # idempotent
++
++
++def test_local_storage_refuses_path_escape(tmp_path: Path) -> None:
++    storage = LocalStorage(tmp_path / "store")
++    with pytest.raises(ValueError, match="escapes"):
++        storage.put("../outside", b"x", "text/plain")
++
++
++@mock_aws
++def test_s3_storage_round_trip() -> None:
++    client = boto3.client("s3", region_name="us-east-1")
++    client.create_bucket(Bucket="fieldwise-test")
++    storage = S3Storage("fieldwise-test", prefix="/dev/", client=client)
++    storage.put("documents/1/pages/1.jpg", b"jpeg", "image/jpeg")
++    assert storage.exists("documents/1/pages/1.jpg")
++    assert storage.get("documents/1/pages/1.jpg") == b"jpeg"
++    assert client.head_object(Bucket="fieldwise-test", Key="dev/documents/1/pages/1.jpg")
++    storage.delete("documents/1/pages/1.jpg")
++    assert not storage.exists("documents/1/pages/1.jpg")
++
++
++def test_storage_from_url(tmp_path: Path) -> None:
++    local = storage_from_url(f"file://{tmp_path}/blobs")
++    assert isinstance(local, LocalStorage)
++    assert local.root == tmp_path / "blobs"
++    relative = storage_from_url("file://./data/storage")
++    assert isinstance(relative, LocalStorage)
++    assert relative.root == Path("./data/storage")
++    with mock_aws():
++        s3 = storage_from_url("s3://bucket/prefix")
++        assert isinstance(s3, S3Storage)
++        assert (s3.bucket, s3.prefix) == ("bucket", "prefix")
++    with pytest.raises(ValueError, match="scheme"):
++        storage_from_url("ftp://x")
+diff --git a/backend/tests/unit/test_values.py b/backend/tests/unit/test_values.py
+new file mode 100644
+index 0000000..77e1111
+--- /dev/null
++++ b/backend/tests/unit/test_values.py
+@@ -0,0 +1,49 @@
++from decimal import Decimal
++
++import pytest
++
++from fieldwise.values import normalise_text, parse_int, parse_money
++
++
++@pytest.mark.parametrize(
++    ("raw", "expected"),
++    [
++        ("60.000", Decimal("60000")),
++        ("60,000", Decimal("60000")),
++        ("1.234.567", Decimal("1234567")),
++        ("12,50", Decimal("12.50")),
++        ("12.5", Decimal("12.5")),
++        ("1.234,50", Decimal("1234.50")),
++        ("1,234.50", Decimal("1234.50")),
++        ("Rp 60.000", Decimal("60000")),
++        ("IDR60.000,-", Decimal("60000")),
++        ("-60.000", Decimal("-60000")),
++        ("(60.000)", Decimal("-60000")),
++        ("@ 15.000", Decimal("15000")),
++        ("60000", Decimal("60000")),
++        (60000, Decimal("60000")),
++        (12.5, Decimal("12.5")),
++        (["", "60.000"], Decimal("60000")),
++    ],
++)
++def test_parse_money(raw: object, expected: Decimal) -> None:
++    assert parse_money(raw) == expected
++
++
++@pytest.mark.parametrize("raw", [None, "", "free", "-", "()", [], True])
++def test_parse_money_rejects_non_amounts(raw: object) -> None:
++    assert parse_money(raw) is None
++
++
++@pytest.mark.parametrize(
++    ("raw", "expected"),
++    [("2", 2), ("2 x", 2), ("x2", 2), ("2.00", 2), (3, 3), (2.9, 2), (["", "4"], 4), ("qty", None)],
++)
++def test_parse_int(raw: object, expected: int | None) -> None:
++    assert parse_int(raw) == expected
++
++
++def test_normalise_text_folds_case_whitespace_and_punctuation() -> None:
++    assert normalise_text("  NASI  Goreng, (Spicy)!! ") == "nasi goreng spicy"
++    assert normalise_text(["Es", "Teh"]) == "es teh"
++    assert normalise_text(None) == ""
+diff --git a/backend/uv.lock b/backend/uv.lock
+index 761b158..c724775 100644
+--- a/backend/uv.lock
++++ b/backend/uv.lock
+@@ -91,6 +91,61 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/91/a7/c8bbb2173f7a7131b3b2412035b2d814ab5ef2ce9799bd06f07c451640e4/ast_serialize-0.11.2-cp39-abi3-win_arm64.whl", hash = "sha256:dab599cbdcb7b45b18c41fad746645580b3a24357082b7f0e8921cd373804f27", size = 1136031, upload-time = "2026-09-13T18:48:54.04Z" },
+ ]
+ 
++[[package]]
++name = "boto3"
++version = "1.43.97"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "botocore" },
++    { name = "jmespath" },
++    { name = "s3transfer" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/39/bd/928bf084b0441b2efbac3e02299892dfb07899cd3617af6ebdc13be2cfb9/boto3-1.43.97.tar.gz", hash = "sha256:ffe9a93a6b4b2c1b59f4f5e07c18d2acfe8f68c320a1a12251d4ea8570b9bdfe", size = 112655, upload-time = "2026-09-17T19:28:52.805Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/a7/7f/068104b9d07b0e3e262074bf4efb36a72c836654a14bdfa911ad1e42b393/boto3-1.43.97-py3-none-any.whl", hash = "sha256:420b45f566d3b49c6c1f021c50f47f66ea99ef05b1872d80b472c536542b321e", size = 140032, upload-time = "2026-09-17T19:28:51.212Z" },
++]
++
++[[package]]
++name = "boto3-stubs"
++version = "1.43.97"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "botocore-stubs" },
++    { name = "types-s3transfer" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/46/cf/36a32214b78ec9221d566c0d9ce39ff3039454950c0caab862777463bffe/boto3_stubs-1.43.97.tar.gz", hash = "sha256:fba0be9eaff7ea3eec65fee895a78cbe33a7afe65b79d472226b00bcc448b7bc", size = 104577, upload-time = "2026-09-17T20:32:30.468Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/99/3b/70fd23c1ec1664c6cfdde23d4fbf5c7b3ed208d9c1c31d1a3393f80a394b/boto3_stubs-1.43.97-py3-none-any.whl", hash = "sha256:346e652db3e917b363ff4792893bf0fca327ad4d9a394f57248bd4bd34b02fd4", size = 71513, upload-time = "2026-09-17T20:32:25.879Z" },
++]
++
++[package.optional-dependencies]
++s3 = [
++    { name = "mypy-boto3-s3" },
++]
++
++[[package]]
++name = "botocore"
++version = "1.43.97"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "jmespath" },
++    { name = "python-dateutil" },
++    { name = "urllib3" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/f9/c7/aff84828bc3cd05328c65650320be27bb13e63f37917f1aba3f6309498c8/botocore-1.43.97.tar.gz", hash = "sha256:7c0e18686367e98de49826d8ac9ae951ce0915c172969a5d96b768c9afa9e979", size = 16120115, upload-time = "2026-09-17T19:28:48.141Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/a9/3b/ffb7780e5f4c6af60eee31b8badd2762bba1793ca05f926e9381919c7d85/botocore-1.43.97-py3-none-any.whl", hash = "sha256:6b2beefd4f515aa7bfc614c945493a19315577ff31b464abbc9e33b7aff5112c", size = 15813332, upload-time = "2026-09-17T19:28:45.248Z" },
++]
++
++[[package]]
++name = "botocore-stubs"
++version = "1.43.67"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/3f/45/53d662227dc4787b2c854445ee7eb4751cb5d74cfb5c686a6ecbe1f94c17/botocore_stubs-1.43.67.tar.gz", hash = "sha256:853e74014a1f557055c4ffae5fb38d7c65c7c0520e1aab366cac41d5428f419d", size = 42846, upload-time = "2026-08-08T14:57:53.412Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/4e/5e/bdbf19967898a032292da65a47d6e25b2eee55865db4e687f861d80b5602/botocore_stubs-1.43.67-py3-none-any.whl", hash = "sha256:c51262bac3341c1cda71f05fa01141fffd3990d7a92c7960e3b755c1bc830373", size = 67244, upload-time = "2026-08-08T14:57:52.01Z" },
++]
++
+ [[package]]
+ name = "certifi"
+ version = "2026.7.22"
+@@ -100,6 +155,29 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/0b/a7/71ac2cff56fec219ed242bb11b8efb69fcc4bec75db06fb7bfe35de520e6/certifi-2026.7.22-py3-none-any.whl", hash = "sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775", size = 136983, upload-time = "2026-07-22T03:35:11.276Z" },
+ ]
+ 
++[[package]]
++name = "cffi"
++version = "2.1.1"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "pycparser", marker = "implementation_name != 'PyPy'" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/9e/ef/008a1939e372c06329a3fce4279c02f328488f3526744906eeec3da7ad5f/cffi-2.1.1.tar.gz", hash = "sha256:dd31f52ea1086513bb9df30f8fcee9b8918323ae067a3d5b78bc826a000712be", size = 530807, upload-time = "2026-08-03T21:21:18.939Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/10/69/43965eccfdead3b9220015fd1320e117be8c6ed01a62ffab76eeb752f5d5/cffi-2.1.1-cp312-cp312-macosx_10_15_x86_64.whl", hash = "sha256:c8c69575568085ba0b1b10c0249d779a214aea6f6522e949a0fc9fb0fcb449d0", size = 184821, upload-time = "2026-08-03T21:19:44.887Z" },
++    { url = "https://files.pythonhosted.org/packages/54/7d/16e5a096677b5e313ca80cd5e5170efa3ea44624a82bb111925522da64b1/cffi-2.1.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:f81b3b8f3d4e343550fa4baa0e479bba9f2d29ce9c2e9b51d1ce1718d7442fcf", size = 184719, upload-time = "2026-08-03T21:19:46.129Z" },
++    { url = "https://files.pythonhosted.org/packages/56/e6/8941622732edec876dd17d0453dce07317ae96db34f2ec1436c9d3785986/cffi-2.1.1-cp312-cp312-manylinux1_i686.manylinux2014_i686.manylinux_2_17_i686.manylinux_2_5_i686.whl", hash = "sha256:811bd1e21d32de12efca32393a0ab3f5133b54fce9bd44b8bd77ab07da14bf6a", size = 214799, upload-time = "2026-08-03T21:19:47.218Z" },
++    { url = "https://files.pythonhosted.org/packages/44/de/f98430906df1545ffde0d543dd124a7a439bc2cd32b36b9c53f805df7333/cffi-2.1.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:68e62fe11f30d5ca8289242866f0a5291402d8529ca2178ab8afc5c9694ae890", size = 222389, upload-time = "2026-08-03T21:19:48.331Z" },
++    { url = "https://files.pythonhosted.org/packages/6a/5b/717f1526b9957b34456313c31645c5b82b8fb5c3fe9e4752999be7128bfc/cffi-2.1.1-cp312-cp312-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:4a7c934f7360e8cd64fe9efadcbd10c7c6364f531e432b9a4bf5ccbc9e0e8b50", size = 210249, upload-time = "2026-08-03T21:19:49.543Z" },
++    { url = "https://files.pythonhosted.org/packages/64/b3/f8aa4f3e34986c7e4ec45072d1b1b9dd295b6b18007b45518d79726dd725/cffi-2.1.1-cp312-cp312-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:3143d81e29e1e20a9ce10901ec369012947876596f75a222235965f2b7ae832e", size = 208775, upload-time = "2026-08-03T21:19:50.918Z" },
++    { url = "https://files.pythonhosted.org/packages/b1/db/dceb9dd5b231e1da801793f8acc9f3c52a7e1afe40bb1aae37e02b0faad5/cffi-2.1.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf", size = 221822, upload-time = "2026-08-03T21:19:52.054Z" },
++    { url = "https://files.pythonhosted.org/packages/a0/d2/6cd24ae3be000a634109c247d1475d62e5616d0dc78c82770942ec384248/cffi-2.1.1-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:208f941bb9d18e768138677f0a6d2ce01f590df56043dda1df1535ac57c88517", size = 225232, upload-time = "2026-08-03T21:19:53.109Z" },
++    { url = "https://files.pythonhosted.org/packages/cb/52/3fa190537004dd7f0ab860a6dc7c0175b8667f68d1e618a46f5498d30250/cffi-2.1.1-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:210019b6c7cf07f081b4c54635c8cf744377001350e29cc0f81c4377b4797735", size = 223597, upload-time = "2026-08-03T21:19:54.515Z" },
++    { url = "https://files.pythonhosted.org/packages/80/fb/0bb75b7039588c074b37ae99f40d9bfddf990ecb2fbc346ebccd2e56b9be/cffi-2.1.1-cp312-cp312-win32.whl", hash = "sha256:046bfc24911b37851ee1b51aab8bffe713d89c68c6a057b09484ce9fd5f69b4e", size = 175292, upload-time = "2026-08-03T21:19:55.566Z" },
++    { url = "https://files.pythonhosted.org/packages/d9/79/615cc094e2fb508cade7de88d3b4f6c4ec2bab695c97bce9153dc65aadf5/cffi-2.1.1-cp312-cp312-win_amd64.whl", hash = "sha256:f53e442b08449d42821fa4a4fba000095af9f62742a500f978a9f557ec44339a", size = 185919, upload-time = "2026-08-03T21:19:56.89Z" },
++    { url = "https://files.pythonhosted.org/packages/70/c6/d0ea84713fe46b243a436a18fcd47d639732747e21635c8a27191b06dc30/cffi-2.1.1-cp312-cp312-win_arm64.whl", hash = "sha256:7bde5e4cc5c10140859842b9d383af292b22639a4dffb725314baf45968cef80", size = 180093, upload-time = "2026-08-03T21:19:58.155Z" },
++]
++
+ [[package]]
+ name = "charset-normalizer"
+ version = "3.5.1"
+@@ -183,6 +261,43 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/96/1a/d6d16babd0a5fe4c3fae40702158c570351694e74516d8d81b86c5637448/coverage-7.16.1-py3-none-any.whl", hash = "sha256:3d8bd4e58b6a5c2018d808f297905393c6c61da466a48c3f0596a76a4900ebe4", size = 215264, upload-time = "2026-09-13T19:12:18.895Z" },
+ ]
+ 
++[[package]]
++name = "cryptography"
++version = "50.0.1"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "cffi", marker = "platform_python_implementation != 'PyPy'" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/bb/ad/5d6702db60b1e40b41ef513b6967ff5848f307d50f8449baf1634f5908f1/cryptography-50.0.1.tar.gz", hash = "sha256:5dd9bda1c12b4162f6ff568eeb5e0ff956c28d14406e875cfe8a63a2d414ff20", size = 880381, upload-time = "2026-08-25T19:45:45.499Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/ba/19/797e2aaac9df6a66f1550f49979dc1b1e39ecd2077501c30efa81e8d5d67/cryptography-50.0.1-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:b8f852c65863251b9e3a1b8c150ce21e59b522dbb6a7d4bc80e680d38388e986", size = 4010153, upload-time = "2026-08-25T19:44:03.155Z" },
++    { url = "https://files.pythonhosted.org/packages/90/34/9ce9a62ed9dc82ca9fd6a34445b6904af56e5f38b3eae2ed32e49c36053d/cryptography-50.0.1-cp311-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:53e279950892dc102c6b4e52af03ae5ea92fac572a1ddab78ca73a997f62b69f", size = 4723133, upload-time = "2026-08-25T19:44:05.461Z" },
++    { url = "https://files.pythonhosted.org/packages/57/26/e6d4fc8512a51a5f9ee7bfdbfb853bce1197087df40c9ad993ad370b846f/cryptography-50.0.1-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:ff838d62ec1bfce4f9ba7fa16f4a7b554cd8d0c299e6be37502161a660c84eef", size = 4712478, upload-time = "2026-08-25T19:44:07.375Z" },
++    { url = "https://files.pythonhosted.org/packages/e6/de/d3cdc2815697aae84126cbd6a030ca7b6b452e28a88b501b836bd3aa7a86/cryptography-50.0.1-cp311-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:e74591e283fe6eb956416c929eb58262a719fe0311fd9054c62c3350ed8760d8", size = 4730726, upload-time = "2026-08-25T19:44:09.294Z" },
++    { url = "https://files.pythonhosted.org/packages/55/32/38c0d344b98c06d34b5df8946565a9c0d6dbf32c8e0730a7f05f0a3c6cab/cryptography-50.0.1-cp311-abi3-manylinux_2_28_ppc64le.whl", hash = "sha256:5fe002589592ed749ce77fe0695fcbd3500dd61d7d6db5858a7544c612fa8e45", size = 5353524, upload-time = "2026-08-25T19:44:11.96Z" },
++    { url = "https://files.pythonhosted.org/packages/e1/1b/82f0f0d8858d4432be1af790477edf62aef90324041aa07c57e57bef1af7/cryptography-50.0.1-cp311-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:51593d180cf6d179bde5c5d065bed81386b1f381656ae7d042b7ffc87a9895ad", size = 4746720, upload-time = "2026-08-25T19:44:14.051Z" },
++    { url = "https://files.pythonhosted.org/packages/29/ba/042ca458b8c64348c768284b5d23e69b92ed53d057ab779fee628564676d/cryptography-50.0.1-cp311-abi3-manylinux_2_31_armv7l.whl", hash = "sha256:359e62deae718bce96170e223fdcb6357e4fbd3bb7a3a75f4430763532560e49", size = 4361866, upload-time = "2026-08-25T19:44:16.167Z" },
++    { url = "https://files.pythonhosted.org/packages/39/3b/e96c1ef71edef71057c7e3c3d982ce8fda554e0c52d0cc19c18845cde3eb/cryptography-50.0.1-cp311-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:e2ca8fd1b6b4b82a1c4cb02841d0837e3c12336c2e24b520ab8ab3b969733d8f", size = 4730028, upload-time = "2026-08-25T19:44:18.085Z" },
++    { url = "https://files.pythonhosted.org/packages/e3/38/45abd72ef63f2e7d0754a6cacf97bd8b69512ace7f6130d24c39ece65da2/cryptography-50.0.1-cp311-abi3-manylinux_2_34_ppc64le.whl", hash = "sha256:76de83fbd91ac49c0feaaa983d0748fd7a53176afac5fb3bf7478d244f0eb527", size = 5308405, upload-time = "2026-08-25T19:44:20.197Z" },
++    { url = "https://files.pythonhosted.org/packages/85/66/6ccca4722987ddedaa7fc9c3f4708af7431f5535666c174350830888c6b7/cryptography-50.0.1-cp311-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:51afcfceb15597cf2635068e4ac9a56b2abde622edde17f37d85fd7b5306497a", size = 4746230, upload-time = "2026-08-25T19:44:22.376Z" },
++    { url = "https://files.pythonhosted.org/packages/13/0e/b1f92e013228111413f2e6743948b80bc24dfd3c1b87ba98ceea16f5df89/cryptography-50.0.1-cp311-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:be224a65493ec5b74a158ff22a5522ce4a5ca1e543c647a3a4730d4a09e5f959", size = 4862596, upload-time = "2026-08-25T19:44:24.472Z" },
++    { url = "https://files.pythonhosted.org/packages/7e/22/c3654cccc856e9d682817b04ac3ee79731cb09ca6f95996a95c904de2883/cryptography-50.0.1-cp311-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:9ebcdd5519be9b652a46f507817a74591774fc3d6923ac364e4dfa64e36b291b", size = 5014082, upload-time = "2026-08-25T19:44:26.709Z" },
++    { url = "https://files.pythonhosted.org/packages/42/8b/cb12b1b60c91b074ca6bf0fdd59aa8f10d8bc5f73af8faece86ef0421b37/cryptography-50.0.1-cp311-abi3-win_amd64.whl", hash = "sha256:aed8db4f6d71c51efb89530e12d9464e7bf2923d46c3205dc794a2a93f8c0648", size = 3842826, upload-time = "2026-08-25T19:44:28.784Z" },
++    { url = "https://files.pythonhosted.org/packages/84/a9/ee16a903f13755e914d1eecc482fe64d1f10761c3960e5d8fa6837377aff/cryptography-50.0.1-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:ca83d00d9e69cd5eb63f2e69c3a5a59e0cecae5ae14c6ae0b35830fe3b37bad0", size = 4035307, upload-time = "2026-08-25T19:44:58.305Z" },
++    { url = "https://files.pythonhosted.org/packages/5e/a5/9ec7e81e8526c0d7a387d73386b2daed3f39e10d81a85930bd1b6bfba65c/cryptography-50.0.1-cp39-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:05ba322c4da95b262a212c345af888ef2c37c88c0509756ea00a0e6d68850f23", size = 4751900, upload-time = "2026-08-25T19:45:00.401Z" },
++    { url = "https://files.pythonhosted.org/packages/7e/3c/0e77bd5ffcf078e9dd27d3074aad6c030d9b10d0bf69329d573c927a188c/cryptography-50.0.1-cp39-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:e22dfed744bd4002e909464cb23d2f0b05c6f3113a79ef2e9864a53db737c733", size = 4738357, upload-time = "2026-08-25T19:45:02.786Z" },
++    { url = "https://files.pythonhosted.org/packages/27/3a/3c5f80daa4dcd47323c7af8a2fcb90de27a33564d4fcac69846c0972691a/cryptography-50.0.1-cp39-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:4c4188f7c0cf655be5c06342b817ed0f9595b69ffa2b12026e5353eed29dea88", size = 4758474, upload-time = "2026-08-25T19:45:04.889Z" },
++    { url = "https://files.pythonhosted.org/packages/6e/2b/214cf0cf93db9628c3c20c896b229f327f6fb1b20e4b3743d8ad3f00af8b/cryptography-50.0.1-cp39-abi3-manylinux_2_28_ppc64le.whl", hash = "sha256:2ebbfb0f1fed745e91796e3e1080a1440423fdae8ece1b995a1d80883a409054", size = 5375862, upload-time = "2026-08-25T19:45:07.163Z" },
++    { url = "https://files.pythonhosted.org/packages/d6/51/3f9701867a46b6c1740c9b52fc4d3bed6cbdcfedcc9b6e64305c07f39cff/cryptography-50.0.1-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:407fe2b6db00939c05c0e945e9914238f2f0a430974839429dafc82b1ee6bee5", size = 4772942, upload-time = "2026-08-25T19:45:09.396Z" },
++    { url = "https://files.pythonhosted.org/packages/0d/5c/13ea642e08e2544d0f5396122055f4820cfacb3203562197b5967125ea97/cryptography-50.0.1-cp39-abi3-manylinux_2_31_armv7l.whl", hash = "sha256:2b34d76a652ea2b6faf777c35df230c5637842cd904e04f16230c3f9f03e4361", size = 4383347, upload-time = "2026-08-25T19:45:11.659Z" },
++    { url = "https://files.pythonhosted.org/packages/84/d5/7d1fe1cb93f91c428093ff234e128c89ba8ea61a6f26aab406081f9b996e/cryptography-50.0.1-cp39-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:01f41478cf33fc605a6a089cd56d28b45c6c0b45a1928b61797f2621a04bac71", size = 4758050, upload-time = "2026-08-25T19:45:13.745Z" },
++    { url = "https://files.pythonhosted.org/packages/dd/04/557fc5ead96a829e0bc812a3b9dc4a52a2f27e4f7f5950da7ff27653a805/cryptography-50.0.1-cp39-abi3-manylinux_2_34_ppc64le.whl", hash = "sha256:fc3ed7ebd2a8c96f5b166de0ab9b624996bef3b07bbeb19364dfb78222c22c80", size = 5332955, upload-time = "2026-08-25T19:45:16.193Z" },
++    { url = "https://files.pythonhosted.org/packages/8c/eb/5d7124083e8d8cda8f5b348f544b71ad6f707ad63193758ef4d8e569da02/cryptography-50.0.1-cp39-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:9dde0a357190eb3b1da1bb9ab750e9c85cba82ca5977aa0836cbb94e92611239", size = 4772694, upload-time = "2026-08-25T19:45:18.315Z" },
++    { url = "https://files.pythonhosted.org/packages/63/8e/f1f955e0921dd2b6d22eae7e8d24a4c4b638d10735ffbf6a71f99eb0fcb8/cryptography-50.0.1-cp39-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:fd3718b960d0b5dd213cdf03f3bcb7000e69dda0de8b956061947ff6bcff5558", size = 4888413, upload-time = "2026-08-25T19:45:20.4Z" },
++    { url = "https://files.pythonhosted.org/packages/1f/ab/89e2b798d2c3925f82e2bb72d5979f3d2f6da2dd22ef4a8cd8b70d920039/cryptography-50.0.1-cp39-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:2a93d05e34d5f67fba6f891fe85d929999baa7195e853923ea6d7576c9e68c5e", size = 5044355, upload-time = "2026-08-25T19:45:22.353Z" },
++    { url = "https://files.pythonhosted.org/packages/99/89/87ef49ffe383ef4e147d27b7bf2088fb0b54ea409dd87b5a89442e5828a5/cryptography-50.0.1-cp39-abi3-win_amd64.whl", hash = "sha256:55d16b1ef3ee0958d893a977b19777887e546c9954ea81b200c3301a864013f2", size = 3875429, upload-time = "2026-08-25T19:45:24.418Z" },
++]
++
+ [[package]]
+ name = "docker"
+ version = "7.2.0"
+@@ -219,10 +334,16 @@ version = "0.1.0"
+ source = { editable = "." }
+ dependencies = [
+     { name = "alembic" },
++    { name = "boto3" },
+     { name = "fastapi" },
++    { name = "huggingface-hub" },
++    { name = "pgvector" },
++    { name = "pillow" },
+     { name = "psycopg", extra = ["binary"] },
++    { name = "pyarrow" },
+     { name = "pydantic" },
+     { name = "pydantic-settings" },
++    { name = "pypdfium2" },
+     { name = "rich" },
+     { name = "sqlalchemy" },
+     { name = "structlog" },
+@@ -232,8 +353,11 @@ dependencies = [
+ 
+ [package.dev-dependencies]
+ dev = [
++    { name = "boto3-stubs", extra = ["s3"] },
+     { name = "httpx2" },
++    { name = "moto", extra = ["s3"] },
+     { name = "mypy" },
++    { name = "pyarrow-stubs" },
+     { name = "pytest" },
+     { name = "pytest-cov" },
+     { name = "ruff" },
+@@ -243,10 +367,16 @@ dev = [
+ [package.metadata]
+ requires-dist = [
+     { name = "alembic", specifier = ">=1.20,<2" },
++    { name = "boto3", specifier = ">=1.43,<2" },
+     { name = "fastapi", specifier = ">=0.141,<1" },
++    { name = "huggingface-hub", specifier = ">=0.35,<2" },
++    { name = "pgvector", specifier = ">=0.5,<1" },
++    { name = "pillow", specifier = ">=12,<13" },
+     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
++    { name = "pyarrow", specifier = ">=25,<26" },
+     { name = "pydantic", specifier = ">=2.13,<3" },
+     { name = "pydantic-settings", specifier = ">=2.15,<3" },
++    { name = "pypdfium2", specifier = ">=5.13,<6" },
+     { name = "rich", specifier = ">=15,<16" },
+     { name = "sqlalchemy", specifier = ">=2.0.54,<3" },
+     { name = "structlog", specifier = ">=26,<27" },
+@@ -256,14 +386,35 @@ requires-dist = [
+ 
+ [package.metadata.requires-dev]
+ dev = [
++    { name = "boto3-stubs", extras = ["s3"], specifier = ">=1.43,<2" },
+     { name = "httpx2", specifier = ">=2.13,<3" },
++    { name = "moto", extras = ["s3"], specifier = ">=5,<6" },
+     { name = "mypy", specifier = ">=2.3,<3" },
++    { name = "pyarrow-stubs", specifier = ">=20" },
+     { name = "pytest", specifier = ">=9,<10" },
+     { name = "pytest-cov", specifier = ">=7,<8" },
+     { name = "ruff", specifier = ">=0.16,<1" },
+     { name = "testcontainers", extras = ["postgres"], specifier = ">=4.15,<5" },
+ ]
+ 
++[[package]]
++name = "filelock"
++version = "4.0.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/5e/ac/8c98b17ee3900147b38ef7884a1e590b070b63f0d59fd8b46ef0205f4576/filelock-4.0.0.tar.gz", hash = "sha256:3611eca5d818ca9b00ec3cc7db1dcfe1e2aafc8d44fb4920d8cf60ad1f6bfda6", size = 237935, upload-time = "2026-09-17T03:59:02.967Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/01/fb/0e4489505dac46a0487ba925ea4b046612f1a40f432d63a000421de78549/filelock-4.0.0-py3-none-any.whl", hash = "sha256:a850aa9ec2acba8db9ca2e9fcf8a327fbc2f85e432725715b37bd76b7dd1f798", size = 106036, upload-time = "2026-09-17T03:59:01.336Z" },
++]
++
++[[package]]
++name = "fsspec"
++version = "2026.7.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/00/78/f34251dadb8f3921264a1d9b8946f5e542014ee2614b285261b4e40e6775/fsspec-2026.7.0.tar.gz", hash = "sha256:c803c40f4cf860b49dea58ee3e1c33cb9c790520e233537e1340049f89b82a88", size = 317040, upload-time = "2026-07-28T16:34:51.052Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/fd/3c/6a2bf344106328fd04963664a60b9bb6496fc25df8e962fcdc1367285fb9/fsspec-2026.7.0-py3-none-any.whl", hash = "sha256:b57ddbafedfaef7018c1ecab32aa200a9d7ca26b77965f64e48b70061249d279", size = 206583, upload-time = "2026-07-28T16:34:49.538Z" },
++]
++
+ [[package]]
+ name = "greenlet"
+ version = "3.5.6"
+@@ -289,6 +440,35 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl", hash = "sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86", size = 37515, upload-time = "2025-04-24T03:35:24.344Z" },
+ ]
+ 
++[[package]]
++name = "hf-xet"
++version = "1.6.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/1b/ab/522a2ab67f27971a9d48ca666d4fca85ef7d5282d142e31fd087e27b1bbe/hf_xet-1.6.0.tar.gz", hash = "sha256:2e58454a340b3556dfa4972d5451aff4fba8dd42a236600ba1a1d2b1514f0fef", size = 920527, upload-time = "2026-08-03T22:33:13.243Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/a2/50/7afa2c9c787405864fc47a0d1bbc02c62e9101947ed43c1f43899fc7d91d/hf_xet-1.6.0-cp38-abi3-macosx_10_12_x86_64.whl", hash = "sha256:633dc0cd71d32da58ab8c03ad38e2fac452c15c2b0a2866ebf6ededfe0a5061d", size = 4071729, upload-time = "2026-08-03T22:33:00.721Z" },
++    { url = "https://files.pythonhosted.org/packages/4b/69/55b8dcf636142ae660fec1869fcac14c4da2e8412e14d6eee1523be77e9f/hf_xet-1.6.0-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:f0906082d9932ae0c0057fa194041c22b4e2cdb46b2592ef3b91f020d62a081a", size = 3876287, upload-time = "2026-08-03T22:33:02.251Z" },
++    { url = "https://files.pythonhosted.org/packages/67/4e/a28359bf1c1ecf11eba22123168c138698f7cb576ac678f5a2e16cd5da08/hf_xet-1.6.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:d62671bb130879cef0ee4c9ebe47a14af6c66ec53e6d84dc15936e5ffdfac82f", size = 4464663, upload-time = "2026-08-03T22:33:03.802Z" },
++    { url = "https://files.pythonhosted.org/packages/9a/69/1f0cbc2fb22ae6082d094f743d1b8945a3f36f6089cb95f42b7ee348cda7/hf_xet-1.6.0-cp38-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:0e6e21fa3cdfcdcd76748564bf593870a5e013f47d97cf10aed63aa222cff5b7", size = 4262538, upload-time = "2026-08-03T22:33:05.287Z" },
++    { url = "https://files.pythonhosted.org/packages/d1/3a/4f4f2301ade26e404462d3336fa11f7958d914cabbabdd6e03c3c5d5658c/hf_xet-1.6.0-cp38-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:4fc74352a17015bd0ee90038bc9efe38db894cde45f268b6712b04fce8cd0acb", size = 4460520, upload-time = "2026-08-03T22:33:06.81Z" },
++    { url = "https://files.pythonhosted.org/packages/ab/5f/311725e2a905534dfee2dcb5b08414f249147f1f12252bfc2bd24caa075c/hf_xet-1.6.0-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:8fb4f71cba6129110c3374a33f919001ff130488fc23553698e34cc1c2a1198c", size = 4675937, upload-time = "2026-08-03T22:33:08.616Z" },
++    { url = "https://files.pythonhosted.org/packages/98/b7/8c59a66d15205024662f1d66968136f13893f96df1ddc5087e2e281fc95f/hf_xet-1.6.0-cp38-abi3-win_amd64.whl", hash = "sha256:fb4fadde1b2b70bf4c0c14a6dccbe7194b1c28947fefd5bbe3fed9d940676c3b", size = 4033128, upload-time = "2026-08-03T22:33:10.171Z" },
++    { url = "https://files.pythonhosted.org/packages/73/63/ca511b6f802f28cf3489b280fe77475bcca8de85e81a6299d7916b5b5555/hf_xet-1.6.0-cp38-abi3-win_arm64.whl", hash = "sha256:3dc3e35441ba395006af5aaacc40ef2e603c51ef46c3530b9156185f00935ea3", size = 3859359, upload-time = "2026-08-03T22:33:11.725Z" },
++]
++
++[[package]]
++name = "httpcore"
++version = "1.0.9"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "certifi" },
++    { name = "h11" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/06/94/82699a10bca87a5556c9c59b5963f2d039dbd239f25bc2a63907a05a14cb/httpcore-1.0.9.tar.gz", hash = "sha256:6e34463af53fd2ab5d807f399a9b45ea31c3dfa2276f15a2c3f00afff6e176e8", size = 85484, upload-time = "2025-04-24T22:06:22.219Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl", hash = "sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55", size = 78784, upload-time = "2025-04-24T22:06:20.566Z" },
++]
++
+ [[package]]
+ name = "httpcore2"
+ version = "2.13.0"
+@@ -317,6 +497,21 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/05/0b/4240efeb672751ee5b9b380cb0e3fdc050bc05f68adc7a8aefc4fcd9a69a/httptools-0.8.0-cp312-cp312-win_amd64.whl", hash = "sha256:cd96f29b4bab1d42fa6e3d008711c75e0f79e94e06827330160e3a304227f150", size = 90918, upload-time = "2026-05-25T22:17:15.155Z" },
+ ]
+ 
++[[package]]
++name = "httpx"
++version = "0.28.1"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "anyio" },
++    { name = "certifi" },
++    { name = "httpcore" },
++    { name = "idna" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/b1/df/48c586a5fe32a0f01324ee087459e112ebb7224f646c0b5023f5e79e9956/httpx-0.28.1.tar.gz", hash = "sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc", size = 141406, upload-time = "2024-12-06T15:37:23.222Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl", hash = "sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad", size = 73517, upload-time = "2024-12-06T15:37:21.509Z" },
++]
++
+ [[package]]
+ name = "httpx2"
+ version = "2.13.0"
+@@ -343,6 +538,26 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/9b/43/832f631d32e4f1211caa2ba368317739fe71f0b8530e4c9d15dc454bac2a/httpx2_jsfetch-1.0-py3-none-any.whl", hash = "sha256:cb916b707601e69a07721aabc8f3f6659be3a6893bc1ff5c6f9e02241df2da32", size = 6382, upload-time = "2026-08-07T00:13:06.567Z" },
+ ]
+ 
++[[package]]
++name = "huggingface-hub"
++version = "1.32.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "click" },
++    { name = "filelock" },
++    { name = "fsspec" },
++    { name = "hf-xet", marker = "platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'arm64' or platform_machine == 'x86_64'" },
++    { name = "httpx" },
++    { name = "packaging" },
++    { name = "pyyaml" },
++    { name = "tqdm" },
++    { name = "typing-extensions" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/fe/0f/e83fdd856da8fca26bf78d71709ebd120432a0ce535e72b9597cab1eb5bf/huggingface_hub-1.32.0.tar.gz", hash = "sha256:ed70a45498abe86039df7c2f4e5f7575de524be908d3840e8f828d5525eafd6a", size = 1038662, upload-time = "2026-09-17T10:27:48.049Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/1b/cf/d98dd561d6d0d7b7d7a64d1563f8aaaa7c235daee41c1c9bcc3da62420ed/huggingface_hub-1.32.0-py3-none-any.whl", hash = "sha256:b0c7c80561969d9cdacdd55fce67ba9584cca0b9d4ea80957a3a5c1445fac5c8", size = 842906, upload-time = "2026-09-17T10:27:46.102Z" },
++]
++
+ [[package]]
+ name = "idna"
+ version = "3.20"
+@@ -361,6 +576,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
+ ]
+ 
++[[package]]
++name = "jmespath"
++version = "1.1.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/d3/59/322338183ecda247fb5d1763a6cbe46eff7222eaeebafd9fa65d4bf5cb11/jmespath-1.1.0.tar.gz", hash = "sha256:472c87d80f36026ae83c6ddd0f1d05d4e510134ed462851fd5f754c8c3cbb88d", size = 27377, upload-time = "2026-01-22T16:35:26.279Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/14/2f/967ba146e6d58cf6a652da73885f52fc68001525b4197effc174321d70b4/jmespath-1.1.0-py3-none-any.whl", hash = "sha256:a5663118de4908c91729bea0acadca56526eb2698e83de10cd116ae0f4e97c64", size = 20419, upload-time = "2026-01-22T16:35:24.919Z" },
++]
++
+ [[package]]
+ name = "librt"
+ version = "0.15.0"
+@@ -436,6 +660,30 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
+ ]
+ 
++[[package]]
++name = "moto"
++version = "5.2.3"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "boto3" },
++    { name = "botocore" },
++    { name = "cryptography" },
++    { name = "requests" },
++    { name = "responses" },
++    { name = "werkzeug" },
++    { name = "xmltodict" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/6c/0f/1682c01ca0608c25526afb150246a3c9c1f609caccbd39758de4850e31bc/moto-5.2.3.tar.gz", hash = "sha256:a9e95c3218b6eda18e74571f1ced11cb1bc3151467d562c1da6037b9d19832cb", size = 8785514, upload-time = "2026-08-22T18:46:00.199Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/58/80/ee7ace7a49bd525455497fa2ff198111877d6f93b908b657adeb2cf057a4/moto-5.2.3-py3-none-any.whl", hash = "sha256:5ec31b3cdbb383a19d46030157bd82aaaa7a9cc5f564200f995663d347bd4728", size = 6780972, upload-time = "2026-08-22T18:45:55.719Z" },
++]
++
++[package.optional-dependencies]
++s3 = [
++    { name = "py-partiql-parser" },
++    { name = "pyyaml" },
++]
++
+ [[package]]
+ name = "mypy"
+ version = "2.3.1"
+@@ -458,6 +706,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/8e/41/9675c7a1e78edecfba0b79e587a52594c56e189368261dc7b3a7fffb9527/mypy-2.3.1-py3-none-any.whl", hash = "sha256:6ed5c7e3419083268e5c9258bd1c1ef91af44a9e89374dbcaf37b775716e72eb", size = 2754338, upload-time = "2026-08-15T03:02:53.4Z" },
+ ]
+ 
++[[package]]
++name = "mypy-boto3-s3"
++version = "1.43.93"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/97/3b/8ca4c299090b3a7fe97c6db8e17a6d7db92cb9b456804e59426ddea84824/mypy_boto3_s3-1.43.93.tar.gz", hash = "sha256:858e1ffe738ece3fa83ebc2b50f19aa53d0d69c1084739b37ec671b060713192", size = 79411, upload-time = "2026-09-11T19:44:36.959Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/2a/f1/7ebc5d419bda7ab80dba0e59d5484a70229e617cf346665882f70fa499c3/mypy_boto3_s3-1.43.93-py3-none-any.whl", hash = "sha256:52be1672a8b65ff3a1f779b46f7ed4fab85e78f15b353ce7eb5e20a9f15e7b9b", size = 86721, upload-time = "2026-09-11T19:44:35.263Z" },
++]
++
+ [[package]]
+ name = "mypy-extensions"
+ version = "1.1.0"
+@@ -485,6 +742,32 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/f1/d9/7fb5aa316bc299258e68c73ba3bddbc499654a07f151cba08f6153988714/pathspec-1.1.1-py3-none-any.whl", hash = "sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189", size = 57328, upload-time = "2026-04-27T01:46:07.06Z" },
+ ]
+ 
++[[package]]
++name = "pgvector"
++version = "0.5.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/a7/ec/6eb80aebc728200f95229219882994c1b0585b956ca47da5edb9d062627a/pgvector-0.5.0.tar.gz", hash = "sha256:07a9dcf735696879406983afc6eba9a787cef7c0cf6c367ca1a5779f036dee74", size = 35170, upload-time = "2026-07-06T18:27:27.767Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/5c/e4/a5573f2c579ca9ad133293bfb624148ba0893674ca4a6eeec85ced9a6a09/pgvector-0.5.0-py3-none-any.whl", hash = "sha256:fedc9800894e6da2be51358d7b7c574bf34f247ca741a5a09513622135f5964f", size = 30958, upload-time = "2026-07-06T18:27:26.797Z" },
++]
++
++[[package]]
++name = "pillow"
++version = "12.3.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/1c/3d/bb7fca845737cf9d7dbde16ed1843984665ff2e0a518f5db43e77ec540b9/pillow-12.3.0.tar.gz", hash = "sha256:3b8182a766685eaa002637e28b4ec8d6b18819a0c71f579bf0dbaa5830297cce", size = 47025035, upload-time = "2026-07-01T11:56:38.965Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/37/bf/fb3ebff8ddcb76aac5a01389251bbbb9519922a9b520d8247c1ca864a25d/pillow-12.3.0-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:ba09209fbe443b4acccebe845d8a138b89a8f4fbaeedd44953490b5315d5e965", size = 5345969, upload-time = "2026-07-01T11:54:06.397Z" },
++    { url = "https://files.pythonhosted.org/packages/d8/66/9a386a92561f402389a4fc70c18838bf6d35eb5eb5c6850b4b2dc64f5048/pillow-12.3.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:ffd0c5368496f41b0944be820fcb7a838aa6e623d250b01acf2643939c3f99d7", size = 4780323, upload-time = "2026-07-01T11:54:09.351Z" },
++    { url = "https://files.pythonhosted.org/packages/25/27/ac8f99618ffd3dde21db0f4d4b1d2ab00c0880595bfd17df103f7f39fd0c/pillow-12.3.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:d9c7f76c0673154f044e9d78c8655fb4213f6ca31a836df48b40fe5d187717b9", size = 6266838, upload-time = "2026-07-01T11:54:11.71Z" },
++    { url = "https://files.pythonhosted.org/packages/84/21/a35af28dcc61f37ed850a2d64c65c701321dfbf25085e469d5559360cbbf/pillow-12.3.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:78cb2c6865a35ab8ff8b75fd122f6033b92a62c82801110e48ddd6c936a45d91", size = 6940830, upload-time = "2026-07-01T11:54:13.732Z" },
++    { url = "https://files.pythonhosted.org/packages/eb/51/8b08617af3ad95e33ce6d7dd2c99ed6c8298f7fb131636303956be022e25/pillow-12.3.0-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:e491916b378fba47242221bb9ead245211b70d504f495d105d17b14a24b4907c", size = 6344383, upload-time = "2026-07-01T11:54:15.756Z" },
++    { url = "https://files.pythonhosted.org/packages/1d/72/cf78ac9780bb93c28328f408973845a309d4d145041665f734572ced1b52/pillow-12.3.0-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:0dd2064cbc55aaec028ef5fbb60fa47bb6c3e7918e07ff17935284b227a9d2df", size = 7052934, upload-time = "2026-07-01T11:54:17.721Z" },
++    { url = "https://files.pythonhosted.org/packages/20/20/25e0f4dc178a6bc0696793720055519a0de89e7661dae886992decbd2f81/pillow-12.3.0-cp312-cp312-win32.whl", hash = "sha256:dbce0b29841537a2fa4a214c2bbf14de3587c9680caa9b4e217568472490b28f", size = 6472684, upload-time = "2026-07-01T11:54:19.839Z" },
++    { url = "https://files.pythonhosted.org/packages/45/89/da2f7971a317f83d807fdd4065c0af40208e59e692cc43d315a71a0e96d1/pillow-12.3.0-cp312-cp312-win_amd64.whl", hash = "sha256:a2b55dd6b2a4c4b7d87ffa56bdb33fdc5fdb9a462173861a7bc097f17d91cb09", size = 7227137, upload-time = "2026-07-01T11:54:22.025Z" },
++    { url = "https://files.pythonhosted.org/packages/de/47/4845a0a6c0dbf1db8456bd9fc791f13c5ced7ced20606d08a0aacfd25b49/pillow-12.3.0-cp312-cp312-win_arm64.whl", hash = "sha256:331b624368d4f1d069149002f25f44bc61c8919ce8ddb3c45bdad8f6e2d89510", size = 2568267, upload-time = "2026-07-01T11:54:24.051Z" },
++]
++
+ [[package]]
+ name = "pluggy"
+ version = "1.6.0"
+@@ -530,6 +813,51 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/03/8d/452620608cafff164737e20b42ebffee8151b865ee171ba0d6692a560a44/psycopg_binary-3.3.5-cp312-cp312-win_amd64.whl", hash = "sha256:35885e333020fc152d27bea1a494bef13b2e68f6fd92b6229015e93539152008", size = 3648197, upload-time = "2026-08-31T22:42:51.575Z" },
+ ]
+ 
++[[package]]
++name = "py-partiql-parser"
++version = "0.6.3"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/56/7a/a0f6bda783eb4df8e3dfd55973a1ac6d368a89178c300e1b5b91cd181e5e/py_partiql_parser-0.6.3.tar.gz", hash = "sha256:09cecf916ce6e3da2c050f0cb6106166de42c33d34a078ec2eb19377ea70389a", size = 17456, upload-time = "2025-10-18T13:56:13.441Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/c9/33/a7cbfccc39056a5cf8126b7aab4c8bafbedd4f0ca68ae40ecb627a2d2cd3/py_partiql_parser-0.6.3-py2.py3-none-any.whl", hash = "sha256:deb0769c3346179d2f590dcbde556f708cdb929059fb654bad75f4cf6e07f582", size = 23752, upload-time = "2025-10-18T13:56:12.256Z" },
++]
++
++[[package]]
++name = "pyarrow"
++version = "25.0.1"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/3d/e3/27f57f80141379d60defe6703eb50a707325706f07fedfd1312c7a751995/pyarrow-25.0.1.tar.gz", hash = "sha256:9150a83248bfed9813ea3c3af74c3856c1984d444aa28e58bf7733b9750ddf6a", size = 1201653, upload-time = "2026-08-10T12:40:53.904Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/a6/e2/9ab15b88cbfac28e16419ce5439ec29234c5172cb8259301b4ba639bdec0/pyarrow-25.0.1-cp312-cp312-macosx_12_0_arm64.whl", hash = "sha256:df961f2e7ae9cf496459259d798652c70625f6c080650d6952f8c04053c58ee9", size = 35861559, upload-time = "2026-08-10T12:38:02.567Z" },
++    { url = "https://files.pythonhosted.org/packages/58/79/a0036dbe1eabe1f73127427342f1d99982584c4a2cde2651d6c93499c6f6/pyarrow-25.0.1-cp312-cp312-macosx_12_0_x86_64.whl", hash = "sha256:cc4aa407fde9fc660be3939e49ea31f50f3e9fec17c0ec63159f7711edd3efc9", size = 37628383, upload-time = "2026-08-10T12:38:09.083Z" },
++    { url = "https://files.pythonhosted.org/packages/13/49/d93a57d375f4bf0cf82913dd6bb54acafde83dd993be2282c81ac5616cad/pyarrow-25.0.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:4340f0ba6c1d2e13f21658de1d7c662ca2545018568d0030a1e9afca159d87e3", size = 46820190, upload-time = "2026-08-10T12:38:15.458Z" },
++    { url = "https://files.pythonhosted.org/packages/60/c9/711ca85d79f1ec98f29a5eae2b051e25b4ecec5de3e3c0e2d5c5dcb15664/pyarrow-25.0.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:5389cdf79447ed1515c9e31620e6e1e2302249564d603f2ad727d4f6d313e4c3", size = 50102437, upload-time = "2026-08-10T12:38:22.487Z" },
++    { url = "https://files.pythonhosted.org/packages/80/53/8fb8359ff17cfb6263a1cf3ebf7caec9fe197de118719e84fcb1d0618026/pyarrow-25.0.1-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:d51592cb7561e87877c506113e7adbf1342ab579e6c21f0ef44b8ba41cb74c80", size = 49942424, upload-time = "2026-08-10T12:38:28.755Z" },
++    { url = "https://files.pythonhosted.org/packages/e8/83/4e5ae02a9341571b18a6fca380ac7a58ce6ddae7ab3c060208c0a1e79f02/pyarrow-25.0.1-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:6109c94d8b9f3b17a041daca16cacb2f651ad8f1ef70a4232c2c0f37a23da2a8", size = 53144206, upload-time = "2026-08-10T12:38:34.862Z" },
++    { url = "https://files.pythonhosted.org/packages/65/ee/197cbf47e49f83e6ebeb946a5259a48a638dea27ac774db42fe78022179d/pyarrow-25.0.1-cp312-cp312-win_amd64.whl", hash = "sha256:8858d7bfc22e3f51529aeaa4077225029724623e4595dc9eff8c793935c34140", size = 27953934, upload-time = "2026-08-10T12:38:39.808Z" },
++]
++
++[[package]]
++name = "pyarrow-stubs"
++version = "20.0.0.20260819"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "pyarrow" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/12/a7/8a2ca91ffe4c6576207f932de655d7d8a36485c520dccce70ce7d492b256/pyarrow_stubs-20.0.0.20260819.tar.gz", hash = "sha256:150710a72248bc834bf048d3092713f070904a4af76d40289c43afb3ee189823", size = 238222, upload-time = "2026-08-19T05:52:53.618Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/65/6c/eea1d03e475217aea95b1d52aee09c97575d05bbc592c39c085b71dab89f/pyarrow_stubs-20.0.0.20260819-py3-none-any.whl", hash = "sha256:297e60b6e5314739c082b4757d090d8be6047465510eb0684ca954ef7ea58be3", size = 235949, upload-time = "2026-08-19T05:52:54.711Z" },
++]
++
++[[package]]
++name = "pycparser"
++version = "3.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/1b/7d/92392ff7815c21062bea51aa7b87d45576f649f16458d78b7cf94b9ab2e6/pycparser-3.0.tar.gz", hash = "sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29", size = 103492, upload-time = "2026-01-21T14:26:51.89Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/0c/c3/44f3fbbfa403ea2a7c779186dc20772604442dde72947e7d01069cbe98e3/pycparser-3.0-py3-none-any.whl", hash = "sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992", size = 48172, upload-time = "2026-01-21T14:26:50.693Z" },
++]
++
+ [[package]]
+ name = "pydantic"
+ version = "2.13.5"
+@@ -598,6 +926,35 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/71/46/17f022dd3e953bf20a04a028a21ec746d942f8d2af30fa0f124fa0e6a684/pygments-2.21.0-py3-none-any.whl", hash = "sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9", size = 1250147, upload-time = "2026-08-17T08:02:44.912Z" },
+ ]
+ 
++[[package]]
++name = "pypdfium2"
++version = "5.13.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/ec/78/a52cb80611339ec95f35c7a10d7bfe7a6f97f3b50a35a9f94283d062512e/pypdfium2-5.13.0.tar.gz", hash = "sha256:7ca2d8e31bd8d0d40c496416b7d8bea423388669ffd494929f50e8c3a82326b8", size = 273639, upload-time = "2026-08-13T10:58:15.837Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/7c/9c/a49050af85055054299c7fab658ac63f8fddde575774aecbf8f71c7a9e5f/pypdfium2-5.13.0-py3-none-android_23_arm64_v8a.whl", hash = "sha256:882f4bbd4b17a335b43603169a14cde9341de12b238acd5c39e690cbca7c4293", size = 3417299, upload-time = "2026-08-13T10:57:40.522Z" },
++    { url = "https://files.pythonhosted.org/packages/50/ad/f23027328843ee2bdd05afe16bb101f5906befd0c70de35fa8c53f60a5ff/pypdfium2-5.13.0-py3-none-android_23_armeabi_v7a.whl", hash = "sha256:d96929bde3bd64c771ab3558ca1ffd7704cc4d872ab92cd9f8f8b8a20f7f36b8", size = 2864708, upload-time = "2026-08-13T10:57:42.259Z" },
++    { url = "https://files.pythonhosted.org/packages/08/99/1fe58428b69d2722dcbcfaa08ce71834a332c5b518fd58874bcef936b823/pypdfium2-5.13.0-py3-none-macosx_13_0_arm64.whl", hash = "sha256:da5c7b74eebf40b5c1fbe1de01aa1edc8827a79fb1efd999616bc20dcaf77ba4", size = 3507415, upload-time = "2026-08-13T10:57:43.978Z" },
++    { url = "https://files.pythonhosted.org/packages/9f/41/06e26da88a4f5b4ed289325868717a186020661b7b221aa6df622711d31b/pypdfium2-5.13.0-py3-none-macosx_13_0_x86_64.whl", hash = "sha256:2abedfb5c70992b19c780ed58d7f7b929e8ce8ee52c9140158f44317c90ec6c7", size = 3670979, upload-time = "2026-08-13T10:57:45.607Z" },
++    { url = "https://files.pythonhosted.org/packages/fe/31/f8210d53775f142be934336665b1d60e800c3f176f28c29b4908d945c518/pypdfium2-5.13.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:9ee8c2bb2e68b396ab4a763215ac100dacb6b96d0da5bebeb239a021aecc3a7e", size = 3676486, upload-time = "2026-08-13T10:57:47.267Z" },
++    { url = "https://files.pythonhosted.org/packages/94/50/d339fa09fbe592564b100bfc76833170a1104a764a458ac2abfffcb632f2/pypdfium2-5.13.0-py3-none-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:07f58e91b8c45ca144a1ff3008faf3c73ef8a5e9fb32988831788363288228cd", size = 3400883, upload-time = "2026-08-13T10:57:49.189Z" },
++    { url = "https://files.pythonhosted.org/packages/c3/e0/b10cf41b5e9f0212d014c40635659c6ab95bb4fcc6fc47f5d3c571f8d57f/pypdfium2-5.13.0-py3-none-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:46b2f5be9e7ae941ee4216e3d20b66f9dc3d81944a3d57756272de5275204709", size = 3803912, upload-time = "2026-08-13T10:57:50.865Z" },
++    { url = "https://files.pythonhosted.org/packages/a7/d8/25ba4ce9a9059ece82f4514df0658fde0aa9bbeafe135e76017c052bf56f/pypdfium2-5.13.0-py3-none-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:d96beb7f379e6c76d874ca93fcd182ac3168dd499056407070f9927fb1061b8e", size = 4218231, upload-time = "2026-08-13T10:57:52.525Z" },
++    { url = "https://files.pythonhosted.org/packages/d3/7c/74a2fb48e5b0d2402d9ca64b39074c722d67e9a8a2c58449a843a8c2329a/pypdfium2-5.13.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:81df25c1ab4c13ff773102d3cbea1967511d079123b067fc077bd0c4d57d91d8", size = 3730077, upload-time = "2026-08-13T10:57:54.021Z" },
++    { url = "https://files.pythonhosted.org/packages/59/12/8c922f00518c26dc47d3676cc09c1d3c95e991c1977e31067d23cc2215cb/pypdfium2-5.13.0-py3-none-manylinux_2_27_s390x.manylinux_2_28_s390x.whl", hash = "sha256:d66a32d89fa5b4a2715810171239eb194df4aba604727483ab760512f3c6a851", size = 4031512, upload-time = "2026-08-13T10:57:55.736Z" },
++    { url = "https://files.pythonhosted.org/packages/c6/48/a171d034c2dac01adcc57d3dad3c97ba11f19d916f421176002c9e02c904/pypdfium2-5.13.0-py3-none-manylinux_2_34_riscv64.manylinux_2_39_riscv64.whl", hash = "sha256:b90b0a5ac310bb34db8eb848e58fcab4e201e124e3cf3cb1ccb7b85293e034af", size = 3995485, upload-time = "2026-08-13T10:57:57.39Z" },
++    { url = "https://files.pythonhosted.org/packages/36/2e/dcb24776d409bb9e5b7fb26a0c62a87b98ab0e30dfcca645eaf31e35123b/pypdfium2-5.13.0-py3-none-musllinux_1_2_aarch64.whl", hash = "sha256:ada81c36483cd61d07e32bc7814620ee96256b4f421b913f566861bf91800248", size = 5016636, upload-time = "2026-08-13T10:57:59.181Z" },
++    { url = "https://files.pythonhosted.org/packages/93/24/1fab8470fc6de6f4481f009c90757b1a1ee0a61d8e864ed273f72ffca855/pypdfium2-5.13.0-py3-none-musllinux_1_2_armv7l.whl", hash = "sha256:3826e521e895648983cb9ee6b934d4bf51552600043984f84e9c2b3b14b696f3", size = 4555251, upload-time = "2026-08-13T10:58:00.753Z" },
++    { url = "https://files.pythonhosted.org/packages/cd/ef/6e8dbea1eddcb55cf34172753ffccd39566333c803cc94d43c653f369f2f/pypdfium2-5.13.0-py3-none-musllinux_1_2_i686.whl", hash = "sha256:5c029d7163a91f264eafab51fb442a84a33efd9fd83d5a06c0136a7857a3cc8d", size = 5263483, upload-time = "2026-08-13T10:58:02.48Z" },
++    { url = "https://files.pythonhosted.org/packages/53/fe/2ff673730189a621c01f9193c74b0f6aa70d8740889fdf11949e1c541869/pypdfium2-5.13.0-py3-none-musllinux_1_2_ppc64le.whl", hash = "sha256:be2dccbde0ce7efe334ecd8f348df4308db360756ede4f0821d82dfc9a58caa8", size = 5144135, upload-time = "2026-08-13T10:58:04.351Z" },
++    { url = "https://files.pythonhosted.org/packages/19/0b/759b9037c007317fa5c990dd3f6eff2b99d3fbced251d1e2512be92f2e2e/pypdfium2-5.13.0-py3-none-musllinux_1_2_riscv64.whl", hash = "sha256:bcd81394fe101405e026eedb3e40bef84635c1e5d974dd6036420eb6937753c6", size = 4648156, upload-time = "2026-08-13T10:58:06.036Z" },
++    { url = "https://files.pythonhosted.org/packages/db/3b/ffe29679c52efe8eb02d77aa6656e6d6201395423329af018ebd5923a3d0/pypdfium2-5.13.0-py3-none-musllinux_1_2_s390x.whl", hash = "sha256:2ed32ff685f8e05e637c990bedbf5fca66727bf27718d8bc33eeab21ce0630d1", size = 5089852, upload-time = "2026-08-13T10:58:07.791Z" },
++    { url = "https://files.pythonhosted.org/packages/7b/b6/cebacc1601ddfdcd1e6a1dc321533d215ceccf9b825fa9b91b11c6dc39fb/pypdfium2-5.13.0-py3-none-musllinux_1_2_x86_64.whl", hash = "sha256:9c777edba28d1d5fd15435ed3a78ee2fdb93dd069be37cb53b559bc122793770", size = 5074153, upload-time = "2026-08-13T10:58:09.396Z" },
++    { url = "https://files.pythonhosted.org/packages/54/40/cf14c4f534f817788966857afdedb90002198dca5ce4fe2c6ecb031955ae/pypdfium2-5.13.0-py3-none-win32.whl", hash = "sha256:d33ee7077db67478b75efe4b5ea9610fb96c5416a0bc4949227f0f59c34dfcd9", size = 3753164, upload-time = "2026-08-13T10:58:10.97Z" },
++    { url = "https://files.pythonhosted.org/packages/5d/99/a37b6b902457569468ed5908c94e56cb6c4032541f02cf89f723d42a9148/pypdfium2-5.13.0-py3-none-win_amd64.whl", hash = "sha256:47dcca2a8d507b5fd24f94c3c9d48fb379430f097bc20f01beff6c963ffbcedb", size = 3885553, upload-time = "2026-08-13T10:58:12.709Z" },
++    { url = "https://files.pythonhosted.org/packages/50/7f/d39f6e64375c2ffd50ea100e3c73af79085c880c2791eb7203bc61d8913f/pypdfium2-5.13.0-py3-none-win_arm64.whl", hash = "sha256:554a0b23376460af1410e3c915906895e2dac67a086b9e6ccde0643a795d3b0d", size = 3700026, upload-time = "2026-08-13T10:58:14.206Z" },
++]
++
+ [[package]]
+ name = "pytest"
+ version = "9.1.1"
+@@ -628,6 +985,18 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/9d/7a/d968e294073affff457b041c2be9868a40c1c71f4a35fcc1e45e5493067b/pytest_cov-7.1.0-py3-none-any.whl", hash = "sha256:a0461110b7865f9a271aa1b51e516c9a95de9d696734a2f71e3e78f46e1d4678", size = 22876, upload-time = "2026-03-21T20:11:14.438Z" },
+ ]
+ 
++[[package]]
++name = "python-dateutil"
++version = "2.9.0.post0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "six" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz", hash = "sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3", size = 342432, upload-time = "2024-03-01T18:36:20.211Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
++]
++
+ [[package]]
+ name = "python-dotenv"
+ version = "1.2.3"
+@@ -680,6 +1049,20 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/a0/f4/c67b0b3f1b9245e8d266f0f112c500d50e5b4e83cb6f3b71b6528104182a/requests-2.34.2-py3-none-any.whl", hash = "sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0", size = 73075, upload-time = "2026-05-14T19:25:26.443Z" },
+ ]
+ 
++[[package]]
++name = "responses"
++version = "0.26.3"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "pyyaml" },
++    { name = "requests" },
++    { name = "urllib3" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/9f/47/f216a33221db8eff328987661cf18371afee89c62a62b434b963d6b509c9/responses-0.26.3.tar.gz", hash = "sha256:b0c11ca8131b8b227b8d5108e6ed39772222bd5aab030ed430e8f99057c4c409", size = 86335, upload-time = "2026-08-26T19:17:24.373Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/6d/86/ca7958de70cb0752350575e98229368a3a2f746a2942034b3364e17312bb/responses-0.26.3-py3-none-any.whl", hash = "sha256:74474f799334ac4f37d93b6437ecc3bb1bb5c77a8d31780a338643be2dce0af8", size = 36289, upload-time = "2026-08-26T19:17:23.176Z" },
++]
++
+ [[package]]
+ name = "rich"
+ version = "15.0.0"
+@@ -718,6 +1101,18 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/fe/a0/50787329e4f20bf9dc9f6230015d46ec69c51a97ace5bc202dae4755365d/ruff-0.16.8-py3-none-win_arm64.whl", hash = "sha256:d075e820af612102ce217f07cc93e69f9490b10ec13ea85fa87bd03d996cef8a", size = 10386316, upload-time = "2026-09-16T15:54:43.332Z" },
+ ]
+ 
++[[package]]
++name = "s3transfer"
++version = "0.19.2"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "botocore" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/76/43/35e4d8aa320bffe8287fe8f65f578fa2d2db0a64212f0e710dce58267854/s3transfer-0.19.2.tar.gz", hash = "sha256:ba0309fd86be3c27dbf78cdd813c13c5e1df16e5874b99d2535ebbdfb9892993", size = 165592, upload-time = "2026-07-22T19:30:44.432Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/bc/e7/5c595c75e9f41a44f30e526eda465ea0b4eec93470e074e4a111b253f13a/s3transfer-0.19.2-py3-none-any.whl", hash = "sha256:d8168eccca828cbb2cd573675333f3bddd254313a9c42494b84c76b539e8ba25", size = 90216, upload-time = "2026-07-22T19:30:43.251Z" },
++]
++
+ [[package]]
+ name = "shellingham"
+ version = "1.5.4"
+@@ -727,6 +1122,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/e0/f9/0595336914c5619e5f28a1fb793285925a8cd4b432c9da0a987836c7f822/shellingham-1.5.4-py2.py3-none-any.whl", hash = "sha256:7ecfff8f2fd72616f7481040475a65b2bf8af90a56c89140852d1120324e8686", size = 9755, upload-time = "2023-10-24T04:13:38.866Z" },
+ ]
+ 
++[[package]]
++name = "six"
++version = "1.17.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
++]
++
+ [[package]]
+ name = "sqlalchemy"
+ version = "2.0.54"
+@@ -785,6 +1189,18 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/00/7e/424aac8b355597835deb333e757a0e94b5ccf38ad00f07fe6ed1f4e17c88/testcontainers-4.15.0-py3-none-any.whl", hash = "sha256:8796c14e76604031ad39cf0ed3b8e9806283a1fbf5270965c2b1c594caa31b74", size = 160771, upload-time = "2026-07-24T23:08:00.13Z" },
+ ]
+ 
++[[package]]
++name = "tqdm"
++version = "4.70.1"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "colorama", marker = "sys_platform == 'win32'" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/0d/ea/b2a5bd54b28a324dae8211928b2d730b6547500342c7e6c6dea08bd0a485/tqdm-4.70.1.tar.gz", hash = "sha256:cefd0eca11b2a37a3aee776544d4f4ae913f02688135b5556b8788dfa474afc4", size = 171846, upload-time = "2026-09-11T07:25:16.601Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/a7/03/921a3d3c75785aca9ebfbfcabfbc3a1be12e2ab5265deb026d55a5a3f83e/tqdm-4.70.1-py3-none-any.whl", hash = "sha256:c293e525e6fef9c20e8728fd4612df02a0aa31bb5fe91ecd93e123b1b7bffa73", size = 80199, upload-time = "2026-09-11T07:25:14.599Z" },
++]
++
+ [[package]]
+ name = "truststore"
+ version = "0.10.4"
+@@ -809,6 +1225,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/dc/bf/205d0004930ede8f542fb58f601526fccf4ae7626075ca1e6c4de5d3d652/typer-0.27.2-py3-none-any.whl", hash = "sha256:b3a5fc4342d5fc8fda8fc3010b1cf117e9249aab7fae800c2eff62fd3842d97d", size = 123130, upload-time = "2026-08-28T10:26:53.752Z" },
+ ]
+ 
++[[package]]
++name = "types-s3transfer"
++version = "0.16.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/fe/64/42689150509eb3e6e82b33ee3d89045de1592488842ddf23c56957786d05/types_s3transfer-0.16.0.tar.gz", hash = "sha256:b4636472024c5e2b62278c5b759661efeb52a81851cde5f092f24100b1ecb443", size = 13557, upload-time = "2025-12-08T08:13:09.928Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/98/27/e88220fe6274eccd3bdf95d9382918716d312f6f6cef6a46332d1ee2feff/types_s3transfer-0.16.0-py3-none-any.whl", hash = "sha256:1c0cd111ecf6e21437cb410f5cddb631bfb2263b77ad973e79b9c6d0cb24e0ef", size = 19247, upload-time = "2025-12-08T08:13:08.426Z" },
++]
++
+ [[package]]
+ name = "typing-extensions"
+ version = "4.16.0"
+@@ -939,6 +1364,18 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/41/63/23572870e01836a98346075b9e17a8bc24a6ddd9800a3204ceee58677f3c/websockets-17.1-py3-none-any.whl", hash = "sha256:f221081107b8c48184d99f7019604486376e7ef826037e70aad6b02540732c23", size = 211134, upload-time = "2026-08-26T17:25:31.397Z" },
+ ]
+ 
++[[package]]
++name = "werkzeug"
++version = "3.1.8"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "markupsafe" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/dd/b2/381be8cfdee792dd117872481b6e378f85c957dd7c5bca38897b08f765fd/werkzeug-3.1.8.tar.gz", hash = "sha256:9bad61a4268dac112f1c5cd4630a56ede601b6ed420300677a869083d70a4c44", size = 875852, upload-time = "2026-04-02T18:49:14.268Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/93/8c/2e650f2afeb7ee576912636c23ddb621c91ac6a98e66dc8d29c3c69446e1/werkzeug-3.1.8-py3-none-any.whl", hash = "sha256:63a77fb8892bf28ebc3178683445222aa500e48ebad5ec77b0ad80f8726b1f50", size = 226459, upload-time = "2026-04-02T18:49:12.72Z" },
++]
++
+ [[package]]
+ name = "wrapt"
+ version = "2.4.1"
+@@ -958,3 +1395,12 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/d7/ec/40e4c9735626afd1dc0eeb310310278361f192800503cda0f5b3d8d24db4/wrapt-2.4.1-cp312-cp312-win_arm64.whl", hash = "sha256:38819761401baa2d11916d7265b82f23265f8fe5a31c431dd7c24a8863c65f88", size = 95240, upload-time = "2026-09-10T23:10:22.39Z" },
+     { url = "https://files.pythonhosted.org/packages/4f/a2/edcfc8d9a30375791b775715f8501364588f65b494ec4f6930568a19e765/wrapt-2.4.1-py3-none-any.whl", hash = "sha256:1e84ec5d89a0a07a0ef6bcd343f5c8ecdc95601d71de3058cdc63274e86c193c", size = 75317, upload-time = "2026-09-10T23:12:14.82Z" },
+ ]
++
++[[package]]
++name = "xmltodict"
++version = "1.0.4"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/19/70/80f3b7c10d2630aa66414bf23d210386700aa390547278c789afa994fd7e/xmltodict-1.0.4.tar.gz", hash = "sha256:6d94c9f834dd9e44514162799d344d815a3a4faec913717a9ecbfa5be1bb8e61", size = 26124, upload-time = "2026-02-22T02:21:22.074Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/38/34/98a2f52245f4d47be93b580dae5f9861ef58977d73a79eb47c58f1ad1f3a/xmltodict-1.0.4-py3-none-any.whl", hash = "sha256:a4a00d300b0e1c59fc2bfccb53d7b2e88c32f200df138a0dd2229f842497026a", size = 13580, upload-time = "2026-02-22T02:21:21.039Z" },
++]

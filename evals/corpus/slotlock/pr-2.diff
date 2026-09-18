@@ -1,0 +1,1717 @@
+diff --git a/.env.example b/.env.example
+index 48a898d..e8eea3b 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,11 +1,12 @@
+ # Copy to .env (gitignored).
+ DATABASE_URL=postgresql://slotlock:slotlock@localhost:5432/slotlock
+ SHADOW_DATABASE_URL=postgresql://slotlock:slotlock@localhost:5432/slotlock_shadow
++DATABASE_POOL_SIZE=20
+ REDIS_URL=redis://localhost:6379/0
+ PORT=3000
+ LOG_LEVEL=info
+ 
+-# advisory | for_update | optimistic | serializable | exclusion
++# advisory | for_update | optimistic | serializable | exclusion — or naive, the control that double-books (refused in production)
+ BOOKING_STRATEGY=advisory
+ HOLD_TTL_SECONDS=600
+ 
+diff --git a/docs/adr/0001-five-ways-to-serialise-a-booking.md b/docs/adr/0001-five-ways-to-serialise-a-booking.md
+index 888e2cb..2ed0cb1 100644
+--- a/docs/adr/0001-five-ways-to-serialise-a-booking.md
++++ b/docs/adr/0001-five-ways-to-serialise-a-booking.md
+@@ -24,6 +24,10 @@ so the other four are measured without it. Pools (capacity N) always use `adviso
+ exclusion strategy, and the results table says so. The benchmark (`bench/`) runs the same k6 race
+ against each and the README shows the numbers side by side.
+ 
++A sixth, `naive`, is the bug itself — check, then insert, nothing holding the two together. It is
++kept as the control: the race test proves it double-books and the benchmark shows what "no
++locking" costs in correctness, not just in latency. The configuration refuses it in production.
++
+ ## Consequences
+ 
+ - One code path per strategy, one integration test parametrised over all five, one benchmark.
+diff --git a/package.json b/package.json
+index 8b10076..86bb7e3 100644
+--- a/package.json
++++ b/package.json
+@@ -43,6 +43,7 @@
+     "@prisma/client": "7.10.0",
+     "bullmq": "^6.3.6",
+     "dotenv": "^17.4.2",
++    "fastify": "5.12.4",
+     "ioredis": "^6.0.0",
+     "nestjs-pino": "^5.2.0",
+     "pg": "^8.23.0",
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 2dc2c65..e977fca 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -196,6 +196,9 @@ importers:
+       dotenv:
+         specifier: ^17.4.2
+         version: 17.4.2
++      fastify:
++        specifier: 5.12.4
++        version: 5.12.4
+       ioredis:
+         specifier: ^6.0.0
+         version: 6.0.0
+diff --git a/src/app.module.ts b/src/app.module.ts
+index ce72f8e..9de03c0 100644
+--- a/src/app.module.ts
++++ b/src/app.module.ts
+@@ -1,5 +1,6 @@
+ import { DynamicModule, Module } from '@nestjs/common';
+ import { LoggerModule } from 'nestjs-pino';
++import { BookingsModule } from './bookings/bookings.module';
+ import { CONFIG, type Config } from './config';
+ import { ConfigModule } from './config.module';
+ import { HealthController } from './health/health.controller';
+@@ -26,6 +27,7 @@ export class AppModule {
+         }),
+         PrismaModule,
+         ResourcesModule,
++        BookingsModule,
+       ],
+       controllers: [HealthController],
+     };
+diff --git a/src/bookings/bookings.controller.ts b/src/bookings/bookings.controller.ts
+new file mode 100644
+index 0000000..0659c03
+--- /dev/null
++++ b/src/bookings/bookings.controller.ts
+@@ -0,0 +1,59 @@
++import {
++  Body,
++  Controller,
++  Get,
++  Headers,
++  HttpCode,
++  Param,
++  Post,
++  UseInterceptors,
++} from '@nestjs/common';
++import {
++  ApiConflictResponse,
++  ApiCreatedResponse,
++  ApiHeader,
++  ApiOkResponse,
++  ApiOperation,
++  ApiTags,
++  ApiUnprocessableEntityResponse,
++} from '@nestjs/swagger';
++import { ZodValidationPipe } from '../common/zod-validation.pipe';
++import { IdempotencyInterceptor } from '../idempotency/idempotency.interceptor';
++import { type BookingOut, type CreateBooking, createBookingSchema } from './bookings.dto';
++import { BookingsService } from './bookings.service';
++
++@ApiTags('bookings')
++@Controller('bookings')
++export class BookingsController {
++  constructor(private readonly bookings: BookingsService) {}
++
++  @Post()
++  @HttpCode(201)
++  @UseInterceptors(IdempotencyInterceptor)
++  @ApiOperation({ summary: 'Hold a resource for a time slot (idempotent)' })
++  @ApiHeader({
++    name: 'Idempotency-Key',
++    required: true,
++    description: 'Unique per attempt; retries reuse it.',
++  })
++  @ApiHeader({ name: 'X-User-Id', required: true })
++  @ApiCreatedResponse({
++    description: 'The booking is HELD until the hold expires or a payment confirms it.',
++  })
++  @ApiConflictResponse({ description: 'no_capacity, or request_in_flight for a concurrent retry.' })
++  @ApiUnprocessableEntityResponse({
++    description: 'idempotency_key_reused with a different request.',
++  })
++  create(
++    @Headers('x-user-id') userId: string,
++    @Body(new ZodValidationPipe(createBookingSchema)) body: CreateBooking,
++  ): Promise<BookingOut> {
++    return this.bookings.create(userId, body);
++  }
++
++  @Get(':id')
++  @ApiOkResponse({ description: 'One booking.' })
++  get(@Param('id') id: string): Promise<BookingOut> {
++    return this.bookings.get(id);
++  }
++}
+diff --git a/src/bookings/bookings.dto.ts b/src/bookings/bookings.dto.ts
+new file mode 100644
+index 0000000..9d9144b
+--- /dev/null
++++ b/src/bookings/bookings.dto.ts
+@@ -0,0 +1,31 @@
++import { z } from 'zod';
++
++const MAX_DURATION_MS = 8 * 60 * 60 * 1000;
++
++export const createBookingSchema = z
++  .object({
++    resourceId: z.string().min(1).max(64),
++    startsAt: z.coerce.date(),
++    endsAt: z.coerce.date(),
++  })
++  .refine((b) => b.endsAt > b.startsAt, {
++    message: 'endsAt must be after startsAt',
++    path: ['endsAt'],
++  })
++  .refine((b) => b.endsAt.getTime() - b.startsAt.getTime() <= MAX_DURATION_MS, {
++    message: 'a booking is at most 8 hours',
++    path: ['endsAt'],
++  });
++
++export type CreateBooking = z.infer<typeof createBookingSchema>;
++
++export interface BookingOut {
++  id: string;
++  resourceId: string;
++  userId: string;
++  startsAt: string;
++  endsAt: string;
++  status: 'HELD' | 'CONFIRMED' | 'CANCELLED' | 'EXPIRED';
++  holdExpiresAt: string | null;
++  paymentId: string | null;
++}
+diff --git a/src/bookings/bookings.module.ts b/src/bookings/bookings.module.ts
+new file mode 100644
+index 0000000..cf4ad41
+--- /dev/null
++++ b/src/bookings/bookings.module.ts
+@@ -0,0 +1,13 @@
++import { Module } from '@nestjs/common';
++import { IdempotencyModule } from '../idempotency/idempotency.module';
++import { BookingsController } from './bookings.controller';
++import { BookingsService, CLOCK, systemClock } from './bookings.service';
++import { StrategyModule } from './strategies/strategy.module';
++
++@Module({
++  imports: [StrategyModule, IdempotencyModule],
++  controllers: [BookingsController],
++  providers: [BookingsService, { provide: CLOCK, useValue: systemClock }],
++  exports: [BookingsService],
++})
++export class BookingsModule {}
+diff --git a/src/bookings/bookings.service.ts b/src/bookings/bookings.service.ts
+new file mode 100644
+index 0000000..4dd8aab
+--- /dev/null
++++ b/src/bookings/bookings.service.ts
+@@ -0,0 +1,60 @@
++import { Inject, Injectable } from '@nestjs/common';
++import { BookingNotFoundError, ResourceNotFoundError } from '../common/errors';
++import { CONFIG, type Config } from '../config';
++import { PrismaService } from '../prisma/prisma.service';
++import type { BookingOut, CreateBooking } from './bookings.dto';
++import { RESERVE_STRATEGY, type ReserveStrategy } from './strategies/reserve.strategy';
++
++export interface Clock {
++  now(): Date;
++}
++
++export const CLOCK = Symbol('CLOCK');
++export const systemClock: Clock = { now: () => new Date() };
++
++@Injectable()
++export class BookingsService {
++  constructor(
++    private readonly prisma: PrismaService,
++    @Inject(RESERVE_STRATEGY) private readonly strategy: ReserveStrategy,
++    @Inject(CONFIG) private readonly config: Config,
++    @Inject(CLOCK) private readonly clock: Clock,
++  ) {}
++
++  get strategyName(): string {
++    return this.strategy.name;
++  }
++
++  async create(userId: string, input: CreateBooking): Promise<BookingOut> {
++    const resource = await this.prisma.resource.findUnique({ where: { id: input.resourceId } });
++    if (!resource) throw new ResourceNotFoundError(input.resourceId);
++    const now = this.clock.now();
++    const held = await this.strategy.reserve({
++      resource: {
++        id: resource.id,
++        capacity: resource.capacity,
++        exclusive: resource.kind === 'ROOM',
++      },
++      userId,
++      startsAt: input.startsAt,
++      endsAt: input.endsAt,
++      holdExpiresAt: new Date(now.getTime() + this.config.HOLD_TTL_SECONDS * 1000),
++    });
++    return this.get(held.id);
++  }
++
++  async get(id: string): Promise<BookingOut> {
++    const row = await this.prisma.booking.findUnique({ where: { id } });
++    if (!row) throw new BookingNotFoundError(id);
++    return {
++      id: row.id,
++      resourceId: row.resourceId,
++      userId: row.userId,
++      startsAt: row.startsAt.toISOString(),
++      endsAt: row.endsAt.toISOString(),
++      status: row.status,
++      holdExpiresAt: row.holdExpiresAt?.toISOString() ?? null,
++      paymentId: row.paymentId,
++    };
++  }
++}
+diff --git a/src/bookings/strategies/advisory.strategy.ts b/src/bookings/strategies/advisory.strategy.ts
+new file mode 100644
+index 0000000..fbbe580
+--- /dev/null
++++ b/src/bookings/strategies/advisory.strategy.ts
+@@ -0,0 +1,28 @@
++import { Injectable } from '@nestjs/common';
++import { NoCapacityError } from '../../common/errors';
++import { PrismaService } from '../../prisma/prisma.service';
++import {
++  countOverlapping,
++  insertHeld,
++  type ReservedBooking,
++  type ReserveInput,
++  type ReserveStrategy,
++} from './reserve.strategy';
++
++/** A transaction-scoped advisory lock per resource: callers for the same resource queue up. */
++@Injectable()
++export class AdvisoryStrategy implements ReserveStrategy {
++  readonly name = 'advisory' as const;
++
++  constructor(private readonly prisma: PrismaService) {}
++
++  reserve(input: ReserveInput): Promise<ReservedBooking> {
++    return this.prisma.$transaction(async (tx) => {
++      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${input.resource.id}))`;
++      if ((await countOverlapping(tx, input)) >= input.resource.capacity) {
++        throw new NoCapacityError(input.resource.id);
++      }
++      return insertHeld(tx, input);
++    });
++  }
++}
+diff --git a/src/bookings/strategies/exclusion.strategy.ts b/src/bookings/strategies/exclusion.strategy.ts
+new file mode 100644
+index 0000000..b1aba84
+--- /dev/null
++++ b/src/bookings/strategies/exclusion.strategy.ts
+@@ -0,0 +1,81 @@
++import { Injectable } from '@nestjs/common';
++import {
++  isRetryableConflict,
++  NoCapacityError,
++  PG,
++  pgCode,
++  RetryExhaustedError,
++} from '../../common/errors';
++import { PrismaService } from '../../prisma/prisma.service';
++import { AdvisoryStrategy } from './advisory.strategy';
++import {
++  insertHeld,
++  type ReservedBooking,
++  type ReserveInput,
++  type ReserveStrategy,
++} from './reserve.strategy';
++
++export const EXCLUSION_CONSTRAINT = 'booking_no_overlap';
++
++/**
++ * Let the database say no: a GiST exclusion constraint rejects an overlapping active booking on an
++ * exclusive resource, so the insert simply fails with 23P01. "At most N" cannot be expressed this
++ * way, so pools use the advisory strategy underneath.
++ *
++ * The insert is a single autocommit statement rather than an interactive transaction. Postgres
++ * checks an exclusion constraint after inserting the index entry, so two concurrent inserters can
++ * each find the other's uncommitted row and wait on each other; the deadlock detector then aborts
++ * one of them with 40P01 (after deadlock_timeout, 1 s by default), and that one retries and gets
++ * its 23P01. A client-side transaction timeout would only add a way to lose the row that would
++ * have won.
++ */
++@Injectable()
++export class ExclusionStrategy implements ReserveStrategy {
++  readonly name = 'exclusion' as const;
++  static readonly MAX_ATTEMPTS = 5;
++  attempts = 0;
++  deadlocks = 0;
++
++  constructor(
++    private readonly prisma: PrismaService,
++    private readonly advisory: AdvisoryStrategy,
++  ) {}
++
++  async reserve(input: ReserveInput): Promise<ReservedBooking> {
++    if (!input.resource.exclusive) return this.advisory.reserve(input);
++    for (let attempt = 0; ; attempt += 1) {
++      this.attempts += 1;
++      try {
++        return await insertHeld(this.prisma, input);
++      } catch (error) {
++        const code = pgCode(error);
++        if (code === PG.exclusionViolation || String(error).includes(EXCLUSION_CONSTRAINT)) {
++          throw new NoCapacityError(input.resource.id);
++        }
++        if (!isRetryableConflict(error)) throw error;
++        this.deadlocks += 1;
++        if (attempt + 1 >= ExclusionStrategy.MAX_ATTEMPTS) {
++          throw new RetryExhaustedError(this.name, ExclusionStrategy.MAX_ATTEMPTS);
++        }
++      }
++    }
++  }
++
++  /** Adds or drops the constraint so it only exists while this strategy is active. */
++  static async ensureConstraint(prisma: PrismaService, active: boolean): Promise<void> {
++    if (active) {
++      await prisma.$executeRawUnsafe(`
++        DO $$ BEGIN
++          IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '${EXCLUSION_CONSTRAINT}') THEN
++            ALTER TABLE bookings ADD CONSTRAINT ${EXCLUSION_CONSTRAINT}
++              EXCLUDE USING gist ("resourceId" WITH =, tstzrange("startsAt", "endsAt") WITH &&)
++              WHERE ("exclusive" AND status IN ('HELD', 'CONFIRMED'));
++          END IF;
++        END $$;`);
++    } else {
++      await prisma.$executeRawUnsafe(
++        `ALTER TABLE bookings DROP CONSTRAINT IF EXISTS ${EXCLUSION_CONSTRAINT}`,
++      );
++    }
++  }
++}
+diff --git a/src/bookings/strategies/for-update.strategy.ts b/src/bookings/strategies/for-update.strategy.ts
+new file mode 100644
+index 0000000..0cfc84b
+--- /dev/null
++++ b/src/bookings/strategies/for-update.strategy.ts
+@@ -0,0 +1,28 @@
++import { Injectable } from '@nestjs/common';
++import { NoCapacityError } from '../../common/errors';
++import { PrismaService } from '../../prisma/prisma.service';
++import {
++  countOverlapping,
++  insertHeld,
++  type ReservedBooking,
++  type ReserveInput,
++  type ReserveStrategy,
++} from './reserve.strategy';
++
++/** Row lock on the resource: the same serialisation as the advisory lock, visible in the plan. */
++@Injectable()
++export class ForUpdateStrategy implements ReserveStrategy {
++  readonly name = 'for_update' as const;
++
++  constructor(private readonly prisma: PrismaService) {}
++
++  reserve(input: ReserveInput): Promise<ReservedBooking> {
++    return this.prisma.$transaction(async (tx) => {
++      await tx.$queryRaw`SELECT id FROM resources WHERE id = ${input.resource.id} FOR UPDATE`;
++      if ((await countOverlapping(tx, input)) >= input.resource.capacity) {
++        throw new NoCapacityError(input.resource.id);
++      }
++      return insertHeld(tx, input);
++    });
++  }
++}
+diff --git a/src/bookings/strategies/naive.strategy.ts b/src/bookings/strategies/naive.strategy.ts
+new file mode 100644
+index 0000000..ddc7d48
+--- /dev/null
++++ b/src/bookings/strategies/naive.strategy.ts
+@@ -0,0 +1,31 @@
++import { Injectable } from '@nestjs/common';
++import { NoCapacityError } from '../../common/errors';
++import { PrismaService } from '../../prisma/prisma.service';
++import {
++  countOverlapping,
++  insertHeld,
++  type ReservedBooking,
++  type ReserveInput,
++  type ReserveStrategy,
++} from './reserve.strategy';
++
++/**
++ * The bug, on purpose: check then insert with nothing holding the two together. Two concurrent
++ * callers both count zero and both insert. Kept as the control the race test and the benchmark
++ * run against; the configuration refuses it in production.
++ */
++@Injectable()
++export class NaiveStrategy implements ReserveStrategy {
++  readonly name = 'naive' as const;
++
++  constructor(private readonly prisma: PrismaService) {}
++
++  reserve(input: ReserveInput): Promise<ReservedBooking> {
++    return this.prisma.$transaction(async (tx) => {
++      if ((await countOverlapping(tx, input)) >= input.resource.capacity) {
++        throw new NoCapacityError(input.resource.id);
++      }
++      return insertHeld(tx, input);
++    });
++  }
++}
+diff --git a/src/bookings/strategies/optimistic.strategy.ts b/src/bookings/strategies/optimistic.strategy.ts
+new file mode 100644
+index 0000000..6414ba8
+--- /dev/null
++++ b/src/bookings/strategies/optimistic.strategy.ts
+@@ -0,0 +1,60 @@
++import { Injectable } from '@nestjs/common';
++import { NoCapacityError, RetryExhaustedError } from '../../common/errors';
++import { PrismaService } from '../../prisma/prisma.service';
++import {
++  countOverlapping,
++  insertHeld,
++  jitter,
++  type ReservedBooking,
++  type ReserveInput,
++  type ReserveStrategy,
++  sleep,
++} from './reserve.strategy';
++
++class VersionConflict extends Error {}
++
++/**
++ * No locks: count, insert, then bump the resource's version guarded by the version we read.
++ * A competing transaction that committed first makes the guarded update touch 0 rows; we roll
++ * back and try again, and the retry's count sees the winner's booking.
++ */
++@Injectable()
++export class OptimisticStrategy implements ReserveStrategy {
++  readonly name = 'optimistic' as const;
++  static readonly MAX_ATTEMPTS = 6;
++  attempts = 0;
++  retries = 0;
++
++  constructor(private readonly prisma: PrismaService) {}
++
++  async reserve(input: ReserveInput): Promise<ReservedBooking> {
++    for (let attempt = 0; ; attempt += 1) {
++      this.attempts += 1;
++      try {
++        return await this.prisma.$transaction(async (tx) => {
++          const seen = await tx.resource.findUniqueOrThrow({
++            where: { id: input.resource.id },
++            select: { version: true },
++          });
++          if ((await countOverlapping(tx, input)) >= input.resource.capacity) {
++            throw new NoCapacityError(input.resource.id);
++          }
++          const booking = await insertHeld(tx, input);
++          const bumped = await tx.resource.updateMany({
++            where: { id: input.resource.id, version: seen.version },
++            data: { version: { increment: 1 } },
++          });
++          if (bumped.count === 0) throw new VersionConflict();
++          return booking;
++        });
++      } catch (error) {
++        if (!(error instanceof VersionConflict)) throw error;
++        if (attempt + 1 >= OptimisticStrategy.MAX_ATTEMPTS) {
++          throw new RetryExhaustedError(this.name, OptimisticStrategy.MAX_ATTEMPTS);
++        }
++        this.retries += 1;
++        await sleep(jitter(attempt));
++      }
++    }
++  }
++}
+diff --git a/src/bookings/strategies/reserve.strategy.ts b/src/bookings/strategies/reserve.strategy.ts
+new file mode 100644
+index 0000000..7d6dfa3
+--- /dev/null
++++ b/src/bookings/strategies/reserve.strategy.ts
+@@ -0,0 +1,80 @@
++import type { Strategy } from '../../config';
++import type { PrismaService } from '../../prisma/prisma.service';
++
++export interface ReserveInput {
++  resource: { id: string; capacity: number; exclusive: boolean };
++  userId: string;
++  startsAt: Date;
++  endsAt: Date;
++  holdExpiresAt: Date;
++}
++
++export interface ReservedBooking {
++  id: string;
++  resourceId: string;
++  userId: string;
++  startsAt: Date;
++  endsAt: Date;
++  status: 'HELD';
++  holdExpiresAt: Date | null;
++}
++
++/**
++ * Creates a HELD booking if the resource has capacity for [startsAt, endsAt), atomically with
++ * respect to every other caller — or throws NoCapacityError. Each implementation serialises
++ * differently; see docs/adr/0001.
++ */
++export interface ReserveStrategy {
++  readonly name: Strategy;
++  reserve(input: ReserveInput): Promise<ReservedBooking>;
++}
++
++export const RESERVE_STRATEGY = Symbol('RESERVE_STRATEGY');
++
++/** The transaction client Prisma hands to `$transaction(async (tx) => …)`. */
++export type Tx = Parameters<Parameters<PrismaService['$transaction']>[0]>[0];
++
++export const ACTIVE = ['HELD', 'CONFIRMED'] as const;
++
++/** Active bookings of the resource that intersect the slot (half-open intervals). */
++export function countOverlapping(tx: Tx, input: ReserveInput): Promise<number> {
++  return tx.booking.count({
++    where: {
++      resourceId: input.resource.id,
++      status: { in: [...ACTIVE] },
++      startsAt: { lt: input.endsAt },
++      endsAt: { gt: input.startsAt },
++    },
++  });
++}
++
++export function insertHeld(tx: Tx, input: ReserveInput): Promise<ReservedBooking> {
++  return tx.booking.create({
++    data: {
++      resourceId: input.resource.id,
++      userId: input.userId,
++      startsAt: input.startsAt,
++      endsAt: input.endsAt,
++      exclusive: input.resource.exclusive,
++      status: 'HELD',
++      holdExpiresAt: input.holdExpiresAt,
++    },
++    select: {
++      id: true,
++      resourceId: true,
++      userId: true,
++      startsAt: true,
++      endsAt: true,
++      status: true,
++      holdExpiresAt: true,
++    },
++  }) as Promise<ReservedBooking>;
++}
++
++export function sleep(ms: number): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, ms));
++}
++
++export function jitter(attempt: number): number {
++  return Math.floor(Math.random() * 20 * 2 ** attempt);
++}
+diff --git a/src/bookings/strategies/serializable.strategy.ts b/src/bookings/strategies/serializable.strategy.ts
+new file mode 100644
+index 0000000..995842f
+--- /dev/null
++++ b/src/bookings/strategies/serializable.strategy.ts
+@@ -0,0 +1,51 @@
++import { Injectable } from '@nestjs/common';
++import { isRetryableConflict, NoCapacityError, RetryExhaustedError } from '../../common/errors';
++import { PrismaService } from '../../prisma/prisma.service';
++import {
++  countOverlapping,
++  insertHeld,
++  jitter,
++  type ReservedBooking,
++  type ReserveInput,
++  type ReserveStrategy,
++  sleep,
++} from './reserve.strategy';
++
++/**
++ * The textbook answer: the same count-then-insert in a SERIALIZABLE transaction. Postgres tracks
++ * the predicate the count read; a concurrent insert into it fails one of the transactions at
++ * commit with 40001, and that one is retried.
++ */
++@Injectable()
++export class SerializableStrategy implements ReserveStrategy {
++  readonly name = 'serializable' as const;
++  static readonly MAX_ATTEMPTS = 8;
++  attempts = 0;
++  retries = 0;
++
++  constructor(private readonly prisma: PrismaService) {}
++
++  async reserve(input: ReserveInput): Promise<ReservedBooking> {
++    for (let attempt = 0; ; attempt += 1) {
++      this.attempts += 1;
++      try {
++        return await this.prisma.$transaction(
++          async (tx) => {
++            if ((await countOverlapping(tx, input)) >= input.resource.capacity) {
++              throw new NoCapacityError(input.resource.id);
++            }
++            return insertHeld(tx, input);
++          },
++          { isolationLevel: 'Serializable' },
++        );
++      } catch (error) {
++        if (!isRetryableConflict(error)) throw error;
++        if (attempt + 1 >= SerializableStrategy.MAX_ATTEMPTS) {
++          throw new RetryExhaustedError(this.name, SerializableStrategy.MAX_ATTEMPTS);
++        }
++        this.retries += 1;
++        await sleep(jitter(attempt));
++      }
++    }
++  }
++}
+diff --git a/src/bookings/strategies/strategy.module.ts b/src/bookings/strategies/strategy.module.ts
+new file mode 100644
+index 0000000..45371f5
+--- /dev/null
++++ b/src/bookings/strategies/strategy.module.ts
+@@ -0,0 +1,49 @@
++import { Inject, Module, OnModuleInit } from '@nestjs/common';
++import { CONFIG, type Config } from '../../config';
++import { PrismaService } from '../../prisma/prisma.service';
++import { AdvisoryStrategy } from './advisory.strategy';
++import { ExclusionStrategy } from './exclusion.strategy';
++import { ForUpdateStrategy } from './for-update.strategy';
++import { NaiveStrategy } from './naive.strategy';
++import { OptimisticStrategy } from './optimistic.strategy';
++import { RESERVE_STRATEGY, type ReserveStrategy } from './reserve.strategy';
++import { SerializableStrategy } from './serializable.strategy';
++
++const ALL = [
++  AdvisoryStrategy,
++  ForUpdateStrategy,
++  OptimisticStrategy,
++  SerializableStrategy,
++  ExclusionStrategy,
++  NaiveStrategy,
++];
++
++@Module({
++  providers: [
++    ...ALL,
++    {
++      provide: RESERVE_STRATEGY,
++      inject: [CONFIG, ...ALL],
++      useFactory: (config: Config, ...strategies: ReserveStrategy[]): ReserveStrategy => {
++        const chosen = strategies.find((s) => s.name === config.BOOKING_STRATEGY);
++        if (!chosen) throw new Error(`no strategy named ${config.BOOKING_STRATEGY}`);
++        return chosen;
++      },
++    },
++  ],
++  exports: [RESERVE_STRATEGY, ...ALL],
++})
++export class StrategyModule implements OnModuleInit {
++  constructor(
++    @Inject(CONFIG) private readonly config: Config,
++    private readonly prisma: PrismaService,
++  ) {}
++
++  /** The exclusion constraint exists only while the exclusion strategy is the active one. */
++  async onModuleInit(): Promise<void> {
++    await ExclusionStrategy.ensureConstraint(
++      this.prisma,
++      this.config.BOOKING_STRATEGY === 'exclusion',
++    );
++  }
++}
+diff --git a/src/common/errors.ts b/src/common/errors.ts
+new file mode 100644
+index 0000000..3650d43
+--- /dev/null
++++ b/src/common/errors.ts
+@@ -0,0 +1,96 @@
++import {
++  ConflictException,
++  HttpException,
++  NotFoundException,
++  ServiceUnavailableException,
++  UnprocessableEntityException,
++} from '@nestjs/common';
++
++/** Domain errors carry a stable `code` the API returns as JSON; HTTP mapping happens here. */
++export class NoCapacityError extends ConflictException {
++  constructor(resourceId: string) {
++    super({ code: 'no_capacity', message: `no capacity left on ${resourceId} for that time` });
++  }
++}
++
++export class RequestInFlightError extends ConflictException {
++  constructor(key: string) {
++    super({
++      code: 'request_in_flight',
++      message: `a request with Idempotency-Key ${key} is still running`,
++    });
++  }
++}
++
++export class IdempotencyMismatchError extends UnprocessableEntityException {
++  constructor(key: string) {
++    super({
++      code: 'idempotency_key_reused',
++      message: `Idempotency-Key ${key} was used with a different request`,
++    });
++  }
++}
++
++/** An optimistic or serializable retry loop gave up; the client should retry with backoff. */
++export class RetryExhaustedError extends ServiceUnavailableException {
++  constructor(strategy: string, attempts: number) {
++    super({
++      code: 'retry_exhausted',
++      message: `${strategy} strategy gave up after ${attempts} attempts; retry later`,
++    });
++  }
++}
++
++export class ResourceNotFoundError extends NotFoundException {
++  constructor(id: string) {
++    super({ code: 'resource_not_found', message: `resource ${id} not found` });
++  }
++}
++
++export class BookingNotFoundError extends NotFoundException {
++  constructor(id: string) {
++    super({ code: 'booking_not_found', message: `booking ${id} not found` });
++  }
++}
++
++export class InvalidTransitionError extends HttpException {
++  constructor(from: string, to: string) {
++    super({ code: 'invalid_transition', message: `a ${from} booking cannot become ${to}` }, 409);
++  }
++}
++
++/** Postgres SQLSTATE codes we branch on, wherever Prisma surfaces them. */
++export const PG = {
++  serializationFailure: '40001',
++  deadlockDetected: '40P01',
++  uniqueViolation: '23505',
++  exclusionViolation: '23P01',
++} as const;
++
++/**
++ * The SQLSTATE behind an error, wherever Prisma 7 puts it: a driver-adapter error's `cause`
++ * (thrown as-is inside interactive transactions), a known request error's code, or the `meta`
++ * of a raw-query failure.
++ */
++export function pgCode(error: unknown): string | undefined {
++  const e = error as {
++    code?: unknown;
++    meta?: { code?: unknown };
++    cause?: { kind?: unknown; code?: unknown };
++  };
++  if (e?.cause && typeof e.cause === 'object') {
++    if (e.cause.kind === 'TransactionWriteConflict') return PG.serializationFailure;
++    if (e.cause.kind === 'UniqueConstraintViolation') return PG.uniqueViolation;
++    if (typeof e.cause.code === 'string') return e.cause.code;
++  }
++  if (e?.code === 'P2002') return PG.uniqueViolation;
++  if (e?.code === 'P2034') return PG.serializationFailure;
++  if (typeof e?.meta?.code === 'string') return e.meta.code;
++  const message = error instanceof Error ? error.message : String(error);
++  return message.match(/\b(40001|40P01|23505|23P01)\b/)?.[1];
++}
++
++export function isRetryableConflict(error: unknown): boolean {
++  const code = pgCode(error);
++  return code === PG.serializationFailure || code === PG.deadlockDetected;
++}
+diff --git a/src/common/http-exception.filter.ts b/src/common/http-exception.filter.ts
+new file mode 100644
+index 0000000..dda6ca4
+--- /dev/null
++++ b/src/common/http-exception.filter.ts
+@@ -0,0 +1,79 @@
++import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus } from '@nestjs/common';
++import type { FastifyReply, FastifyRequest } from 'fastify';
++import { Logger } from 'nestjs-pino';
++
++export interface ErrorBody {
++  code: string;
++  message: string;
++  [extra: string]: unknown;
++}
++
++/**
++ * Every error leaves as `{ code, message, … }`. Domain errors already carry a code; Nest's own
++ * exceptions get one derived from their status; anything else is logged and becomes a 500 without
++ * leaking its message.
++ */
++@Catch()
++export class HttpExceptionFilter implements ExceptionFilter {
++  constructor(private readonly logger: Logger) {}
++
++  catch(exception: unknown, host: ArgumentsHost): void {
++    const reply = host.switchToHttp().getResponse<FastifyReply>();
++    const request = host.switchToHttp().getRequest<FastifyRequest>();
++    const { status, body } = toErrorResponse(exception);
++    if (status >= 500) {
++      this.logger.error(
++        { err: exception, method: request.method, url: request.url },
++        'unhandled error',
++      );
++    }
++    reply.status(status).send(body);
++  }
++}
++
++export function toErrorResponse(exception: unknown): { status: number; body: ErrorBody } {
++  if (exception instanceof HttpException) {
++    const status = exception.getStatus();
++    const response = exception.getResponse();
++    if (typeof response === 'object' && response !== null && 'code' in response) {
++      return { status, body: response as ErrorBody };
++    }
++    const message =
++      typeof response === 'string'
++        ? response
++        : ((response as { message?: string | string[] }).message ?? exception.message);
++    return {
++      status,
++      body: {
++        code: codeForStatus(status),
++        message: Array.isArray(message) ? message.join('; ') : message,
++        ...(typeof response === 'object'
++          ? omit(response as Record<string, unknown>, ['message', 'statusCode', 'error'])
++          : {}),
++      },
++    };
++  }
++  return {
++    status: HttpStatus.INTERNAL_SERVER_ERROR,
++    body: { code: 'internal_error', message: 'something went wrong on our side' },
++  };
++}
++
++function codeForStatus(status: number): string {
++  switch (status) {
++    case 400:
++      return 'bad_request';
++    case 404:
++      return 'not_found';
++    case 409:
++      return 'conflict';
++    case 422:
++      return 'unprocessable';
++    default:
++      return `http_${status}`;
++  }
++}
++
++function omit(source: Record<string, unknown>, keys: string[]): Record<string, unknown> {
++  return Object.fromEntries(Object.entries(source).filter(([k]) => !keys.includes(k)));
++}
+diff --git a/src/config.ts b/src/config.ts
+index 3bad757..b3d2d01 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -7,23 +7,33 @@ export const STRATEGIES = [
+   'optimistic',
+   'serializable',
+   'exclusion',
++  'naive',
+ ] as const;
+ export type Strategy = (typeof STRATEGIES)[number];
+ 
+-const schema = z.object({
+-  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+-  PORT: z.coerce.number().int().positive().default(3000),
+-  LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'silent']).default('info'),
+-  DATABASE_URL: z.string().url(),
+-  REDIS_URL: z.string().url().default('redis://localhost:6379/0'),
+-  BOOKING_STRATEGY: z.enum(STRATEGIES).default('advisory'),
+-  HOLD_TTL_SECONDS: z.coerce.number().int().positive().default(600),
+-  STRIPE_SECRET_KEY: z
+-    .string()
+-    .optional()
+-    .transform((v) => (v ? v : undefined)),
+-  STRIPE_WEBHOOK_SECRET: z.string().min(8).default('whsec_slotlock_dev'),
+-});
++/** The five that are safe; `naive` is the bug itself, kept as a control for tests and benchmarks. */
++export const SAFE_STRATEGIES = STRATEGIES.filter((s) => s !== 'naive');
++
++const schema = z
++  .object({
++    NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
++    PORT: z.coerce.number().int().positive().default(3000),
++    LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'silent']).default('info'),
++    DATABASE_URL: z.string().url(),
++    DATABASE_POOL_SIZE: z.coerce.number().int().positive().default(20),
++    REDIS_URL: z.string().url().default('redis://localhost:6379/0'),
++    BOOKING_STRATEGY: z.enum(STRATEGIES).default('advisory'),
++    HOLD_TTL_SECONDS: z.coerce.number().int().positive().default(600),
++    STRIPE_SECRET_KEY: z
++      .string()
++      .optional()
++      .transform((v) => (v ? v : undefined)),
++    STRIPE_WEBHOOK_SECRET: z.string().min(8).default('whsec_slotlock_dev'),
++  })
++  .refine((c) => !(c.NODE_ENV === 'production' && c.BOOKING_STRATEGY === 'naive'), {
++    message: 'BOOKING_STRATEGY=naive double-books by design and is refused in production',
++    path: ['BOOKING_STRATEGY'],
++  });
+ 
+ export type Config = z.infer<typeof schema>;
+ 
+diff --git a/src/health/health.controller.ts b/src/health/health.controller.ts
+index 03ed8cc..b5b2df4 100644
+--- a/src/health/health.controller.ts
++++ b/src/health/health.controller.ts
+@@ -1,16 +1,22 @@
+-import { Controller, Get } from '@nestjs/common';
++import { Controller, Get, Inject } from '@nestjs/common';
+ import { ApiOkResponse, ApiTags } from '@nestjs/swagger';
++import { CONFIG, type Config } from '../config';
+ import { PrismaService } from '../prisma/prisma.service';
+ 
+ @ApiTags('meta')
+ @Controller()
+ export class HealthController {
+-  constructor(private readonly prisma: PrismaService) {}
++  constructor(
++    private readonly prisma: PrismaService,
++    @Inject(CONFIG) private readonly config: Config,
++  ) {}
+ 
+   @Get('health')
+-  @ApiOkResponse({ description: 'The process is up and the database answers.' })
+-  async health(): Promise<{ status: string; database: string }> {
++  @ApiOkResponse({
++    description: 'The process is up, the database answers, and the active strategy.',
++  })
++  async health(): Promise<{ status: string; database: string; strategy: string }> {
+     await this.prisma.$queryRaw`SELECT 1`;
+-    return { status: 'ok', database: 'ok' };
++    return { status: 'ok', database: 'ok', strategy: this.config.BOOKING_STRATEGY };
+   }
+ }
+diff --git a/src/idempotency/idempotency.interceptor.ts b/src/idempotency/idempotency.interceptor.ts
+new file mode 100644
+index 0000000..a073e67
+--- /dev/null
++++ b/src/idempotency/idempotency.interceptor.ts
+@@ -0,0 +1,82 @@
++import {
++  BadRequestException,
++  CallHandler,
++  ExecutionContext,
++  HttpException,
++  Injectable,
++  NestInterceptor,
++} from '@nestjs/common';
++import type { FastifyReply, FastifyRequest } from 'fastify';
++import { from, Observable, of } from 'rxjs';
++import { catchError, mergeMap, switchMap, tap } from 'rxjs/operators';
++import { IdempotencyService, requestHash } from './idempotency.service';
++
++export const IDEMPOTENCY_HEADER = 'idempotency-key';
++export const USER_HEADER = 'x-user-id';
++
++/** Applies the idempotency-key protocol to a handler; the handler sees a normal request. */
++@Injectable()
++export class IdempotencyInterceptor implements NestInterceptor {
++  constructor(private readonly idempotency: IdempotencyService) {}
++
++  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
++    const request = context.switchToHttp().getRequest<FastifyRequest>();
++    const reply = context.switchToHttp().getResponse<FastifyReply>();
++    const key = header(request, IDEMPOTENCY_HEADER);
++    const userId = header(request, USER_HEADER);
++    if (!key || key.length > 128)
++      throw new BadRequestException({
++        code: 'idempotency_key_required',
++        message: 'send an Idempotency-Key header (1–128 chars)',
++      });
++    if (!userId)
++      throw new BadRequestException({ code: 'user_required', message: 'send an X-User-Id header' });
++    const hash = requestHash(
++      userId,
++      request.method,
++      request.url.split('?')[0] ?? request.url,
++      request.body,
++    );
++
++    return from(this.idempotency.claim(userId, key, hash)).pipe(
++      switchMap((claim) => {
++        if (claim.kind === 'replay') {
++          reply.status(claim.status);
++          reply.header('idempotency-replayed', 'true');
++          return of(claim.body);
++        }
++        return next.handle().pipe(
++          mergeMap((body) =>
++            from(this.idempotency.complete(userId, key, { status: reply.statusCode, body })).pipe(
++              switchMap(() => of(body)),
++            ),
++          ),
++          catchError((error: unknown) => {
++            if (error instanceof HttpException && error.getStatus() < 500) {
++              return from(
++                this.idempotency.complete(userId, key, {
++                  status: error.getStatus(),
++                  body: error.getResponse(),
++                }),
++              ).pipe(
++                tap(() => {
++                  throw error;
++                }),
++              );
++            }
++            return from(this.idempotency.release(userId, key)).pipe(
++              tap(() => {
++                throw error;
++              }),
++            );
++          }),
++        );
++      }),
++    );
++  }
++}
++
++function header(request: FastifyRequest, name: string): string | undefined {
++  const value = request.headers[name];
++  return Array.isArray(value) ? value[0] : value;
++}
+diff --git a/src/idempotency/idempotency.module.ts b/src/idempotency/idempotency.module.ts
+new file mode 100644
+index 0000000..f882744
+--- /dev/null
++++ b/src/idempotency/idempotency.module.ts
+@@ -0,0 +1,9 @@
++import { Module } from '@nestjs/common';
++import { IdempotencyInterceptor } from './idempotency.interceptor';
++import { IdempotencyService } from './idempotency.service';
++
++@Module({
++  providers: [IdempotencyService, IdempotencyInterceptor],
++  exports: [IdempotencyService, IdempotencyInterceptor],
++})
++export class IdempotencyModule {}
+diff --git a/src/idempotency/idempotency.service.ts b/src/idempotency/idempotency.service.ts
+new file mode 100644
+index 0000000..40140bd
+--- /dev/null
++++ b/src/idempotency/idempotency.service.ts
+@@ -0,0 +1,78 @@
++import { createHash } from 'node:crypto';
++import { Injectable } from '@nestjs/common';
++import { IdempotencyMismatchError, PG, pgCode, RequestInFlightError } from '../common/errors';
++import { PrismaService } from '../prisma/prisma.service';
++
++export const KEY_TTL_MS = 24 * 60 * 60 * 1000;
++
++export type Claim = { kind: 'fresh' } | { kind: 'replay'; status: number; body: unknown };
++
++export interface StoredResponse {
++  status: number;
++  body: unknown;
++}
++
++export function requestHash(userId: string, method: string, path: string, body: unknown): string {
++  return createHash('sha256')
++    .update(JSON.stringify([userId, method.toUpperCase(), path, body ?? null]))
++    .digest('hex');
++}
++
++/**
++ * Idempotency keys are scoped to the user. A key is claimed IN_FLIGHT before the handler runs;
++ * a concurrent claim of the same key gets 409; a finished key replays its stored response when
++ * the request hash matches and 422 when it does not.
++ */
++@Injectable()
++export class IdempotencyService {
++  constructor(private readonly prisma: PrismaService) {}
++
++  scopedKey(userId: string, key: string): string {
++    return `${userId}:${key}`;
++  }
++
++  async claim(userId: string, key: string, hash: string, now = new Date()): Promise<Claim> {
++    const scoped = this.scopedKey(userId, key);
++    try {
++      await this.prisma.idempotencyKey.create({
++        data: {
++          key: scoped,
++          userId,
++          requestHash: hash,
++          expiresAt: new Date(now.getTime() + KEY_TTL_MS),
++        },
++      });
++      return { kind: 'fresh' };
++    } catch (error) {
++      if (pgCode(error) !== PG.uniqueViolation && (error as { code?: string }).code !== 'P2002')
++        throw error;
++    }
++    const existing = await this.prisma.idempotencyKey.findUnique({ where: { key: scoped } });
++    if (!existing) return this.claim(userId, key, hash, now); // deleted between our insert and read
++    if (existing.expiresAt <= now) {
++      await this.prisma.idempotencyKey.deleteMany({
++        where: { key: scoped, expiresAt: { lte: now } },
++      });
++      return this.claim(userId, key, hash, now);
++    }
++    if (existing.requestHash !== hash) throw new IdempotencyMismatchError(key);
++    if (existing.status === 'IN_FLIGHT') throw new RequestInFlightError(key);
++    return { kind: 'replay', status: existing.responseStatus ?? 200, body: existing.responseBody };
++  }
++
++  async complete(userId: string, key: string, response: StoredResponse): Promise<void> {
++    await this.prisma.idempotencyKey.update({
++      where: { key: this.scopedKey(userId, key) },
++      data: {
++        status: 'DONE',
++        responseStatus: response.status,
++        responseBody: response.body as object,
++      },
++    });
++  }
++
++  /** A 5xx or a crash must not poison the key: release it so the client can retry. */
++  async release(userId: string, key: string): Promise<void> {
++    await this.prisma.idempotencyKey.deleteMany({ where: { key: this.scopedKey(userId, key) } });
++  }
++}
+diff --git a/src/main.ts b/src/main.ts
+index 4da5a59..46ce8b0 100644
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -3,6 +3,7 @@ import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify
+ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+ import { Logger } from 'nestjs-pino';
+ import { AppModule } from './app.module';
++import { HttpExceptionFilter } from './common/http-exception.filter';
+ import { CONFIG, type Config } from './config';
+ 
+ export async function createApp(config?: Config): Promise<NestFastifyApplication> {
+@@ -12,6 +13,7 @@ export async function createApp(config?: Config): Promise<NestFastifyApplication
+     { bufferLogs: true },
+   );
+   app.useLogger(app.get(Logger));
++  app.useGlobalFilters(new HttpExceptionFilter(app.get(Logger)));
+   app.enableShutdownHooks();
+ 
+   const document = SwaggerModule.createDocument(
+diff --git a/src/prisma/prisma.service.ts b/src/prisma/prisma.service.ts
+index 15f43d2..a726394 100644
+--- a/src/prisma/prisma.service.ts
++++ b/src/prisma/prisma.service.ts
+@@ -3,11 +3,22 @@ import { PrismaPg } from '@prisma/adapter-pg';
+ import { CONFIG, type Config } from '../config';
+ import { PrismaClient } from '../generated/prisma/client';
+ 
+-/** One Prisma client per process, on the pg driver adapter (Prisma 7 has no Rust engine). */
++/**
++ * One Prisma client per process, on the pg driver adapter (Prisma 7 has no Rust engine). Under
++ * contention many transactions queue for a connection or wait on a lock, so the interactive
++ * transaction limits are well above Prisma's 2 s / 5 s defaults: a queued request should wait,
++ * not fail.
++ */
+ @Injectable()
+ export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
+   constructor(@Inject(CONFIG) config: Config) {
+-    super({ adapter: new PrismaPg({ connectionString: config.DATABASE_URL }) });
++    super({
++      adapter: new PrismaPg({
++        connectionString: config.DATABASE_URL,
++        max: config.DATABASE_POOL_SIZE,
++      }),
++      transactionOptions: { maxWait: 15_000, timeout: 30_000 },
++    });
+   }
+ 
+   async onModuleInit(): Promise<void> {
+diff --git a/test/integration/bookings.race.test.ts b/test/integration/bookings.race.test.ts
+new file mode 100644
+index 0000000..4c77a3e
+--- /dev/null
++++ b/test/integration/bookings.race.test.ts
+@@ -0,0 +1,125 @@
++import type { NestFastifyApplication } from '@nestjs/platform-fastify';
++import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
++import { EXCLUSION_CONSTRAINT } from '../../src/bookings/strategies/exclusion.strategy';
++import { SAFE_STRATEGIES, type Strategy } from '../../src/config';
++import { PrismaService } from '../../src/prisma/prisma.service';
++import { createTestApp, resetDatabase } from './harness';
++
++const SLOT = { startsAt: '2026-10-01T09:00:00.000Z', endsAt: '2026-10-01T10:00:00.000Z' };
++
++function book(app: NestFastifyApplication, resourceId: string, n: number, slot = SLOT) {
++  return Promise.all(
++    Array.from({ length: n }, (_, i) =>
++      app.inject({
++        method: 'POST',
++        url: '/bookings',
++        headers: {
++          'idempotency-key': `race-${resourceId}-${i}-${Math.random()}`,
++          'x-user-id': `user-${i}`,
++        },
++        payload: { resourceId, ...slot },
++      }),
++    ),
++  );
++}
++
++async function activeBookings(app: NestFastifyApplication, resourceId: string): Promise<number> {
++  return app
++    .get(PrismaService)
++    .booking.count({ where: { resourceId, status: { in: ['HELD', 'CONFIRMED'] } } });
++}
++
++async function constraintExists(app: NestFastifyApplication): Promise<boolean> {
++  const rows = await app.get(PrismaService).$queryRaw<{ n: bigint }[]>`
++    SELECT count(*)::bigint AS n FROM pg_constraint WHERE conname = ${EXCLUSION_CONSTRAINT}`;
++  return Number(rows[0]?.n ?? 0) === 1;
++}
++
++describe.each(SAFE_STRATEGIES as Strategy[])('POST /bookings under the %s strategy', (strategy) => {
++  let app: NestFastifyApplication;
++
++  beforeAll(async () => {
++    app = await createTestApp({ BOOKING_STRATEGY: strategy });
++  });
++  afterAll(async () => {
++    await app.close();
++  });
++  beforeEach(async () => {
++    await resetDatabase(app);
++  });
++
++  it('reports the strategy on /health and owns the exclusion constraint only when it is the one', async () => {
++    expect((await app.inject({ method: 'GET', url: '/health' })).json()).toMatchObject({
++      strategy,
++    });
++    expect(await constraintExists(app)).toBe(strategy === 'exclusion');
++  });
++
++  it('holds a room once: 50 concurrent requests for one slot → 1 × 201, 49 × 409, one row', async () => {
++    const responses = await book(app, 'room-1', 50);
++    const codes = responses.map((r) => r.statusCode).sort();
++    expect(codes.filter((c) => c === 201)).toHaveLength(1);
++    expect(codes.filter((c) => c === 409)).toHaveLength(49);
++    expect(responses.find((r) => r.statusCode === 409)?.json()).toMatchObject({
++      code: 'no_capacity',
++    });
++    expect(responses.find((r) => r.statusCode === 201)?.json()).toMatchObject({
++      resourceId: 'room-1',
++      status: 'HELD',
++      ...SLOT,
++    });
++    expect(await activeBookings(app, 'room-1')).toBe(1);
++  });
++
++  it('fills a pool exactly to capacity: 20 concurrent requests on a pool of 3 → 3 × 201', async () => {
++    const responses = await book(app, 'pool-quiet', 20);
++    expect(responses.filter((r) => r.statusCode === 201)).toHaveLength(3);
++    expect(responses.filter((r) => r.statusCode === 409)).toHaveLength(17);
++    expect(await activeBookings(app, 'pool-quiet')).toBe(3);
++  });
++
++  it('treats slots as half-open intervals: back-to-back bookings do not collide, overlapping ones do', async () => {
++    const first = await book(app, 'room-2', 1, SLOT);
++    const adjacent = await book(app, 'room-2', 1, {
++      startsAt: SLOT.endsAt,
++      endsAt: '2026-10-01T11:00:00.000Z',
++    });
++    const overlapping = await book(app, 'room-2', 1, {
++      startsAt: '2026-10-01T09:30:00.000Z',
++      endsAt: '2026-10-01T10:30:00.000Z',
++    });
++    expect([first[0]?.statusCode, adjacent[0]?.statusCode, overlapping[0]?.statusCode]).toEqual([
++      201, 201, 409,
++    ]);
++    expect(await activeBookings(app, 'room-2')).toBe(2);
++  });
++
++  it('ignores cancelled bookings when counting capacity', async () => {
++    const [held] = await book(app, 'room-3', 1);
++    await app
++      .get(PrismaService)
++      .booking.update({ where: { id: held?.json().id }, data: { status: 'CANCELLED' } });
++    expect((await book(app, 'room-3', 1))[0]?.statusCode).toBe(201);
++  });
++});
++
++describe('POST /bookings under the naive control', () => {
++  let app: NestFastifyApplication;
++
++  beforeAll(async () => {
++    app = await createTestApp({ BOOKING_STRATEGY: 'naive' });
++  });
++  afterAll(async () => {
++    await app.close();
++  });
++
++  it('double-books — the race is real, which is what the five strategies are for', async () => {
++    let worst = 0;
++    for (let round = 0; round < 5 && worst < 2; round += 1) {
++      await resetDatabase(app);
++      await book(app, 'room-1', 50);
++      worst = Math.max(worst, await activeBookings(app, 'room-1'));
++    }
++    expect(worst).toBeGreaterThan(1);
++  });
++});
+diff --git a/test/integration/idempotency.test.ts b/test/integration/idempotency.test.ts
+new file mode 100644
+index 0000000..ba485cb
+--- /dev/null
++++ b/test/integration/idempotency.test.ts
+@@ -0,0 +1,154 @@
++import type { NestFastifyApplication } from '@nestjs/platform-fastify';
++import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
++import { IdempotencyService, KEY_TTL_MS } from '../../src/idempotency/idempotency.service';
++import { PrismaService } from '../../src/prisma/prisma.service';
++import { createTestApp, resetDatabase } from './harness';
++
++const SLOT = { startsAt: '2026-10-01T09:00:00.000Z', endsAt: '2026-10-01T10:00:00.000Z' };
++const body = (resourceId = 'room-1') => ({ resourceId, ...SLOT });
++
++let app: NestFastifyApplication;
++
++beforeAll(async () => {
++  app = await createTestApp();
++});
++afterAll(async () => {
++  await app.close();
++});
++beforeEach(async () => {
++  await resetDatabase(app);
++});
++
++function post(key: string | undefined, payload: Record<string, unknown>, userId = 'alice') {
++  const headers: Record<string, string> = { 'x-user-id': userId };
++  if (key !== undefined) headers['idempotency-key'] = key;
++  return app.inject({ method: 'POST', url: '/bookings', headers, payload });
++}
++
++describe('Idempotency-Key on POST /bookings', () => {
++  it('is required, as is the user', async () => {
++    expect((await post(undefined, body())).json()).toMatchObject({
++      code: 'idempotency_key_required',
++    });
++    const noUser = await app.inject({
++      method: 'POST',
++      url: '/bookings',
++      headers: { 'idempotency-key': 'k' },
++      payload: body(),
++    });
++    expect(noUser.statusCode).toBe(400);
++    expect(noUser.json()).toMatchObject({ code: 'user_required' });
++  });
++
++  it('replays the stored response for a retry with the same key and body, creating no second booking', async () => {
++    const first = await post('k1', body());
++    const retry = await post('k1', body());
++    expect(first.statusCode).toBe(201);
++    expect(retry.statusCode).toBe(201);
++    expect(retry.headers['idempotency-replayed']).toBe('true');
++    expect(first.headers['idempotency-replayed']).toBeUndefined();
++    expect(retry.json()).toEqual(first.json());
++    expect(await app.get(PrismaService).booking.count()).toBe(1);
++  });
++
++  it('replays a stored 409 too — a retry of a lost race stays lost', async () => {
++    await post('winner', body(), 'bob');
++    const lost = await post('k2', body());
++    const retry = await post('k2', body());
++    expect(lost.statusCode).toBe(409);
++    expect(retry.statusCode).toBe(409);
++    expect(retry.headers['idempotency-replayed']).toBe('true');
++    expect(retry.json()).toMatchObject({ code: 'no_capacity' });
++  });
++
++  it('answers 422 when the same key arrives with a different body', async () => {
++    await post('k3', body('room-1'));
++    const reused = await post('k3', body('room-2'));
++    expect(reused.statusCode).toBe(422);
++    expect(reused.json()).toMatchObject({ code: 'idempotency_key_reused' });
++    expect(await app.get(PrismaService).booking.count()).toBe(1);
++  });
++
++  it('answers 409 request_in_flight to duplicates while the first request is still running, then replays it', async () => {
++    const prisma = app.get(PrismaService);
++    let release!: () => void;
++    const gate = new Promise<void>((resolve) => {
++      release = resolve;
++    });
++    const original = prisma.resource.findUnique.bind(prisma.resource);
++    prisma.resource.findUnique = (async (...args: Parameters<typeof original>) => {
++      await gate;
++      return original(...args);
++    }) as never;
++    try {
++      const first = post('k4', body());
++      await vi.waitFor(async () => {
++        expect(await prisma.idempotencyKey.count({ where: { status: 'IN_FLIGHT' } })).toBe(1);
++      });
++      const duplicates = await Promise.all(Array.from({ length: 9 }, () => post('k4', body())));
++      expect(duplicates.map((r) => r.statusCode)).toEqual(Array(9).fill(409));
++      expect(duplicates[0]?.json()).toMatchObject({ code: 'request_in_flight' });
++      release();
++      expect((await first).statusCode).toBe(201);
++    } finally {
++      release();
++      prisma.resource.findUnique = original as never;
++    }
++    const retry = await post('k4', body());
++    expect(retry.statusCode).toBe(201);
++    expect(retry.headers['idempotency-replayed']).toBe('true');
++    expect(await prisma.booking.count()).toBe(1);
++  });
++
++  it('scopes keys per user: two users may reuse the same key', async () => {
++    const alice = await post('shared', body('room-1'), 'alice');
++    const bob = await post('shared', body('room-2'), 'bob');
++    expect([alice.statusCode, bob.statusCode]).toEqual([201, 201]);
++    expect(await app.get(PrismaService).booking.count()).toBe(2);
++  });
++
++  it('releases the key when the handler fails with a 5xx so the client can retry', async () => {
++    const idempotency = app.get(IdempotencyService);
++    const prisma = app.get(PrismaService);
++    const original = prisma.resource.findUnique.bind(prisma.resource);
++    prisma.resource.findUnique = (() => Promise.reject(new Error('database went away'))) as never;
++    try {
++      expect((await post('k5', body())).statusCode).toBe(500);
++    } finally {
++      prisma.resource.findUnique = original as never;
++    }
++    expect(
++      await prisma.idempotencyKey.findUnique({
++        where: { key: idempotency.scopedKey('alice', 'k5') },
++      }),
++    ).toBeNull();
++    expect((await post('k5', body())).statusCode).toBe(201);
++  });
++
++  it('forgets a key after its TTL', async () => {
++    const prisma = app.get(PrismaService);
++    await post('k6', body('room-1'));
++    await prisma.idempotencyKey.updateMany({
++      data: { expiresAt: new Date(Date.now() - KEY_TTL_MS) },
++    });
++    const later = await post('k6', body('room-2'));
++    expect(later.statusCode).toBe(201);
++    expect(later.headers['idempotency-replayed']).toBeUndefined();
++  });
++
++  it('does not treat a 4xx handler result as a poisoned key: validation errors are stored and replayed', async () => {
++    const bad = await post('k7', {
++      resourceId: 'room-1',
++      startsAt: SLOT.endsAt,
++      endsAt: SLOT.startsAt,
++    });
++    const retry = await post('k7', {
++      resourceId: 'room-1',
++      startsAt: SLOT.endsAt,
++      endsAt: SLOT.startsAt,
++    });
++    expect(bad.statusCode).toBe(400);
++    expect(retry.statusCode).toBe(400);
++    expect(retry.headers['idempotency-replayed']).toBe('true');
++  });
++});
+diff --git a/test/unit/bookings.dto.test.ts b/test/unit/bookings.dto.test.ts
+new file mode 100644
+index 0000000..8472694
+--- /dev/null
++++ b/test/unit/bookings.dto.test.ts
+@@ -0,0 +1,25 @@
++import { describe, expect, it } from 'vitest';
++import { createBookingSchema } from '../../src/bookings/bookings.dto';
++
++const at = (h: number) => new Date(Date.UTC(2026, 9, 1, h)).toISOString();
++
++describe('createBookingSchema', () => {
++  it('accepts a slot and coerces the dates', () => {
++    const parsed = createBookingSchema.parse({
++      resourceId: 'room-1',
++      startsAt: at(9),
++      endsAt: at(10),
++    });
++    expect(parsed.startsAt).toBeInstanceOf(Date);
++    expect(parsed.endsAt.getTime() - parsed.startsAt.getTime()).toBe(3_600_000);
++  });
++
++  it.each([
++    ['ends before it starts', { startsAt: at(10), endsAt: at(9) }],
++    ['is empty', { startsAt: at(9), endsAt: at(9) }],
++    ['is longer than 8 hours', { startsAt: at(1), endsAt: at(10) }],
++    ['has an unparseable date', { startsAt: 'yesterday', endsAt: at(10) }],
++  ])('rejects a slot that %s', (_name, slot) => {
++    expect(createBookingSchema.safeParse({ resourceId: 'room-1', ...slot }).success).toBe(false);
++  });
++});
+diff --git a/test/unit/errors.test.ts b/test/unit/errors.test.ts
+new file mode 100644
+index 0000000..6923947
+--- /dev/null
++++ b/test/unit/errors.test.ts
+@@ -0,0 +1,45 @@
++import { describe, expect, it } from 'vitest';
++import { isRetryableConflict, PG, pgCode } from '../../src/common/errors';
++
++describe('pgCode', () => {
++  it('reads a driver-adapter error thrown inside an interactive transaction', () => {
++    const conflict = Object.assign(new Error('TransactionWriteConflict'), {
++      name: 'DriverAdapterError',
++      cause: { kind: 'TransactionWriteConflict' },
++    });
++    const unique = Object.assign(new Error('UniqueConstraintViolation'), {
++      cause: { kind: 'UniqueConstraintViolation', constraint: { fields: ['key'] } },
++    });
++    const raw = Object.assign(new Error('postgres'), {
++      cause: { kind: 'postgres', code: '23P01' },
++    });
++    expect(pgCode(conflict)).toBe(PG.serializationFailure);
++    expect(pgCode(unique)).toBe(PG.uniqueViolation);
++    expect(pgCode(raw)).toBe(PG.exclusionViolation);
++  });
++
++  it('reads Prisma known-request codes and raw-query meta', () => {
++    expect(pgCode({ code: 'P2002', meta: { target: ['key'] } })).toBe(PG.uniqueViolation);
++    expect(pgCode({ code: 'P2034' })).toBe(PG.serializationFailure);
++    expect(
++      pgCode({ code: 'P2010', meta: { code: '23P01', message: 'conflicting key value' } }),
++    ).toBe(PG.exclusionViolation);
++  });
++
++  it('falls back to the SQLSTATE in the message, and gives up otherwise', () => {
++    expect(pgCode(new Error('ERROR: deadlock detected (SQLSTATE 40P01)'))).toBe(
++      PG.deadlockDetected,
++    );
++    expect(pgCode(new Error('something else'))).toBeUndefined();
++    expect(pgCode(null)).toBeUndefined();
++  });
++});
++
++describe('isRetryableConflict', () => {
++  it('is true only for serialization failures and deadlocks', () => {
++    expect(isRetryableConflict({ code: 'P2034' })).toBe(true);
++    expect(isRetryableConflict(new Error('40P01'))).toBe(true);
++    expect(isRetryableConflict({ code: 'P2002' })).toBe(false);
++    expect(isRetryableConflict(new Error('boom'))).toBe(false);
++  });
++});
+diff --git a/test/unit/idempotency.test.ts b/test/unit/idempotency.test.ts
+new file mode 100644
+index 0000000..7d93bf1
+--- /dev/null
++++ b/test/unit/idempotency.test.ts
+@@ -0,0 +1,25 @@
++import { describe, expect, it } from 'vitest';
++import { requestHash } from '../../src/idempotency/idempotency.service';
++
++describe('requestHash', () => {
++  const body = {
++    resourceId: 'room-1',
++    startsAt: '2026-10-01T09:00:00Z',
++    endsAt: '2026-10-01T10:00:00Z',
++  };
++
++  it('is stable for the same user, route and body', () => {
++    expect(requestHash('u1', 'POST', '/bookings', body)).toBe(
++      requestHash('u1', 'post', '/bookings', { ...body }),
++    );
++  });
++
++  it('changes when the body, the route or the user changes', () => {
++    const base = requestHash('u1', 'POST', '/bookings', body);
++    expect(requestHash('u1', 'POST', '/bookings', { ...body, resourceId: 'room-2' })).not.toBe(
++      base,
++    );
++    expect(requestHash('u1', 'POST', '/other', body)).not.toBe(base);
++    expect(requestHash('u2', 'POST', '/bookings', body)).not.toBe(base);
++  });
++});
+diff --git a/test/unit/strategy-selection.test.ts b/test/unit/strategy-selection.test.ts
+new file mode 100644
+index 0000000..b767baa
+--- /dev/null
++++ b/test/unit/strategy-selection.test.ts
+@@ -0,0 +1,79 @@
++import { describe, expect, it, vi } from 'vitest';
++import { ExclusionStrategy } from '../../src/bookings/strategies/exclusion.strategy';
++import type { ReserveInput } from '../../src/bookings/strategies/reserve.strategy';
++import { loadConfig, SAFE_STRATEGIES, STRATEGIES } from '../../src/config';
++
++const env = { DATABASE_URL: 'postgresql://x:y@localhost:5432/z' };
++
++describe('BOOKING_STRATEGY', () => {
++  it.each(STRATEGIES)('accepts %s outside production', (strategy) => {
++    expect(loadConfig({ ...env, BOOKING_STRATEGY: strategy }).BOOKING_STRATEGY).toBe(strategy);
++  });
++
++  it('refuses the naive control in production', () => {
++    expect(() => loadConfig({ ...env, NODE_ENV: 'production', BOOKING_STRATEGY: 'naive' })).toThrow(
++      /naive/,
++    );
++    expect(
++      loadConfig({ ...env, NODE_ENV: 'production', BOOKING_STRATEGY: 'advisory' }).BOOKING_STRATEGY,
++    ).toBe('advisory');
++  });
++
++  it('keeps naive out of the safe list', () => {
++    expect(SAFE_STRATEGIES).toEqual([
++      'advisory',
++      'for_update',
++      'optimistic',
++      'serializable',
++      'exclusion',
++    ]);
++  });
++});
++
++describe('ExclusionStrategy', () => {
++  const input = (exclusive: boolean): ReserveInput => ({
++    resource: { id: 'r', capacity: exclusive ? 1 : 3, exclusive },
++    userId: 'u',
++    startsAt: new Date(),
++    endsAt: new Date(Date.now() + 3_600_000),
++    holdExpiresAt: new Date(),
++  });
++
++  it('delegates pools to the advisory strategy because a constraint cannot count to N', async () => {
++    const advisory = { reserve: vi.fn().mockResolvedValue({ id: 'b' }) };
++    const prisma = { booking: { create: vi.fn() } };
++    const strategy = new ExclusionStrategy(prisma as never, advisory as never);
++    await strategy.reserve(input(false));
++    expect(advisory.reserve).toHaveBeenCalledOnce();
++    expect(prisma.booking.create).not.toHaveBeenCalled();
++  });
++
++  it('turns the constraint violation into a 409 no_capacity', async () => {
++    const advisory = { reserve: vi.fn() };
++    const violation = Object.assign(
++      new Error('conflicting key value violates exclusion constraint "booking_no_overlap"'),
++      { code: 'P2010', meta: { code: '23P01' } },
++    );
++    const prisma = { booking: { create: vi.fn().mockRejectedValue(violation) } };
++    const strategy = new ExclusionStrategy(prisma as never, advisory as never);
++    await expect(strategy.reserve(input(true))).rejects.toMatchObject({ status: 409 });
++    expect(advisory.reserve).not.toHaveBeenCalled();
++  });
++
++  it('retries a deadlock victim, which then sees the winner and gets its 409', async () => {
++    const deadlock = Object.assign(new Error('deadlock detected'), {
++      cause: { kind: 'TransactionWriteConflict' },
++    });
++    const violation = Object.assign(new Error('23P01'), {
++      cause: { kind: 'postgres', code: '23P01' },
++    });
++    const create = vi.fn().mockRejectedValueOnce(deadlock).mockRejectedValueOnce(violation);
++    const strategy = new ExclusionStrategy(
++      { booking: { create } } as never,
++      { reserve: vi.fn() } as never,
++    );
++    await expect(strategy.reserve(input(true))).rejects.toMatchObject({ status: 409 });
++    expect(create).toHaveBeenCalledTimes(2);
++    expect(strategy.deadlocks).toBe(1);
++  });
++});

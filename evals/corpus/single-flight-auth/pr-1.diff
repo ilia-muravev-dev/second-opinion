@@ -1,0 +1,925 @@
+diff --git a/src/broadcast.ts b/src/broadcast.ts
+new file mode 100644
+index 0000000..211d4c4
+--- /dev/null
++++ b/src/broadcast.ts
+@@ -0,0 +1,59 @@
++import { isTokenSet } from './storage';
++import type { ChannelMessage, ChannelOption, TokenChannel, TokenSet } from './types';
++
++const MESSAGE_TYPES = new Set(['tokens', 'cleared', 'session-lost', 'lease-released']);
++
++export function isChannelMessage<T extends TokenSet>(value: unknown): value is ChannelMessage<T> {
++  if (typeof value !== 'object' || value === null) return false;
++  const message = value as Record<string, unknown>;
++  if (typeof message.type !== 'string' || !MESSAGE_TYPES.has(message.type)) return false;
++  if (message.type === 'tokens') return isTokenSet(message.tokens);
++  if (message.type === 'lease-released') return typeof message.name === 'string';
++  return true;
++}
++
++export const noopChannel: TokenChannel<never> = {
++  post() {},
++  subscribe() {
++    return () => {};
++  },
++  close() {},
++};
++
++/** A `TokenChannel` backed by `BroadcastChannel`; a no-op where the API does not exist. */
++export function broadcastChannel<T extends TokenSet>(name: string): TokenChannel<T> {
++  if (typeof BroadcastChannel === 'undefined') return noopChannel;
++  const channel = new BroadcastChannel(name);
++  // Node keeps the event loop alive for open channels; a token cache must not do that.
++  (channel as { unref?: () => void }).unref?.();
++  const listeners = new Set<(message: ChannelMessage<T>) => void>();
++  channel.onmessage = (event: MessageEvent<unknown>) => {
++    if (!isChannelMessage<T>(event.data)) return;
++    for (const listener of listeners) listener(event.data);
++  };
++  return {
++    post(message) {
++      try {
++        channel.postMessage(message);
++      } catch {
++        // A closed channel or an unclonable payload must not break the refresh itself.
++      }
++    },
++    subscribe(listener) {
++      listeners.add(listener);
++      return () => {
++        listeners.delete(listener);
++      };
++    },
++    close() {
++      listeners.clear();
++      channel.close();
++    },
++  };
++}
++
++export function resolveChannel<T extends TokenSet>(option: ChannelOption<T>): TokenChannel<T> {
++  if (option === false) return noopChannel;
++  if (typeof option === 'object') return option;
++  return broadcastChannel<T>(option);
++}
+diff --git a/src/cross-tab-lock.ts b/src/cross-tab-lock.ts
+new file mode 100644
+index 0000000..b9dc072
+--- /dev/null
++++ b/src/cross-tab-lock.ts
+@@ -0,0 +1,160 @@
++import type { LockOption, RefreshLock, TokenChannel, TokenSet } from './types';
++
++export interface LockConfig {
++  name: string;
++  leaseTtlMs: number;
++  channel: TokenChannel<TokenSet>;
++  now(): number;
++}
++
++interface Lease {
++  owner: string;
++  expiresAt: number;
++}
++
++export const noLock: RefreshLock = {
++  run: (fn) => fn(),
++};
++
++export function hasWebLocks(): boolean {
++  try {
++    return typeof navigator !== 'undefined' && typeof navigator.locks?.request === 'function';
++  } catch {
++    return false;
++  }
++}
++
++function hasLocalStorage(): boolean {
++  try {
++    return typeof localStorage !== 'undefined' && typeof localStorage.getItem === 'function';
++  } catch {
++    return false;
++  }
++}
++
++/** Exclusive lock through the Web Locks API — the browser releases it if the tab dies mid-refresh. */
++export function webLocksLock(name: string): RefreshLock {
++  if (!hasWebLocks()) {
++    throw new Error('single-flight-auth: the Web Locks API is not available in this environment');
++  }
++  return {
++    run: (fn) => navigator.locks.request(name, { mode: 'exclusive' }, () => fn()),
++  };
++}
++
++/**
++ * Cooperative lease in `localStorage` for browsers without Web Locks. Best effort: `localStorage`
++ * has no compare-and-swap, so the acquirer writes its lease, waits a few milliseconds for a
++ * concurrent writer to overwrite it, then checks the lease is still its own. A lease that outlives
++ * `leaseTtlMs` is treated as abandoned (the holder's tab probably closed).
++ */
++export function leaseLock(config: LockConfig): RefreshLock {
++  const key = `${config.name}:lease`;
++  const owner = randomId();
++
++  const read = (): Lease | null => {
++    try {
++      const raw = localStorage.getItem(key);
++      if (raw === null) return null;
++      const parsed: unknown = JSON.parse(raw);
++      if (typeof parsed !== 'object' || parsed === null) return null;
++      const lease = parsed as Partial<Lease>;
++      return typeof lease.owner === 'string' && typeof lease.expiresAt === 'number'
++        ? (lease as Lease)
++        : null;
++    } catch {
++      return null;
++    }
++  };
++
++  const write = (lease: Lease | null) => {
++    try {
++      if (lease) localStorage.setItem(key, JSON.stringify(lease));
++      else localStorage.removeItem(key);
++    } catch {
++      // If storage is unusable the lease degrades to in-tab single flight.
++    }
++  };
++
++  const waitForRelease = (maxMs: number) =>
++    new Promise<void>((resolve) => {
++      let done = false;
++      const finish = () => {
++        if (done) return;
++        done = true;
++        clearTimeout(timer);
++        unsubscribe();
++        globalThis.removeEventListener?.('storage', onStorage);
++        resolve();
++      };
++      const onStorage = (event: Event) => {
++        if ((event as StorageEvent).key === key) finish();
++      };
++      const timer = setTimeout(finish, maxMs);
++      const unsubscribe = config.channel.subscribe((message) => {
++        if (message.type === 'lease-released' && message.name === config.name) finish();
++      });
++      globalThis.addEventListener?.('storage', onStorage);
++    });
++
++  const acquire = async () => {
++    for (;;) {
++      const current = read();
++      const now = config.now();
++      if (!current || current.expiresAt <= now) {
++        write({ owner, expiresAt: now + config.leaseTtlMs });
++        await sleep(5 + Math.random() * 10);
++        if (read()?.owner === owner) return;
++      }
++      const remaining = current ? Math.max(0, current.expiresAt - config.now()) : 0;
++      await waitForRelease(Math.min(50, remaining || 50));
++    }
++  };
++
++  const release = () => {
++    if (read()?.owner === owner) write(null);
++    config.channel.post({ type: 'lease-released', name: config.name });
++  };
++
++  return {
++    async run(fn) {
++      await acquire();
++      try {
++        return await fn();
++      } finally {
++        release();
++      }
++    },
++  };
++}
++
++export function resolveLock(option: LockOption, config: LockConfig): RefreshLock {
++  if (typeof option === 'object') return option;
++  const mode = option === 'auto' ? detect() : option;
++  switch (mode) {
++    case 'web-locks':
++      return webLocksLock(config.name);
++    case 'lease':
++      return leaseLock(config);
++    case 'none':
++      return noLock;
++  }
++}
++
++function detect(): 'web-locks' | 'lease' | 'none' {
++  if (hasWebLocks()) return 'web-locks';
++  if (hasLocalStorage()) return 'lease';
++  return 'none';
++}
++
++function randomId(): string {
++  try {
++    return globalThis.crypto.randomUUID();
++  } catch {
++    return Math.random().toString(36).slice(2);
++  }
++}
++
++function sleep(ms: number): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, ms));
++}
+diff --git a/src/index.ts b/src/index.ts
+index 0f923e1..1904ac7 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,4 +1,8 @@
++export { broadcastChannel } from './broadcast';
++export { leaseLock, noLock, webLocksLock } from './cross-tab-lock';
+ export { SessionLostError } from './errors';
++export { singleFlight } from './single-flight';
++export { isTokenSet, memoryStorage, webStorage } from './storage';
+ export type {
+   AuthClient,
+   AuthClientOptions,
+diff --git a/src/single-flight.ts b/src/single-flight.ts
+new file mode 100644
+index 0000000..2c2734f
+--- /dev/null
++++ b/src/single-flight.ts
+@@ -0,0 +1,17 @@
++/**
++ * Wraps an async function so that concurrent callers share the one in-flight promise.
++ * The first caller's arguments win; later callers receive the same result or rejection.
++ */
++export function singleFlight<A extends unknown[], T>(
++  fn: (...args: A) => Promise<T>,
++): (...args: A) => Promise<T> {
++  let inflight: Promise<T> | null = null;
++  return (...args) => {
++    if (inflight) return inflight;
++    const flight = (async () => fn(...args))().finally(() => {
++      inflight = null;
++    });
++    inflight = flight;
++    return flight;
++  };
++}
+diff --git a/src/storage.ts b/src/storage.ts
+new file mode 100644
+index 0000000..ada3cb8
+--- /dev/null
++++ b/src/storage.ts
+@@ -0,0 +1,84 @@
++import type { StorageOption, TokenSet, TokenStorage } from './types';
++
++export function isTokenSet(value: unknown): value is TokenSet {
++  if (typeof value !== 'object' || value === null) return false;
++  const { accessToken, expiresAt } = value as Record<string, unknown>;
++  return (
++    typeof accessToken === 'string' && typeof expiresAt === 'number' && Number.isFinite(expiresAt)
++  );
++}
++
++/** Keeps the token set in a variable. Per tab; combine with a channel to stay in sync across tabs. */
++export function memoryStorage<T extends TokenSet = TokenSet>(): TokenStorage<T> {
++  let current: T | null = null;
++  return {
++    get: () => current,
++    set: (tokens) => {
++      current = tokens;
++    },
++    clear: () => {
++      current = null;
++    },
++  };
++}
++
++/**
++ * Keeps the token set in a Web Storage area under `key`. Reads go to the area so that tabs sharing
++ * `localStorage` see each other's refreshes. When the area throws (quota, privacy modes) the adapter
++ * falls back to an in-memory copy instead of failing the request.
++ */
++export function webStorage<T extends TokenSet = TokenSet>(
++  area: Storage,
++  key: string,
++): TokenStorage<T> {
++  let mirror: T | null = null;
++  return {
++    get() {
++      try {
++        const raw = area.getItem(key);
++        if (raw === null) return null;
++        const parsed: unknown = JSON.parse(raw);
++        return isTokenSet(parsed) ? (parsed as T) : null;
++      } catch {
++        return mirror;
++      }
++    },
++    set(tokens) {
++      mirror = tokens;
++      try {
++        area.setItem(key, JSON.stringify(tokens));
++      } catch {
++        // Quota exceeded or storage disabled: the mirror keeps this tab working.
++      }
++    },
++    clear() {
++      mirror = null;
++      try {
++        area.removeItem(key);
++      } catch {
++        // Nothing to clean up if the area is unavailable.
++      }
++    },
++  };
++}
++
++function getArea(name: 'localStorage' | 'sessionStorage'): Storage | null {
++  try {
++    const area = (globalThis as Record<string, unknown>)[name];
++    if (!area || typeof (area as Storage).getItem !== 'function') return null;
++    return area as Storage;
++  } catch {
++    // Accessing storage throws in sandboxed iframes and some privacy modes.
++    return null;
++  }
++}
++
++export function resolveStorage<T extends TokenSet>(
++  option: StorageOption<T>,
++  key: string,
++): TokenStorage<T> {
++  if (typeof option === 'object') return option;
++  if (option === 'memory') return memoryStorage<T>();
++  const area = getArea(option);
++  return area ? webStorage<T>(area, key) : memoryStorage<T>();
++}
+diff --git a/test/unit/broadcast.test.ts b/test/unit/broadcast.test.ts
+new file mode 100644
+index 0000000..8c144e3
+--- /dev/null
++++ b/test/unit/broadcast.test.ts
+@@ -0,0 +1,64 @@
++import { describe, expect, it } from 'vitest';
++import { broadcastChannel } from '../../src';
++import { isChannelMessage, noopChannel, resolveChannel } from '../../src/broadcast';
++import { flush, tokens } from './helpers';
++
++describe('isChannelMessage', () => {
++  it('accepts the known message shapes', () => {
++    expect(isChannelMessage({ type: 'tokens', tokens: tokens('a', 1) })).toBe(true);
++    expect(isChannelMessage({ type: 'cleared' })).toBe(true);
++    expect(isChannelMessage({ type: 'session-lost' })).toBe(true);
++    expect(isChannelMessage({ type: 'lease-released', name: 'x' })).toBe(true);
++  });
++
++  it('rejects malformed messages', () => {
++    expect(isChannelMessage(null)).toBe(false);
++    expect(isChannelMessage({ type: 'tokens', tokens: { accessToken: 1 } })).toBe(false);
++    expect(isChannelMessage({ type: 'lease-released' })).toBe(false);
++    expect(isChannelMessage({ type: 'evil' })).toBe(false);
++  });
++});
++
++describe('broadcastChannel', () => {
++  it('delivers valid messages to other channels with the same name', async () => {
++    const name = `test-${Math.random()}`;
++    const a = broadcastChannel(name);
++    const b = broadcastChannel(name);
++    const received: unknown[] = [];
++    b.subscribe((message) => received.push(message));
++
++    a.post({ type: 'cleared' });
++    a.post({ type: 'session-lost' });
++    await flush();
++
++    expect(received).toEqual([{ type: 'cleared' }, { type: 'session-lost' }]);
++    a.close();
++    b.close();
++  });
++
++  it('stops delivering after unsubscribe and close, and tolerates posting when closed', async () => {
++    const name = `test-${Math.random()}`;
++    const a = broadcastChannel(name);
++    const b = broadcastChannel(name);
++    const received: unknown[] = [];
++    const unsubscribe = b.subscribe((message) => received.push(message));
++
++    unsubscribe();
++    a.post({ type: 'cleared' });
++    await flush();
++    expect(received).toEqual([]);
++
++    a.close();
++    expect(() => a.post({ type: 'cleared' })).not.toThrow();
++    b.close();
++  });
++});
++
++describe('resolveChannel', () => {
++  it('maps false to the no-op channel and passes custom channels through', () => {
++    expect(resolveChannel(false)).toBe(noopChannel);
++    const custom = broadcastChannel('custom');
++    expect(resolveChannel(custom)).toBe(custom);
++    custom.close();
++  });
++});
+diff --git a/test/unit/cross-tab-lock.test.ts b/test/unit/cross-tab-lock.test.ts
+new file mode 100644
+index 0000000..1da0b18
+--- /dev/null
++++ b/test/unit/cross-tab-lock.test.ts
+@@ -0,0 +1,162 @@
++// @vitest-environment happy-dom
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { type ChannelMessage, leaseLock, noLock, webLocksLock } from '../../src';
++import { noopChannel } from '../../src/broadcast';
++import { type LockConfig, resolveLock } from '../../src/cross-tab-lock';
++import { sleep } from './helpers';
++
++const config = (overrides: Partial<LockConfig> = {}): LockConfig => ({
++  name: 'test-lock',
++  leaseTtlMs: 200,
++  channel: noopChannel,
++  now: () => Date.now(),
++  ...overrides,
++});
++
++const LEASE_KEY = 'test-lock:lease';
++
++function stubWebLocks() {
++  const request = vi.fn(
++    async (_name: string, _options: LockOptions, callback: () => Promise<unknown>) => callback(),
++  );
++  Object.defineProperty(navigator, 'locks', { value: { request }, configurable: true });
++  return request;
++}
++
++afterEach(() => {
++  localStorage.clear();
++  Reflect.deleteProperty(navigator, 'locks');
++});
++
++describe('leaseLock', () => {
++  it('lets one runner through at a time under contention', async () => {
++    let active = 0;
++    let peak = 0;
++    const order: number[] = [];
++    const locks = Array.from({ length: 8 }, () => leaseLock(config()));
++
++    await Promise.all(
++      locks.map((lock, index) =>
++        lock.run(async () => {
++          active += 1;
++          peak = Math.max(peak, active);
++          await sleep(5);
++          order.push(index);
++          active -= 1;
++        }),
++      ),
++    );
++
++    expect(peak).toBe(1);
++    expect(order).toHaveLength(8);
++    expect(localStorage.getItem(LEASE_KEY)).toBeNull();
++  });
++
++  it('holds the lease while running and removes it afterwards', async () => {
++    const lock = leaseLock(config());
++    let leaseDuringRun: string | null = null;
++
++    await lock.run(async () => {
++      leaseDuringRun = localStorage.getItem(LEASE_KEY);
++    });
++
++    expect(leaseDuringRun).not.toBeNull();
++    expect(localStorage.getItem(LEASE_KEY)).toBeNull();
++  });
++
++  it('releases the lease when the runner throws', async () => {
++    const lock = leaseLock(config());
++    await expect(lock.run(async () => Promise.reject(new Error('boom')))).rejects.toThrow('boom');
++    expect(localStorage.getItem(LEASE_KEY)).toBeNull();
++  });
++
++  it('takes over an abandoned lease once it has expired', async () => {
++    localStorage.setItem(
++      LEASE_KEY,
++      JSON.stringify({ owner: 'dead-tab', expiresAt: Date.now() + 60 }),
++    );
++    const lock = leaseLock(config());
++    const started = Date.now();
++
++    await lock.run(async () => {});
++
++    expect(Date.now() - started).toBeGreaterThanOrEqual(50);
++    expect(localStorage.getItem(LEASE_KEY)).toBeNull();
++  });
++
++  it('wakes up when the holder announces the release on the channel', async () => {
++    const listeners = new Set<(m: ChannelMessage) => void>();
++    const channel: LockConfig['channel'] = {
++      post: (m) => {
++        for (const l of listeners) l(m);
++      },
++      subscribe: (l) => {
++        listeners.add(l);
++        return () => listeners.delete(l);
++      },
++      close: () => {},
++    };
++    localStorage.setItem(
++      LEASE_KEY,
++      JSON.stringify({ owner: 'other', expiresAt: Date.now() + 10_000 }),
++    );
++    const lock = leaseLock(config({ channel }));
++    let ran = false;
++    const running = lock.run(async () => {
++      ran = true;
++    });
++
++    await sleep(30);
++    expect(ran).toBe(false);
++
++    localStorage.removeItem(LEASE_KEY);
++    channel.post({ type: 'lease-released', name: 'test-lock' });
++    await running;
++    expect(ran).toBe(true);
++  });
++
++  it('ignores a corrupt lease value', async () => {
++    localStorage.setItem(LEASE_KEY, '{nope');
++    const lock = leaseLock(config());
++    await expect(lock.run(async () => 'ok')).resolves.toBe('ok');
++  });
++});
++
++describe('webLocksLock', () => {
++  it('requests an exclusive Web Lock with the given name', async () => {
++    const request = stubWebLocks();
++    const lock = webLocksLock('my-lock');
++
++    await expect(lock.run(async () => 'done')).resolves.toBe('done');
++
++    expect(request).toHaveBeenCalledTimes(1);
++    expect(request.mock.calls[0]?.[0]).toBe('my-lock');
++    expect(request.mock.calls[0]?.[1]).toEqual({ mode: 'exclusive' });
++  });
++
++  it('throws at creation when the API is missing', () => {
++    expect(() => webLocksLock('x')).toThrow('Web Locks API is not available');
++  });
++});
++
++describe('resolveLock', () => {
++  it('returns custom locks unchanged and "none" as the pass-through lock', () => {
++    const custom = { run: <T>(fn: () => Promise<T>) => fn() };
++    expect(resolveLock(custom, config())).toBe(custom);
++    expect(resolveLock('none', config())).toBe(noLock);
++  });
++
++  it('auto picks Web Locks when available', async () => {
++    const request = stubWebLocks();
++    await resolveLock('auto', config()).run(async () => {});
++    expect(request).toHaveBeenCalled();
++  });
++
++  it('auto falls back to the lease when only localStorage exists', async () => {
++    let leaseDuringRun: string | null = null;
++    await resolveLock('auto', config()).run(async () => {
++      leaseDuringRun = localStorage.getItem(LEASE_KEY);
++    });
++    expect(leaseDuringRun).not.toBeNull();
++  });
++});
+diff --git a/test/unit/environment.test.ts b/test/unit/environment.test.ts
+new file mode 100644
+index 0000000..55d0a24
+--- /dev/null
++++ b/test/unit/environment.test.ts
+@@ -0,0 +1,35 @@
++import { describe, expect, it } from 'vitest';
++import { noLock } from '../../src';
++import { noopChannel } from '../../src/broadcast';
++import { hasWebLocks, resolveLock } from '../../src/cross-tab-lock';
++import { sleep } from './helpers';
++
++describe('in Node', () => {
++  const config = { name: 'x', leaseTtlMs: 100, channel: noopChannel, now: Date.now };
++
++  it('auto uses Web Locks when the runtime has them (Node 24+), otherwise no lock', async () => {
++    const lock = resolveLock('auto', config);
++    if (!hasWebLocks()) {
++      expect(lock).toBe(noLock);
++      return;
++    }
++    let active = 0;
++    let peak = 0;
++    await Promise.all(
++      Array.from({ length: 4 }, () =>
++        lock.run(async () => {
++          active += 1;
++          peak = Math.max(peak, active);
++          await sleep(5);
++          active -= 1;
++        }),
++      ),
++    );
++    expect(peak).toBe(1);
++  });
++
++  it('never picks the localStorage lease without localStorage', async () => {
++    expect(typeof localStorage).toBe('undefined');
++    await expect(resolveLock('auto', config).run(async () => 'ok')).resolves.toBe('ok');
++  });
++});
+diff --git a/test/unit/helpers.ts b/test/unit/helpers.ts
+new file mode 100644
+index 0000000..eb32848
+--- /dev/null
++++ b/test/unit/helpers.ts
+@@ -0,0 +1,114 @@
++import type { RefreshContext, RefreshLock, TokenChannel, TokenSet, TokenStorage } from '../../src';
++
++export function tokens(id: string, expiresAt: number): TokenSet {
++  return { accessToken: `access-${id}`, expiresAt };
++}
++
++/** A `TokenStorage` object that several clients can share, standing in for a shared `localStorage`. */
++export function sharedStorage(initial: TokenSet | null = null): TokenStorage & { reads: number } {
++  let current = initial;
++  return {
++    reads: 0,
++    get() {
++      this.reads += 1;
++      return current;
++    },
++    set(next) {
++      current = next;
++    },
++    clear() {
++      current = null;
++    },
++  };
++}
++
++/** An in-memory exclusive lock shared between clients, standing in for the Web Locks API. */
++export function mutexLock(): RefreshLock & { maxConcurrency: number } {
++  let tail: Promise<unknown> = Promise.resolve();
++  let active = 0;
++  const lock = {
++    maxConcurrency: 0,
++    run<T>(fn: () => Promise<T>): Promise<T> {
++      const result = tail.then(async () => {
++        active += 1;
++        lock.maxConcurrency = Math.max(lock.maxConcurrency, active);
++        try {
++          return await fn();
++        } finally {
++          active -= 1;
++        }
++      });
++      tail = result.catch(() => undefined);
++      return result;
++    },
++  };
++  return lock;
++}
++
++/** A synchronous in-process channel: messages reach every other subscriber immediately. */
++export function localBus(): () => TokenChannel {
++  const members = new Set<{ listeners: Set<(m: unknown) => void> }>();
++  return () => {
++    const self = { listeners: new Set<(m: unknown) => void>() };
++    members.add(self);
++    return {
++      post(message) {
++        for (const member of members) {
++          if (member === self) continue;
++          for (const listener of member.listeners) listener(message);
++        }
++      },
++      subscribe(listener) {
++        self.listeners.add(listener as (m: unknown) => void);
++        return () => self.listeners.delete(listener as (m: unknown) => void);
++      },
++      close() {
++        members.delete(self);
++      },
++    };
++  };
++}
++
++export interface RotatingServer {
++  /** The `refresh` option: behaves like a server that rotates refresh tokens. */
++  refresh(context: RefreshContext): Promise<TokenSet>;
++  calls: number;
++  rejected: number;
++  contexts: RefreshContext[];
++}
++
++/**
++ * Models refresh-token rotation: each refresh consumes the current refresh token and issues a new
++ * one. A refresh that started while another one was in flight presents an already-consumed token
++ * and is rejected with 401 — exactly what happens when two tabs race.
++ */
++export function rotatingServer(now: () => number, ttlMs = 60_000, latencyMs = 5): RotatingServer {
++  let generation = 0;
++  const server: RotatingServer = {
++    calls: 0,
++    rejected: 0,
++    contexts: [],
++    async refresh(context) {
++      server.calls += 1;
++      server.contexts.push(context);
++      const presented = generation;
++      await sleep(latencyMs);
++      if (presented !== generation) {
++        server.rejected += 1;
++        throw new Response('refresh token already used', { status: 401 });
++      }
++      generation += 1;
++      return tokens(`gen${generation}`, now() + ttlMs);
++    },
++  };
++  return server;
++}
++
++export function sleep(ms: number): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, ms));
++}
++
++/** Flushes pending macrotasks so BroadcastChannel deliveries settle. */
++export function flush(): Promise<void> {
++  return sleep(15);
++}
+diff --git a/test/unit/single-flight.test.ts b/test/unit/single-flight.test.ts
+new file mode 100644
+index 0000000..98b3d5c
+--- /dev/null
++++ b/test/unit/single-flight.test.ts
+@@ -0,0 +1,53 @@
++import { describe, expect, it } from 'vitest';
++import { singleFlight } from '../../src';
++
++const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 5));
++
++describe('singleFlight', () => {
++  it('shares one in-flight promise between concurrent callers', async () => {
++    let calls = 0;
++    const flight = singleFlight(async (label: string) => {
++      calls += 1;
++      await tick();
++      return `result for ${label}`;
++    });
++
++    const results = await Promise.all([flight('first'), flight('second'), flight('third')]);
++
++    expect(calls).toBe(1);
++    expect(results).toEqual(Array(3).fill('result for first'));
++  });
++
++  it('starts a new flight once the previous one has settled', async () => {
++    let calls = 0;
++    const flight = singleFlight(async () => {
++      calls += 1;
++      await tick();
++      return calls;
++    });
++
++    expect(await flight()).toBe(1);
++    expect(await flight()).toBe(2);
++  });
++
++  it('propagates a rejection to every caller and then resets', async () => {
++    let calls = 0;
++    const flight = singleFlight(async () => {
++      calls += 1;
++      await tick();
++      if (calls === 1) throw new Error('boom');
++      return 'ok';
++    });
++
++    const outcomes = await Promise.allSettled([flight(), flight()]);
++    expect(outcomes.map((o) => o.status)).toEqual(['rejected', 'rejected']);
++    expect(await flight()).toBe('ok');
++  });
++
++  it('turns a synchronous throw into a rejection', async () => {
++    const flight = singleFlight((): Promise<never> => {
++      throw new Error('sync');
++    });
++    await expect(flight()).rejects.toThrow('sync');
++  });
++});
+diff --git a/test/unit/storage.test.ts b/test/unit/storage.test.ts
+new file mode 100644
+index 0000000..152a8f7
+--- /dev/null
++++ b/test/unit/storage.test.ts
+@@ -0,0 +1,104 @@
++import { describe, expect, it } from 'vitest';
++import { isTokenSet, memoryStorage, webStorage } from '../../src';
++import { resolveStorage } from '../../src/storage';
++import { tokens } from './helpers';
++
++function fakeArea(): Storage & { map: Map<string, string>; failing: boolean } {
++  const area = {
++    map: new Map<string, string>(),
++    failing: false,
++    get length() {
++      return area.map.size;
++    },
++    key: (index: number) => [...area.map.keys()][index] ?? null,
++    getItem(key: string) {
++      if (area.failing) throw new Error('SecurityError');
++      return area.map.get(key) ?? null;
++    },
++    setItem(key: string, value: string) {
++      if (area.failing) throw new Error('QuotaExceededError');
++      area.map.set(key, value);
++    },
++    removeItem(key: string) {
++      if (area.failing) throw new Error('SecurityError');
++      area.map.delete(key);
++    },
++    clear() {
++      area.map.clear();
++    },
++  };
++  return area;
++}
++
++describe('isTokenSet', () => {
++  it('accepts an object with a string accessToken and a finite expiresAt', () => {
++    expect(isTokenSet({ accessToken: 'a', expiresAt: 1 })).toBe(true);
++    expect(isTokenSet({ accessToken: 'a', expiresAt: 1, refreshToken: 'r' })).toBe(true);
++  });
++
++  it('rejects everything else', () => {
++    expect(isTokenSet(null)).toBe(false);
++    expect(isTokenSet('token')).toBe(false);
++    expect(isTokenSet({ accessToken: 1, expiresAt: 1 })).toBe(false);
++    expect(isTokenSet({ accessToken: 'a', expiresAt: Number.NaN })).toBe(false);
++    expect(isTokenSet({ accessToken: 'a' })).toBe(false);
++  });
++});
++
++describe('memoryStorage', () => {
++  it('round-trips and clears', () => {
++    const storage = memoryStorage();
++    expect(storage.get()).toBeNull();
++    storage.set(tokens('a', 10));
++    expect(storage.get()).toEqual(tokens('a', 10));
++    storage.clear();
++    expect(storage.get()).toBeNull();
++  });
++});
++
++describe('webStorage', () => {
++  it('serialises the whole token set under the key', () => {
++    const area = fakeArea();
++    const storage = webStorage(area, 'k');
++    storage.set({ ...tokens('a', 10), refreshToken: 'r' } as never);
++    expect(JSON.parse(area.map.get('k') ?? '')).toEqual({ ...tokens('a', 10), refreshToken: 'r' });
++    expect(storage.get()).toEqual({ ...tokens('a', 10), refreshToken: 'r' });
++    storage.clear();
++    expect(area.map.has('k')).toBe(false);
++    expect(storage.get()).toBeNull();
++  });
++
++  it('treats corrupt or foreign values as no token', () => {
++    const area = fakeArea();
++    const storage = webStorage(area, 'k');
++    area.map.set('k', '{not json');
++    expect(storage.get()).toBeNull();
++    area.map.set('k', JSON.stringify({ something: 'else' }));
++    expect(storage.get()).toBeNull();
++  });
++
++  it('falls back to an in-memory copy when the area throws', () => {
++    const area = fakeArea();
++    const storage = webStorage(area, 'k');
++    area.failing = true;
++    storage.set(tokens('a', 10));
++    expect(area.map.size).toBe(0);
++    expect(storage.get()).toEqual(tokens('a', 10));
++    storage.clear();
++    expect(storage.get()).toBeNull();
++  });
++});
++
++describe('resolveStorage', () => {
++  it('returns a custom storage object unchanged', () => {
++    const custom = memoryStorage();
++    expect(resolveStorage(custom, 'k')).toBe(custom);
++  });
++
++  it('falls back to memory when Web Storage is unavailable (Node)', () => {
++    const storage = resolveStorage('localStorage', 'k');
++    expect(storage.get()).toBeNull();
++    storage.set(tokens('a', 10));
++    expect(storage.get()).toEqual(tokens('a', 10));
++  });
++});

@@ -1,0 +1,2354 @@
+diff --git a/backend/.env.example b/backend/.env.example
+index 8af63d5..6c0cc0f 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -2,7 +2,7 @@
+ DATABASE_URL=postgresql+psycopg://fieldwise:fieldwise@localhost:5432/fieldwise
+ REDIS_URL=redis://localhost:6379/0
+ STORAGE_URL=file://./data/storage
+-# anthropic | fake
++# anthropic | openai | fake   (openai = any OpenAI-compatible endpoint, see below)
+ LLM_PROVIDER=anthropic
+ # off | record | replay
+ LLM_CASSETTE_MODE=off
+@@ -10,3 +10,15 @@ DEFAULT_MODEL=claude-sonnet-5
+ DEFAULT_EFFORT=low
+ # Paste your key here; it is read by the Anthropic SDK.
+ ANTHROPIC_API_KEY=
++
++# --- Free options for trying the pipeline (LLM_PROVIDER=openai) ---
++# OpenRouter free vision models (rate-limited): https://openrouter.ai/models?q=free
++#   OPENAI_BASE_URL=https://openrouter.ai/api/v1
++#   OPENAI_API_KEY=sk-or-...
++#   DEFAULT_MODEL=qwen/qwen3.8-27b:free
++# A local Ollama model (brew install ollama; ollama pull qwen2.5vl:7b):
++#   OPENAI_BASE_URL=http://localhost:11434/v1
++#   OPENAI_API_KEY=ollama
++#   DEFAULT_MODEL=qwen2.5vl:7b
++OPENAI_BASE_URL=https://openrouter.ai/api/v1
++OPENAI_API_KEY=
+diff --git a/backend/pyproject.toml b/backend/pyproject.toml
+index a5229e3..88334df 100644
+--- a/backend/pyproject.toml
++++ b/backend/pyproject.toml
+@@ -25,6 +25,10 @@ dependencies = [
+   "rapidocr>=3.9,<4",
+   "onnxruntime>=1.22,<2",
+   "opencv-python-headless>=4.10,<5",
++  "anthropic>=1.6,<2",
++  "rapidfuzz>=3.14,<4",
++  "jsonschema>=4.26,<5",
++  "openai>=2,<3",
+ ]
+ 
+ [project.scripts]
+@@ -41,6 +45,7 @@ dev = [
+   "moto[s3]>=5,<6",
+   "boto3-stubs[s3]>=1.43,<2",
+   "pyarrow-stubs>=20",
++  "types-jsonschema>=4.25",
+ ]
+ 
+ [tool.uv]
+diff --git a/backend/src/fieldwise/cli.py b/backend/src/fieldwise/cli.py
+index 267568b..1896308 100644
+--- a/backend/src/fieldwise/cli.py
++++ b/backend/src/fieldwise/cli.py
+@@ -1,11 +1,13 @@
+ """Command-line interface: database, schemas, ingestion, extraction, evals and reports."""
+ 
++import json
+ from typing import Annotated
+ 
+ import typer
+ from rich.console import Console
+ from rich.table import Table
+ from sqlalchemy import or_, select
++from sqlalchemy.orm import Session
+ 
+ from fieldwise import __version__
+ from fieldwise.config import get_settings
+@@ -15,8 +17,10 @@
+ from fieldwise.documents.cord_import import import_split
+ from fieldwise.documents.ocr import RapidOcrProvider
+ from fieldwise.documents.ocr_service import ocr_document, pending_documents
++from fieldwise.extraction.factory import build_provider, describe
++from fieldwise.extraction.pipeline import ExtractionOptions, run_extraction
+ from fieldwise.logging import configure_logging
+-from fieldwise.schemas.registry import compile_builtin, sync_builtins
++from fieldwise.schemas.registry import compile_builtin, get_schema, sync_builtins
+ from fieldwise.storage import get_storage
+ 
+ app = typer.Typer(help="fieldwise — document extraction workbench.", no_args_is_help=True)
+@@ -126,25 +130,79 @@ def ocr_run(
+     console.print(f"[green]done {done}[/green] · [red]failed {failed}[/red]")
+ 
+ 
++def _find_document(session: Session, reference: str) -> Document:
++    row = session.scalars(
++        select(Document).where(or_(Document.external_id == reference, Document.name == reference))
++    ).first()
++    if row is None:
++        try:
++            row = session.get(Document, reference)
++        except Exception:  # not a UUID
++            row = None
++    if row is None:
++        raise typer.BadParameter(f"no document {reference!r}")
++    return row
++
++
+ @ocr_app.command("show")
+ def ocr_show(
+     document: Annotated[str, typer.Argument(help="Document id, external id or name.")],
+ ) -> None:
+     """Print the OCR text of one document."""
+     with session_factory()() as session:
+-        row = session.scalars(
+-            select(Document).where(or_(Document.external_id == document, Document.name == document))
+-        ).first()
+-        if row is None:
+-            try:
+-                row = session.get(Document, document)
+-            except Exception:  # not a UUID
+-                row = None
+-        if row is None:
+-            raise typer.BadParameter(f"no document {document!r}")
++        row = _find_document(session, document)
+         console.print(f"[bold]{row.name}[/bold]  ocr_status={row.ocr_status}")
+         console.print(row.ocr_text or "(no text)")
+ 
+ 
++@app.command()
++def extract(
++    document: Annotated[str, typer.Argument(help="Document id, external id or name.")],
++    *,
++    schema: Annotated[str, typer.Option(help="Schema name.")] = "receipt",
++    prompt: Annotated[str, typer.Option(help="Prompt version.")] = "v1",
++    model: Annotated[str | None, typer.Option(help="Model id (default from settings).")] = None,
++    effort: Annotated[str | None, typer.Option(help="low|medium|high|xhigh|max.")] = None,
++    provider: Annotated[str | None, typer.Option(help="anthropic | fake.")] = None,
++    cassette: Annotated[str | None, typer.Option(help="off | record | replay.")] = None,
++    ocr_text: Annotated[bool | None, typer.Option(help="Force OCR text on/off.")] = None,
++) -> None:
++    """Extract one document and print the result with tokens, cost and latency."""
++    settings = get_settings()
++    llm = build_provider(
++        settings,
++        provider_name=provider,
++        cassette_mode=cassette,  # type: ignore[arg-type]
++    )
++    options = ExtractionOptions(
++        prompt=prompt,
++        model=model or settings.default_model,
++        effort=effort or settings.default_effort,
++        use_ocr_text=ocr_text,
++    )
++    with session_factory()() as session:
++        row = _find_document(session, document)
++        schema_row = get_schema(session, schema)
++        if schema_row is None:
++            raise typer.BadParameter(f"schema {schema!r} is not in the database")
++        run = run_extraction(
++            session, get_storage(), row, schema=schema_row, options=options, provider=llm
++        )
++        session.commit()
++        console.print(
++            f"[bold]{row.name}[/bold] · {describe(llm)} · {run.model} · prompt {run.prompt_version}"
++            f" · effort {run.effort} · status [bold]{run.status}[/bold]"
++        )
++        if run.result is not None:
++            console.print_json(json.dumps(run.result))
++        if run.error:
++            console.print(f"[red]{run.error}[/red]")
++        console.print(
++            f"tokens in {run.input_tokens} (cache write {run.cache_write_tokens}, read "
++            f"{run.cache_read_tokens}) · out {run.output_tokens} · cost ${run.cost_usd} · "
++            f"{run.latency_ms} ms · served by {run.served_model} · run {run.id}"
++        )
++
++
+ if __name__ == "__main__":
+     app()
+diff --git a/backend/src/fieldwise/config.py b/backend/src/fieldwise/config.py
+index 02f4a41..1437ca7 100644
+--- a/backend/src/fieldwise/config.py
++++ b/backend/src/fieldwise/config.py
+@@ -14,12 +14,16 @@ class Settings(BaseSettings):
+     redis_url: str = "redis://localhost:6379/0"
+     storage_url: str = "file://./data/storage"
+ 
+-    llm_provider: Literal["anthropic", "fake"] = "anthropic"
++    llm_provider: Literal["anthropic", "openai", "fake"] = "anthropic"
+     llm_cassette_mode: Literal["off", "record", "replay"] = "off"
+     llm_cassette_dir: str = "evals/cassettes"
+     default_model: str = "claude-sonnet-5"
+     default_effort: Literal["low", "medium", "high", "xhigh", "max"] = "low"
+     anthropic_api_key: str | None = Field(default=None, repr=False)
++    # Any OpenAI-compatible endpoint: OpenRouter (https://openrouter.ai/api/v1),
++    # Ollama (http://localhost:11434/v1), OpenAI itself.
++    openai_base_url: str = "https://openrouter.ai/api/v1"
++    openai_api_key: str | None = Field(default=None, repr=False)
+ 
+     log_level: str = "INFO"
+ 
+diff --git a/backend/src/fieldwise/db/migrations/versions/0002_extraction_runs.py b/backend/src/fieldwise/db/migrations/versions/0002_extraction_runs.py
+new file mode 100644
+index 0000000..7dfdd6f
+--- /dev/null
++++ b/backend/src/fieldwise/db/migrations/versions/0002_extraction_runs.py
+@@ -0,0 +1,73 @@
++"""extraction runs
++
++Revision ID: 0002
++Revises: 0001
++Create Date: 2026-09-18
++"""
++
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++from sqlalchemy.dialects import postgresql
++
++revision: str = "0002"
++down_revision: str | None = "0001"
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++
++def upgrade() -> None:
++    op.create_table(
++        "extraction_runs",
++        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
++        sa.Column(
++            "document_id",
++            postgresql.UUID(as_uuid=True),
++            sa.ForeignKey("documents.id", ondelete="CASCADE"),
++            nullable=False,
++        ),
++        sa.Column(
++            "schema_id",
++            postgresql.UUID(as_uuid=True),
++            sa.ForeignKey("schemas.id", ondelete="CASCADE"),
++            nullable=False,
++        ),
++        sa.Column("prompt_version", sa.String(16), nullable=False),
++        sa.Column("model", sa.String(64), nullable=False),
++        sa.Column("effort", sa.String(8), nullable=False),
++        sa.Column("fewshot_k", sa.Integer(), nullable=False, server_default="0"),
++        sa.Column("use_ocr_text", sa.Boolean(), nullable=False, server_default=sa.true()),
++        sa.Column("provider", sa.String(16), nullable=False),
++        sa.Column("status", sa.String(16), nullable=False, server_default="queued"),
++        sa.Column("result", postgresql.JSONB(), nullable=True),
++        sa.Column("confidences", postgresql.JSONB(), nullable=True),
++        sa.Column("evidence", postgresql.JSONB(), nullable=True),
++        sa.Column("boxes", postgresql.JSONB(), nullable=True),
++        sa.Column("fewshot_document_ids", postgresql.JSONB(), nullable=True),
++        sa.Column("input_tokens", sa.Integer(), nullable=True),
++        sa.Column("cache_read_tokens", sa.Integer(), nullable=True),
++        sa.Column("cache_write_tokens", sa.Integer(), nullable=True),
++        sa.Column("output_tokens", sa.Integer(), nullable=True),
++        sa.Column("cost_usd", sa.Float(), nullable=True),
++        sa.Column("latency_ms", sa.Integer(), nullable=True),
++        sa.Column("served_model", sa.String(64), nullable=True),
++        sa.Column("request_id", sa.String(64), nullable=True),
++        sa.Column("repair_rounds", sa.Integer(), nullable=False, server_default="0"),
++        sa.Column("error", sa.Text(), nullable=True),
++        sa.Column(
++            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
++        ),
++    )
++    op.create_index("ix_extraction_runs_document_id", "extraction_runs", ["document_id"])
++    op.create_index(
++        "ix_extraction_runs_lookup",
++        "extraction_runs",
++        ["schema_id", "prompt_version", "model", "created_at"],
++    )
++
++
++def downgrade() -> None:
++    op.drop_index("ix_extraction_runs_lookup", table_name="extraction_runs")
++    op.drop_index("ix_extraction_runs_document_id", table_name="extraction_runs")
++    op.drop_table("extraction_runs")
+diff --git a/backend/src/fieldwise/db/models.py b/backend/src/fieldwise/db/models.py
+index fb4161b..1c07479 100644
+--- a/backend/src/fieldwise/db/models.py
++++ b/backend/src/fieldwise/db/models.py
+@@ -87,3 +87,44 @@ class GoldenLabel(Base):
+ 
+     document: Mapped[Document] = relationship(back_populates="golden_labels")
+     schema: Mapped[Schema] = relationship(back_populates="golden_labels")
++
++
++class ExtractionRun(Base):
++    """One model call over one document under one schema, with everything needed to audit it."""
++
++    __tablename__ = "extraction_runs"
++
++    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
++    document_id: Mapped[uuid.UUID] = mapped_column(
++        ForeignKey("documents.id", ondelete="CASCADE"), index=True
++    )
++    schema_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("schemas.id", ondelete="CASCADE"))
++    prompt_version: Mapped[str] = mapped_column(String(16))
++    model: Mapped[str] = mapped_column(String(64))
++    effort: Mapped[str] = mapped_column(String(8))
++    fewshot_k: Mapped[int] = mapped_column(Integer, default=0)
++    use_ocr_text: Mapped[bool] = mapped_column(default=True)
++    provider: Mapped[str] = mapped_column(String(16))
++    # queued | running | succeeded | truncated | failed
++    status: Mapped[str] = mapped_column(String(16), default="queued")
++    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
++    confidences: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
++    evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
++    boxes: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
++    fewshot_document_ids: Mapped[list[str] | None] = mapped_column(JSONB)
++    input_tokens: Mapped[int | None] = mapped_column(Integer)
++    cache_read_tokens: Mapped[int | None] = mapped_column(Integer)
++    cache_write_tokens: Mapped[int | None] = mapped_column(Integer)
++    output_tokens: Mapped[int | None] = mapped_column(Integer)
++    cost_usd: Mapped[float | None] = mapped_column()
++    latency_ms: Mapped[int | None] = mapped_column(Integer)
++    served_model: Mapped[str | None] = mapped_column(String(64))
++    request_id: Mapped[str | None] = mapped_column(String(64))
++    repair_rounds: Mapped[int] = mapped_column(Integer, default=0)
++    error: Mapped[str | None] = mapped_column(Text)
++    created_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True), default=utcnow, server_default=func.now()
++    )
++
++    document: Mapped[Document] = relationship()
++    schema: Mapped[Schema] = relationship()
+diff --git a/backend/src/fieldwise/extraction/__init__.py b/backend/src/fieldwise/extraction/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/backend/src/fieldwise/extraction/builder.py b/backend/src/fieldwise/extraction/builder.py
+new file mode 100644
+index 0000000..cb86eb6
+--- /dev/null
++++ b/backend/src/fieldwise/extraction/builder.py
+@@ -0,0 +1,91 @@
++"""Builds the model request for one document: the system prompt (stable across documents, so it
++is the cached prefix), then per-document content — few-shot examples, OCR text, page images."""
++
++import base64
++import json
++from dataclasses import dataclass
++from typing import Any
++
++from fieldwise.documents.render import downscale_jpeg
++from fieldwise.extraction.prompts.registry import PromptSpec
++from fieldwise.extraction.provider import LLMRequest
++from fieldwise.schemas.compiler import CompiledSchema
++
++MODEL_IMAGE_MAX_EDGE = 1568  # the largest edge the vision encoder uses without downscaling
++
++
++@dataclass(frozen=True)
++class FewShotExample:
++    document_id: str
++    ocr_text: str
++    output: dict[str, Any]
++
++
++def build_request(
++    *,
++    spec: PromptSpec,
++    compiled: CompiledSchema,
++    authored_schema: dict[str, Any],
++    page_jpegs: list[bytes],
++    ocr_text: str | None,
++    examples: list[FewShotExample],
++    model: str,
++    effort: str,
++    max_tokens: int,
++    cache_key: dict[str, str],
++) -> LLMRequest:
++    content: list[dict[str, Any]] = []
++    for index, example in enumerate(examples, start=1):
++        content.append(
++            {
++                "type": "text",
++                "text": (
++                    f"Example {index} — OCR text of a similar document:\n{example.ocr_text}\n\n"
++                    f"Example {index} — correct output:\n"
++                    f"{json.dumps(example.output, ensure_ascii=False)}"
++                ),
++            }
++        )
++    if spec.use_ocr_text and ocr_text:
++        content.append(
++            {
++                "type": "text",
++                "text": (
++                    "OCR text of the document in reading order (it may contain errors; "
++                    f"the image is authoritative):\n{ocr_text}"
++                ),
++            }
++        )
++    for jpeg in page_jpegs:
++        content.append(
++            {
++                "type": "image",
++                "source": {
++                    "type": "base64",
++                    "media_type": "image/jpeg",
++                    "data": base64.standard_b64encode(
++                        downscale_jpeg(jpeg, MODEL_IMAGE_MAX_EDGE)
++                    ).decode("ascii"),
++                },
++            }
++        )
++    content.append(
++        {
++            "type": "text",
++            "text": "Extract the fields defined by the schema from this document. Respond with the "
++            "JSON object only.",
++        }
++    )
++    return LLMRequest(
++        model=model,
++        system=spec.render_system(authored_schema),
++        content=content,
++        output_schema=compiled.strict,
++        effort=effort,
++        max_tokens=max_tokens,
++        cache_key={
++            **cache_key,
++            "prompt": spec.name,
++            "fewshot": ",".join(e.document_id for e in examples),
++        },
++    )
+diff --git a/backend/src/fieldwise/extraction/cassette.py b/backend/src/fieldwise/extraction/cassette.py
+new file mode 100644
+index 0000000..bec0a41
+--- /dev/null
++++ b/backend/src/fieldwise/extraction/cassette.py
+@@ -0,0 +1,56 @@
++"""Records model responses on disk and replays them, so CI can run the eval gate for free and a
++prompt iteration can be re-scored without spending anything."""
++
++import hashlib
++import json
++from pathlib import Path
++from typing import Any, Literal
++
++from fieldwise.extraction.provider import LLMError, LLMProvider, LLMRequest, LLMResponse
++
++CassetteMode = Literal["off", "record", "replay"]
++
++
++def cassette_key(provider_name: str, request: LLMRequest) -> str:
++    identity: dict[str, Any] = {
++        "provider": provider_name,
++        "model": request.model,
++        "effort": request.effort,
++        "max_tokens": request.max_tokens,
++        "schema": hashlib.sha256(
++            json.dumps(request.output_schema, sort_keys=True).encode()
++        ).hexdigest()[:16],
++        "system": hashlib.sha256(request.system.encode()).hexdigest()[:16],
++        **request.cache_key,
++    }
++    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:32]
++
++
++class CassetteProvider:
++    def __init__(self, inner: LLMProvider, directory: Path, mode: CassetteMode) -> None:
++        self.inner = inner
++        self.directory = directory
++        self.mode = mode
++        self.name = inner.name
++        self.hits = 0
++        self.misses = 0
++
++    def _path(self, request: LLMRequest) -> Path:
++        return self.directory / f"{cassette_key(self.inner.name, request)}.json"
++
++    def complete(self, request: LLMRequest) -> LLMResponse:
++        if self.mode == "off":
++            return self.inner.complete(request)
++        path = self._path(request)
++        if path.exists():
++            self.hits += 1
++            return LLMResponse.from_dict(json.loads(path.read_text(encoding="utf-8"))["response"])
++        if self.mode == "replay":
++            self.misses += 1
++            raise LLMError("cassette_miss", f"no recording at {path.name}", retryable=False)
++        response = self.inner.complete(request)
++        self.misses += 1
++        self.directory.mkdir(parents=True, exist_ok=True)
++        payload = {"key": request.cache_key, "model": request.model, "response": response.to_dict()}
++        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++        return response
+diff --git a/backend/src/fieldwise/extraction/confidence.py b/backend/src/fieldwise/extraction/confidence.py
+new file mode 100644
+index 0000000..bf0e73c
+--- /dev/null
++++ b/backend/src/fieldwise/extraction/confidence.py
+@@ -0,0 +1,86 @@
++"""Grounds extracted values in the OCR output: a value that can be found (fuzzily) in a detected
++text span gets a confidence close to 1 and the span's box; a value the OCR never saw gets a low
++score, which the review UI surfaces first."""
++
++import re
++from decimal import Decimal
++from typing import Any
++
++from rapidfuzz import fuzz
++
++from fieldwise.documents.ocr import Box, OcrSpan
++
++MATCH_THRESHOLD = 80.0
++
++
++def flatten(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
++    """Leaf paths with concrete indices: line_items[0].name, total, ..."""
++    if isinstance(value, dict):
++        out: list[tuple[str, Any]] = []
++        for key, child in value.items():
++            path = f"{prefix}.{key}" if prefix else str(key)
++            out.extend(flatten(child, path))
++        return out
++    if isinstance(value, list):
++        out = []
++        for index, child in enumerate(value):
++            out.extend(flatten(child, f"{prefix}[{index}]"))
++        return out
++    return [(prefix, value)]
++
++
++def value_variants(value: Any) -> list[str]:
++    """The ways a value may have been printed: 45500 → 45500, 45,500, 45.500, 45500.00 ..."""
++    if isinstance(value, bool):
++        return [str(value).lower()]
++    if isinstance(value, int | float | Decimal):
++        number = Decimal(str(value))
++        integral = number == number.to_integral_value()
++        magnitude = abs(number)
++        variants = {str(magnitude), f"{magnitude:,}", f"{magnitude:,}".replace(",", ".")}
++        if integral:
++            whole = int(magnitude)
++            variants |= {
++                str(whole),
++                f"{whole:,}",
++                f"{whole:,}".replace(",", "."),
++                f"{whole}.00",
++                f"{whole:,}.00",
++            }
++        else:
++            variants.add(f"{magnitude:.2f}".replace(".", ","))
++        return sorted(variants, key=len, reverse=True)
++    text = " ".join(str(value).split())
++    return [text] if text else []
++
++
++def score_fields(
++    result: dict[str, Any], spans: list[OcrSpan]
++) -> tuple[dict[str, float], dict[str, list[Box]]]:
++    confidences: dict[str, float] = {}
++    boxes: dict[str, list[Box]] = {}
++    span_texts = [(span, span.text.lower()) for span in spans]
++    for path, value in flatten(result):
++        if value is None or value == "":
++            continue
++        variants = [v.lower() for v in value_variants(value)]
++        best_score, best_span = 0.0, None
++        for span, lowered in span_texts:
++            score = max((fuzz.partial_ratio(variant, lowered) for variant in variants), default=0.0)
++            if score > best_score:
++                best_score, best_span = score, span
++        confidences[path] = round(best_score / 100, 3)
++        if best_span is not None and best_score >= MATCH_THRESHOLD:
++            boxes[path] = _word_boxes(best_span, variants) or [best_span.box]
++    return confidences, boxes
++
++
++def _word_boxes(span: OcrSpan, variants: list[str]) -> list[Box]:
++    """Tighter than the span: the words that make up the value (e.g. the price, not the item)."""
++    tokens = {t for variant in variants for t in re.split(r"\s+", variant) if t}
++    matched = [
++        word.box
++        for word in span.words
++        if any(fuzz.ratio(word.text.lower(), token) >= 90 for token in tokens)
++    ]
++    return matched
+diff --git a/backend/src/fieldwise/extraction/factory.py b/backend/src/fieldwise/extraction/factory.py
+new file mode 100644
+index 0000000..eaa7b3e
+--- /dev/null
++++ b/backend/src/fieldwise/extraction/factory.py
+@@ -0,0 +1,51 @@
++"""Builds the configured provider: the real one, the fake, optionally wrapped in a cassette."""
++
++from pathlib import Path
++from typing import Any, cast
++
++from fieldwise.config import Settings
++from fieldwise.extraction.cassette import CassetteMode, CassetteProvider
++from fieldwise.extraction.openai_compat import OpenAICompatibleProvider
++from fieldwise.extraction.provider import AnthropicProvider, FakeProvider, LLMProvider, LLMRequest
++
++
++def empty_answer(request: LLMRequest) -> dict[str, Any]:
++    """The fake provider's default: a schema-valid object with every leaf null and lists empty."""
++    return cast(dict[str, Any], _empty_for(request.output_schema))
++
++
++def _empty_for(schema: dict[str, Any]) -> Any:
++    if schema.get("type") == "object":
++        return {key: _empty_for(child) for key, child in schema.get("properties", {}).items()}
++    if schema.get("type") == "array":
++        return []
++    return None
++
++
++def build_provider(
++    settings: Settings,
++    *,
++    provider_name: str | None = None,
++    cassette_mode: CassetteMode | None = None,
++    cassette_dir: Path | None = None,
++) -> LLMProvider:
++    name = provider_name or settings.llm_provider
++    inner: LLMProvider
++    if name == "fake":
++        inner = FakeProvider(empty_answer)
++    elif name == "anthropic":
++        inner = AnthropicProvider()
++    elif name == "openai":
++        inner = OpenAICompatibleProvider(settings.openai_base_url, settings.openai_api_key)
++    else:
++        raise ValueError(f"unknown provider {name!r}")
++    mode = cassette_mode or settings.llm_cassette_mode
++    if mode == "off":
++        return inner
++    return CassetteProvider(inner, cassette_dir or Path(settings.llm_cassette_dir), mode)
++
++
++def describe(provider: LLMProvider) -> str:
++    if isinstance(provider, CassetteProvider):
++        return f"{provider.inner.name} (cassette: {provider.mode})"
++    return provider.name
+diff --git a/backend/src/fieldwise/extraction/openai_compat.py b/backend/src/fieldwise/extraction/openai_compat.py
+new file mode 100644
+index 0000000..d36e07d
+--- /dev/null
++++ b/backend/src/fieldwise/extraction/openai_compat.py
+@@ -0,0 +1,189 @@
++"""A second provider for any OpenAI-compatible chat-completions endpoint: OpenRouter (free
++open-weight vision models), a local Ollama, or OpenAI itself. It exists so the pipeline can be
++tried for free and so the results table can put a local model next to Claude.
++
++What does not carry over from the Anthropic provider: the effort setting (ignored), prompt
++caching (server dependent), and the cost table (OpenRouter reports the cost itself; Ollama is
++free; anything else is priced as unknown)."""
++
++from __future__ import annotations
++
++import json
++import time
++from typing import Any, cast
++from urllib.parse import urlparse
++
++import openai
++from openai.types.chat import ChatCompletionMessageParam
++
++from fieldwise.extraction.provider import LLMError, LLMRequest, LLMResponse, LLMUsage
++
++OPENROUTER_HOST = "openrouter.ai"
++FINISH_REASONS = {"stop": "end_turn", "length": "max_tokens"}
++
++
++def provider_name_for(base_url: str) -> str:
++    host = urlparse(base_url).hostname or ""
++    if host.endswith(OPENROUTER_HOST):
++        return "openrouter"
++    if host in {"localhost", "127.0.0.1"}:
++        return "ollama"
++    return "openai"
++
++
++def to_openai_content(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Anthropic content blocks → OpenAI content parts."""
++    parts: list[dict[str, Any]] = []
++    for block in blocks:
++        if block["type"] == "text":
++            parts.append({"type": "text", "text": block["text"]})
++        elif block["type"] == "image":
++            source = block["source"]
++            parts.append(
++                {
++                    "type": "image_url",
++                    "image_url": {"url": f"data:{source['media_type']};base64,{source['data']}"},
++                }
++            )
++        else:
++            raise ValueError(f"unsupported content block {block['type']!r}")
++    return parts
++
++
++class OpenAICompatibleProvider:
++    def __init__(
++        self,
++        base_url: str,
++        api_key: str | None,
++        *,
++        client: Any | None = None,
++        max_retries: int = 3,
++        timeout: float = 180.0,
++        json_mode: str = "schema",
++    ) -> None:
++        self.base_url = base_url
++        self.name = provider_name_for(base_url)
++        self.json_mode = json_mode  # schema | object — falls back from schema to object on a 400
++        self.client = client or openai.OpenAI(
++            base_url=base_url, api_key=api_key or "none", max_retries=max_retries, timeout=timeout
++        )
++
++    def _response_format(self, request: LLMRequest, mode: str) -> dict[str, Any]:
++        if mode == "schema":
++            return {
++                "type": "json_schema",
++                "json_schema": {
++                    "name": "extraction",
++                    "schema": request.output_schema,
++                    "strict": True,
++                },
++            }
++        return {"type": "json_object"}
++
++    def _create(self, request: LLMRequest, mode: str) -> Any:
++        messages: list[ChatCompletionMessageParam] = cast(
++            list[ChatCompletionMessageParam],
++            [
++                {"role": "system", "content": request.system},
++                {"role": "user", "content": to_openai_content(request.content)},
++            ],
++        )
++        extra_body: dict[str, Any] = {}
++        if self.name == "openrouter":
++            extra_body["usage"] = {"include": True}
++        return self.client.chat.completions.create(
++            model=request.model,
++            messages=messages,
++            max_tokens=request.max_tokens,
++            temperature=0,
++            response_format=cast(Any, self._response_format(request, mode)),
++            extra_body=extra_body or None,
++        )
++
++    def complete(self, request: LLMRequest) -> LLMResponse:
++        started = time.perf_counter()
++        mode = self.json_mode
++        try:
++            try:
++                completion = self._create(request, mode)
++            except openai.BadRequestError:
++                if mode != "schema":
++                    raise
++                mode = "object"  # the model does not support json_schema; validate ourselves
++                completion = self._create(request, mode)
++        except openai.RateLimitError as error:
++            raise LLMError("rate_limit", str(error), retryable=True) from error
++        except openai.AuthenticationError as error:
++            raise LLMError("auth", str(error), retryable=False) from error
++        except openai.BadRequestError as error:
++            raise LLMError("bad_request", str(error), retryable=False) from error
++        except openai.APIStatusError as error:
++            raise LLMError(
++                "server" if error.status_code >= 500 else "bad_request",
++                str(error),
++                retryable=error.status_code >= 500,
++            ) from error
++        except openai.APIConnectionError as error:
++            raise LLMError("network", str(error), retryable=True) from error
++        latency_ms = round((time.perf_counter() - started) * 1000)
++
++        choice = completion.choices[0] if completion.choices else None
++        if choice is None:
++            raise LLMError("server", "the completion has no choices", retryable=True)
++        served = str(completion.model or request.model)
++        if _base_model(served) != _base_model(request.model):
++            raise LLMError(
++                "served_model", f"asked for {request.model}, served by {served}", retryable=False
++            )
++        text = choice.message.content or ""
++        usage = completion.usage
++        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
++        cached = _cached_tokens(usage)
++        reported_cost = _reported_cost(usage)
++        return LLMResponse(
++            text=_strip_fences(text),
++            usage=LLMUsage(
++                input_tokens=max(prompt_tokens - cached, 0),
++                cache_read_tokens=cached,
++                output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
++            ),
++            served_model=served,
++            stop_reason=FINISH_REASONS.get(str(choice.finish_reason), choice.finish_reason),
++            latency_ms=latency_ms,
++            request_id=getattr(completion, "id", None),
++            cost_usd=reported_cost
++            if reported_cost is not None
++            else (0.0 if self.name == "ollama" else None),
++            extra={"json_mode": mode},
++        )
++
++
++def _base_model(model: str) -> str:
++    """`qwen/qwen3.8-27b:free` and `qwen/qwen3.8-27b` are the same model."""
++    return model.split(":", 1)[0]
++
++
++def _cached_tokens(usage: Any) -> int:
++    details = getattr(usage, "prompt_tokens_details", None)
++    return int(getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
++
++
++def _reported_cost(usage: Any) -> float | None:
++    cost = getattr(usage, "cost", None)
++    if cost is None and hasattr(usage, "model_extra"):
++        cost = (usage.model_extra or {}).get("cost")
++    return float(cost) if cost is not None else None
++
++
++def _strip_fences(text: str) -> str:
++    """Some models wrap JSON in ```json fences even in JSON mode."""
++    stripped = text.strip()
++    if stripped.startswith("```"):
++        stripped = stripped.split("\n", 1)[1] if "\n" in stripped else ""
++        if stripped.rstrip().endswith("```"):
++            stripped = stripped.rstrip()[:-3]
++    try:
++        json.loads(stripped)
++    except json.JSONDecodeError:
++        return text
++    return stripped
+diff --git a/backend/src/fieldwise/extraction/pipeline.py b/backend/src/fieldwise/extraction/pipeline.py
+new file mode 100644
+index 0000000..0a33b69
+--- /dev/null
++++ b/backend/src/fieldwise/extraction/pipeline.py
+@@ -0,0 +1,144 @@
++"""One extraction: build the request, call the provider, validate, ground, price, persist."""
++
++import json
++from dataclasses import dataclass, replace
++from typing import Any
++
++import jsonschema
++import structlog
++from sqlalchemy.orm import Session
++
++from fieldwise.db.models import Document, ExtractionRun, Schema
++from fieldwise.documents.ocr import OcrSpan, deserialise_spans
++from fieldwise.extraction.builder import FewShotExample, build_request
++from fieldwise.extraction.confidence import score_fields
++from fieldwise.extraction.pricing import cost_usd
++from fieldwise.extraction.prompts.registry import get_prompt
++from fieldwise.extraction.provider import LLMError, LLMProvider, LLMResponse
++from fieldwise.schemas.compiler import compile_schema
++from fieldwise.storage import Storage
++
++log = structlog.get_logger(__name__)
++
++
++@dataclass(frozen=True)
++class ExtractionOptions:
++    prompt: str = "v1"
++    model: str = "claude-sonnet-5"
++    effort: str = "low"
++    fewshot_k: int | None = None  # None → the prompt version's default
++    use_ocr_text: bool | None = None  # None → the prompt version's default
++    max_tokens: int = 4096
++    batch_pricing: bool = False
++
++
++class InvalidOutputError(ValueError):
++    pass
++
++
++def parse_output(text: str, strict_schema: dict[str, Any]) -> dict[str, Any]:
++    try:
++        data = json.loads(text)
++    except json.JSONDecodeError as error:
++        raise InvalidOutputError(f"not JSON: {error.msg} at {error.pos}") from error
++    validator = jsonschema.Draft202012Validator(strict_schema)
++    errors = sorted(validator.iter_errors(data), key=lambda e: list(e.path))
++    if errors:
++        first = errors[0]
++        where = "/".join(str(p) for p in first.path) or "<root>"
++        raise InvalidOutputError(f"{where}: {first.message}")
++    if not isinstance(data, dict):
++        raise InvalidOutputError("the output is not an object")
++    return data
++
++
++def document_spans(document: Document) -> list[OcrSpan]:
++    return deserialise_spans(document.ocr_words or [])
++
++
++def run_extraction(
++    session: Session,
++    storage: Storage,
++    document: Document,
++    *,
++    schema: Schema,
++    options: ExtractionOptions,
++    provider: LLMProvider,
++    examples: list[FewShotExample] | None = None,
++) -> ExtractionRun:
++    spec = get_prompt(options.prompt)
++    compiled = compile_schema(schema.json_schema)
++    fewshot_k = spec.fewshot_k if options.fewshot_k is None else options.fewshot_k
++    use_ocr_text = spec.use_ocr_text if options.use_ocr_text is None else options.use_ocr_text
++    examples = (examples or [])[:fewshot_k]
++
++    run = ExtractionRun(
++        document_id=document.id,
++        schema_id=schema.id,
++        prompt_version=spec.name,
++        model=options.model,
++        effort=options.effort,
++        fewshot_k=len(examples),
++        use_ocr_text=use_ocr_text,
++        provider=provider.name,
++        status="running",
++        fewshot_document_ids=[e.document_id for e in examples],
++    )
++    session.add(run)
++    session.flush()
++
++    try:
++        request = build_request(
++            spec=replace(spec, use_ocr_text=use_ocr_text),
++            compiled=compiled,
++            authored_schema=schema.json_schema,
++            page_jpegs=[storage.get(str(page["key"])) for page in document.pages],
++            ocr_text=document.ocr_text,
++            examples=examples,
++            model=options.model,
++            effort=options.effort,
++            max_tokens=options.max_tokens,
++            cache_key={
++                "document": document.sha256,
++                "schema": f"{schema.name}@{schema.version}",
++                "ocr_text": str(use_ocr_text),
++            },
++        )
++        response = provider.complete(request)
++        _record_usage(run, response, batch=options.batch_pricing)
++        if response.truncated:
++            run.status = "truncated"
++            run.error = "stop_reason=max_tokens"
++            return run
++        data = parse_output(response.text, compiled.strict)
++        confidences, boxes = score_fields(data, document_spans(document))
++        run.result = data
++        run.confidences = confidences
++        run.boxes = {path: [list(b) for b in box_list] for path, box_list in boxes.items()}
++        run.status = "succeeded"
++    except LLMError as error:
++        run.status = "failed"
++        run.error = str(error)
++        log.warning("extraction.failed", document=document.name, error=str(error))
++    except InvalidOutputError as error:
++        run.status = "failed"
++        run.error = f"invalid_output: {error}"
++        log.warning("extraction.invalid_output", document=document.name, error=str(error))
++    finally:
++        session.flush()
++    return run
++
++
++def _record_usage(run: ExtractionRun, response: LLMResponse, *, batch: bool) -> None:
++    run.input_tokens = response.usage.input_tokens
++    run.cache_write_tokens = response.usage.cache_write_tokens
++    run.cache_read_tokens = response.usage.cache_read_tokens
++    run.output_tokens = response.usage.output_tokens
++    run.cost_usd = (
++        response.cost_usd
++        if response.cost_usd is not None
++        else cost_usd(run.model, response.usage, batch=batch)
++    )
++    run.latency_ms = response.latency_ms
++    run.served_model = response.served_model
++    run.request_id = response.request_id
+diff --git a/backend/src/fieldwise/extraction/pricing.py b/backend/src/fieldwise/extraction/pricing.py
+new file mode 100644
+index 0000000..a9f1b1b
+--- /dev/null
++++ b/backend/src/fieldwise/extraction/pricing.py
+@@ -0,0 +1,46 @@
++"""List prices (USD per million tokens) of the models the workbench runs, as of 2026-09.
++Cost is always derived from the usage block the API returned, never estimated from text."""
++
++from dataclasses import dataclass
++
++from fieldwise.extraction.provider import LLMUsage
++
++
++@dataclass(frozen=True)
++class Price:
++    input: float
++    output: float
++
++    @property
++    def cache_write(self) -> float:
++        return self.input * 1.25
++
++    @property
++    def cache_read(self) -> float:
++        return self.input * 0.10
++
++
++PRICES: dict[str, Price] = {
++    "claude-opus-5": Price(input=5.00, output=25.00),
++    "claude-sonnet-5": Price(input=2.00, output=10.00),
++    "claude-haiku-4-5": Price(input=1.00, output=5.00),
++}
++
++
++def price_for(model: str) -> Price | None:
++    matches = [prefix for prefix in PRICES if model.startswith(prefix)]
++    return PRICES[max(matches, key=len)] if matches else None
++
++
++def cost_usd(model: str, usage: LLMUsage, *, batch: bool = False) -> float | None:
++    price = price_for(model)
++    if price is None:
++        return None
++    per_million = (
++        usage.input_tokens * price.input
++        + usage.cache_write_tokens * price.cache_write
++        + usage.cache_read_tokens * price.cache_read
++        + usage.output_tokens * price.output
++    )
++    cost = per_million / 1_000_000
++    return round(cost * 0.5 if batch else cost, 6)
+diff --git a/backend/src/fieldwise/extraction/prompts/__init__.py b/backend/src/fieldwise/extraction/prompts/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/backend/src/fieldwise/extraction/prompts/registry.py b/backend/src/fieldwise/extraction/prompts/registry.py
+new file mode 100644
+index 0000000..e8efe59
+--- /dev/null
++++ b/backend/src/fieldwise/extraction/prompts/registry.py
+@@ -0,0 +1,37 @@
++"""Prompt versions are files in this package plus a spec of what each one switches on.
++Adding a version = adding a file and a row here, then measuring it (docs/evals)."""
++
++import json
++from dataclasses import dataclass
++from importlib import resources
++from string import Template
++from typing import Any
++
++
++@dataclass(frozen=True)
++class PromptSpec:
++    name: str
++    notes: str
++    use_ocr_text: bool = False
++    fewshot_k: int = 0
++    use_evidence: bool = False
++    consistency_check: bool = False
++
++    def template(self) -> str:
++        return resources.files(__package__).joinpath(f"{self.name}.md").read_text(encoding="utf-8")
++
++    def render_system(self, authored_schema: dict[str, Any]) -> str:
++        schema_json = json.dumps(authored_schema, indent=2, ensure_ascii=False)
++        return Template(self.template()).safe_substitute(schema_json=schema_json).strip()
++
++
++PROMPTS: dict[str, PromptSpec] = {
++    "v1": PromptSpec(name="v1", notes="Baseline: instructions and the schema; the image only."),
++}
++
++
++def get_prompt(name: str) -> PromptSpec:
++    try:
++        return PROMPTS[name]
++    except KeyError as error:
++        raise KeyError(f"unknown prompt version {name!r}; known: {sorted(PROMPTS)}") from error
+diff --git a/backend/src/fieldwise/extraction/prompts/v1.md b/backend/src/fieldwise/extraction/prompts/v1.md
+new file mode 100644
+index 0000000..ee80e1f
+--- /dev/null
++++ b/backend/src/fieldwise/extraction/prompts/v1.md
+@@ -0,0 +1,10 @@
++You extract structured data from documents. You will be shown a document image and must return the fields of the schema below as JSON.
++
++Rules:
++- Read every value from the document itself. Do not guess or infer values that are not printed.
++- Amounts are plain numbers in the document's currency, without thousands separators or currency symbols.
++- When a field is not printed on the document, use null.
++- Return the JSON object only.
++
++Schema:
++$schema_json
+diff --git a/backend/src/fieldwise/extraction/provider.py b/backend/src/fieldwise/extraction/provider.py
+new file mode 100644
+index 0000000..cf9e9f1
+--- /dev/null
++++ b/backend/src/fieldwise/extraction/provider.py
+@@ -0,0 +1,206 @@
++"""The one place that talks to the Anthropic SDK, behind a protocol that a fake provider (tests,
++the e2e profile) and a recording/replaying cassette provider implement as well."""
++
++from __future__ import annotations
++
++import json
++import time
++from collections.abc import Callable
++from dataclasses import dataclass, field
++from typing import Any, Protocol, cast
++
++import anthropic
++from anthropic.types import ContentBlockParam, MessageParam, TextBlockParam
++
++ErrorKind = str  # rate_limit | server | network | bad_request | auth | served_model | cassette_miss
++
++
++class LLMError(Exception):
++    def __init__(self, kind: ErrorKind, message: str, *, retryable: bool) -> None:
++        super().__init__(message)
++        self.kind = kind
++        self.retryable = retryable
++
++    def __str__(self) -> str:
++        return f"{self.kind}: {super().__str__()}"
++
++
++@dataclass(frozen=True)
++class LLMRequest:
++    model: str
++    system: str
++    content: list[dict[str, Any]]
++    output_schema: dict[str, Any]
++    effort: str = "low"
++    max_tokens: int = 4096
++    # Stable identity of the request for the cassette provider: what it was built from, not the
++    # bytes it contains (image encoding must not change the key).
++    cache_key: dict[str, str] = field(default_factory=dict)
++
++    def messages(self) -> list[MessageParam]:
++        return [{"role": "user", "content": cast(list[ContentBlockParam], self.content)}]
++
++    def system_blocks(self) -> list[TextBlockParam]:
++        return [{"type": "text", "text": self.system, "cache_control": {"type": "ephemeral"}}]
++
++
++@dataclass(frozen=True)
++class LLMUsage:
++    input_tokens: int = 0
++    cache_write_tokens: int = 0
++    cache_read_tokens: int = 0
++    output_tokens: int = 0
++
++    @property
++    def total_input(self) -> int:
++        return self.input_tokens + self.cache_write_tokens + self.cache_read_tokens
++
++
++@dataclass(frozen=True)
++class LLMResponse:
++    text: str
++    usage: LLMUsage
++    served_model: str
++    stop_reason: str | None
++    latency_ms: int
++    request_id: str | None = None
++    # Cost as reported by the provider (OpenRouter does; Anthropic is priced from the table).
++    cost_usd: float | None = None
++    extra: dict[str, Any] = field(default_factory=dict)
++
++    @property
++    def truncated(self) -> bool:
++        return self.stop_reason == "max_tokens"
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "text": self.text,
++            "usage": self.usage.__dict__,
++            "served_model": self.served_model,
++            "stop_reason": self.stop_reason,
++            "latency_ms": self.latency_ms,
++            "request_id": self.request_id,
++            "cost_usd": self.cost_usd,
++            "extra": self.extra,
++        }
++
++    @classmethod
++    def from_dict(cls, data: dict[str, Any]) -> LLMResponse:
++        return cls(
++            text=str(data["text"]),
++            usage=LLMUsage(**data["usage"]),
++            served_model=str(data["served_model"]),
++            stop_reason=data.get("stop_reason"),
++            latency_ms=int(data.get("latency_ms", 0)),
++            request_id=data.get("request_id"),
++            cost_usd=data.get("cost_usd"),
++            extra=dict(data.get("extra") or {}),
++        )
++
++
++class LLMProvider(Protocol):
++    name: str
++
++    def complete(self, request: LLMRequest) -> LLMResponse: ...
++
++
++class AnthropicProvider:
++    name = "anthropic"
++
++    def __init__(
++        self,
++        client: anthropic.Anthropic | None = None,
++        *,
++        max_retries: int = 3,
++        timeout: float = 180.0,
++    ) -> None:
++        self.client = client or anthropic.Anthropic(max_retries=max_retries, timeout=timeout)
++
++    def complete(self, request: LLMRequest) -> LLMResponse:
++        started = time.perf_counter()
++        try:
++            message = self.client.messages.create(
++                model=request.model,
++                max_tokens=request.max_tokens,
++                system=request.system_blocks(),
++                messages=request.messages(),
++                output_config={
++                    "effort": cast(Any, request.effort),
++                    "format": {"type": "json_schema", "schema": request.output_schema},
++                },
++            )
++        except anthropic.RateLimitError as error:
++            raise LLMError("rate_limit", str(error), retryable=True) from error
++        except anthropic.AuthenticationError as error:
++            raise LLMError("auth", str(error), retryable=False) from error
++        except anthropic.BadRequestError as error:
++            raise LLMError("bad_request", str(error), retryable=False) from error
++        except anthropic.APIStatusError as error:
++            raise LLMError(
++                "server" if error.status_code >= 500 else "bad_request",
++                str(error),
++                retryable=error.status_code >= 500,
++            ) from error
++        except anthropic.APIConnectionError as error:
++            raise LLMError("network", str(error), retryable=True) from error
++        latency_ms = round((time.perf_counter() - started) * 1000)
++
++        if not message.model.startswith(request.model):
++            raise LLMError(
++                "served_model",
++                f"asked for {request.model}, served by {message.model}",
++                retryable=False,
++            )
++        text = "".join(block.text for block in message.content if block.type == "text")
++        usage = LLMUsage(
++            input_tokens=message.usage.input_tokens,
++            cache_write_tokens=message.usage.cache_creation_input_tokens or 0,
++            cache_read_tokens=message.usage.cache_read_input_tokens or 0,
++            output_tokens=message.usage.output_tokens,
++        )
++        return LLMResponse(
++            text=text,
++            usage=usage,
++            served_model=message.model,
++            stop_reason=message.stop_reason,
++            latency_ms=latency_ms,
++            request_id=message._request_id,
++        )
++
++
++Responder = Callable[[LLMRequest], dict[str, Any] | str]
++
++
++class FakeProvider:
++    """Answers from a callable. Used by tests and by the `LLM_PROVIDER=fake` profile."""
++
++    name = "fake"
++
++    def __init__(
++        self,
++        responder: Responder,
++        *,
++        served_model: str | None = None,
++        stop_reason: str | None = "end_turn",
++        latency_ms: int = 1,
++    ) -> None:
++        self.responder = responder
++        self.served_model = served_model
++        self.stop_reason = stop_reason
++        self.latency_ms = latency_ms
++        self.requests: list[LLMRequest] = []
++
++    def complete(self, request: LLMRequest) -> LLMResponse:
++        self.requests.append(request)
++        answer = self.responder(request)
++        text = answer if isinstance(answer, str) else json.dumps(answer)
++        prompt_chars = len(request.system) + sum(
++            len(str(block.get("text", ""))) for block in request.content
++        )
++        return LLMResponse(
++            text=text,
++            usage=LLMUsage(input_tokens=prompt_chars // 4, output_tokens=len(text) // 4),
++            served_model=self.served_model or request.model,
++            stop_reason=self.stop_reason,
++            latency_ms=self.latency_ms,
++        )
+diff --git a/backend/tests/integration/test_pipeline.py b/backend/tests/integration/test_pipeline.py
+new file mode 100644
+index 0000000..2607985
+--- /dev/null
++++ b/backend/tests/integration/test_pipeline.py
+@@ -0,0 +1,128 @@
++import json
++from pathlib import Path
++
++import pytest
++from sqlalchemy.orm import Session
++
++from fieldwise.documents.cord_import import map_gt_parse
++from fieldwise.documents.ocr import RapidOcrProvider
++from fieldwise.documents.ocr_service import ocr_document
++from fieldwise.documents.service import create_document
++from fieldwise.extraction.factory import empty_answer
++from fieldwise.extraction.pipeline import ExtractionOptions, run_extraction
++from fieldwise.extraction.provider import FakeProvider, LLMError, LLMRequest
++from fieldwise.schemas.registry import sync_builtins
++from fieldwise.storage import LocalStorage
++
++pytestmark = pytest.mark.integration
++
++FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "cord"
++STEM = "cord-v2_validation_0000"
++
++
++@pytest.fixture
++def receipt(session: Session, storage: LocalStorage) -> tuple[object, object, dict[str, object]]:
++    schema = sync_builtins(session)[0]
++    document = create_document(
++        session,
++        storage,
++        data=(FIXTURES / f"{STEM}.jpg").read_bytes(),
++        name=STEM,
++        source="upload",
++    )
++    ocr_document(document, storage, RapidOcrProvider())
++    golden = map_gt_parse(json.loads((FIXTURES / f"{STEM}.json").read_text()))
++    return document, schema, golden
++
++
++def test_successful_extraction_is_grounded_and_priced(
++    session: Session, storage: LocalStorage, receipt: tuple[object, object, dict[str, object]]
++) -> None:
++    document, schema, golden = receipt
++    provider = FakeProvider(lambda req: golden)
++
++    run = run_extraction(
++        session,
++        storage,
++        document,  # type: ignore[arg-type]
++        schema=schema,  # type: ignore[arg-type]
++        options=ExtractionOptions(prompt="v1", model="claude-sonnet-5", effort="low"),
++        provider=provider,
++    )
++
++    assert run.status == "succeeded"
++    assert run.result == golden
++    assert run.provider == "fake"
++    assert run.prompt_version == "v1"
++    assert run.use_ocr_text is False
++    assert run.confidences is not None
++    assert run.confidences["total"] == 1.0
++    assert run.boxes is not None
++    assert "total" in run.boxes
++    assert run.cost_usd is not None
++    assert run.cost_usd > 0
++    assert run.served_model == "claude-sonnet-5"
++    request: LLMRequest = provider.requests[0]
++    assert request.cache_key["document"] == document.sha256  # type: ignore[attr-defined]
++    assert request.cache_key["schema"] == "receipt@1"
++
++
++def test_invalid_output_fails_the_run(
++    session: Session, storage: LocalStorage, receipt: tuple[object, object, dict[str, object]]
++) -> None:
++    document, schema, _ = receipt
++    run = run_extraction(
++        session,
++        storage,
++        document,  # type: ignore[arg-type]
++        schema=schema,  # type: ignore[arg-type]
++        options=ExtractionOptions(),
++        provider=FakeProvider(lambda req: '{"total": "not a number"'),
++    )
++    assert run.status == "failed"
++    assert run.error is not None
++    assert run.error.startswith("invalid_output: not JSON")
++
++    run = run_extraction(
++        session,
++        storage,
++        document,  # type: ignore[arg-type]
++        schema=schema,  # type: ignore[arg-type]
++        options=ExtractionOptions(),
++        provider=FakeProvider(lambda req: {"total": "text"}),
++    )
++    assert run.status == "failed"
++    assert run.error is not None
++    assert "invalid_output" in run.error
++
++
++def test_truncation_and_provider_errors_are_recorded_not_scored(
++    session: Session, storage: LocalStorage, receipt: tuple[object, object, dict[str, object]]
++) -> None:
++    document, schema, _ = receipt
++    truncated = run_extraction(
++        session,
++        storage,
++        document,  # type: ignore[arg-type]
++        schema=schema,  # type: ignore[arg-type]
++        options=ExtractionOptions(),
++        provider=FakeProvider(empty_answer, stop_reason="max_tokens"),
++    )
++    assert truncated.status == "truncated"
++    assert truncated.result is None
++    assert truncated.output_tokens is not None
++
++    def explode(request: LLMRequest) -> dict[str, object]:
++        raise LLMError("rate_limit", "429", retryable=True)
++
++    failed = run_extraction(
++        session,
++        storage,
++        document,  # type: ignore[arg-type]
++        schema=schema,  # type: ignore[arg-type]
++        options=ExtractionOptions(),
++        provider=FakeProvider(explode),
++    )
++    assert failed.status == "failed"
++    assert failed.error == "rate_limit: 429"
++    assert failed.input_tokens is None
+diff --git a/backend/tests/unit/test_builder.py b/backend/tests/unit/test_builder.py
+new file mode 100644
+index 0000000..4f912ba
+--- /dev/null
++++ b/backend/tests/unit/test_builder.py
+@@ -0,0 +1,79 @@
++import base64
++import json
++from io import BytesIO
++from pathlib import Path
++
++from PIL import Image
++
++from fieldwise.extraction.builder import FewShotExample, build_request
++from fieldwise.extraction.prompts.registry import PROMPTS, get_prompt
++from fieldwise.schemas.registry import compile_builtin, load_builtin
++
++FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "cord"
++
++
++def _jpeg(size: tuple[int, int]) -> bytes:
++    buffer = BytesIO()
++    Image.new("RGB", size, "white").save(buffer, format="JPEG")
++    return buffer.getvalue()
++
++
++def build(**overrides: object) -> object:
++    kwargs: dict[str, object] = {
++        "spec": get_prompt("v1"),
++        "compiled": compile_builtin("receipt"),
++        "authored_schema": load_builtin("receipt"),
++        "page_jpegs": [_jpeg((400, 600))],
++        "ocr_text": "TOTAL 45,500",
++        "examples": [],
++        "model": "claude-sonnet-5",
++        "effort": "low",
++        "max_tokens": 4096,
++        "cache_key": {"document": "sha"},
++    }
++    kwargs.update(overrides)
++    return build_request(**kwargs)  # type: ignore[arg-type]
++
++
++def test_v1_sends_the_schema_in_the_system_prompt_and_the_image_only() -> None:
++    request = build()
++    assert request.system.startswith("You extract structured data")
++    assert '"title": "receipt"' in request.system
++    assert "$schema_json" not in request.system
++    types = [block["type"] for block in request.content]
++    assert types == ["image", "text"]
++    assert request.content[-1]["text"].startswith("Extract the fields")
++    assert request.output_schema == compile_builtin("receipt").strict
++    assert request.cache_key == {"document": "sha", "prompt": "v1", "fewshot": ""}
++
++
++def test_ocr_text_and_examples_are_added_when_the_spec_asks() -> None:
++    spec = get_prompt("v1")
++    with_text = type(spec)(name="v1", notes="", use_ocr_text=True)
++    example = FewShotExample("doc-1", "TOTAL 10,000", {"total": 10000})
++    request = build(spec=with_text, examples=[example])
++    types = [block["type"] for block in request.content]
++    assert types == ["text", "text", "image", "text"]
++    assert "Example 1 — OCR text" in request.content[0]["text"]
++    assert json.dumps({"total": 10000}) in request.content[0]["text"]
++    assert "TOTAL 45,500" in request.content[1]["text"]
++    assert request.cache_key["fewshot"] == "doc-1"
++
++
++def test_images_are_downscaled_for_the_model() -> None:
++    request = build(page_jpegs=[_jpeg((3000, 4000)), _jpeg((100, 100))])
++    images = [block for block in request.content if block["type"] == "image"]
++    assert len(images) == 2
++    with Image.open(BytesIO(base64.b64decode(images[0]["source"]["data"]))) as image:
++        assert max(image.size) == 1568
++    assert images[0]["source"]["media_type"] == "image/jpeg"
++
++
++def test_system_prompt_is_stable_across_documents() -> None:
++    assert build().system == build(cache_key={"document": "other"}).system
++
++
++def test_every_registered_prompt_renders() -> None:
++    for name in PROMPTS:
++        rendered = get_prompt(name).render_system(load_builtin("receipt"))
++        assert "Schema" in rendered
+diff --git a/backend/tests/unit/test_cassette.py b/backend/tests/unit/test_cassette.py
+new file mode 100644
+index 0000000..67a37d0
+--- /dev/null
++++ b/backend/tests/unit/test_cassette.py
+@@ -0,0 +1,56 @@
++from pathlib import Path
++
++import pytest
++
++from fieldwise.extraction.cassette import CassetteProvider, cassette_key
++from fieldwise.extraction.provider import FakeProvider, LLMError, LLMRequest
++
++SCHEMA = {"type": "object", "properties": {}, "required": []}
++
++
++def request(document: str = "doc-a", effort: str = "low") -> LLMRequest:
++    return LLMRequest(
++        model="claude-sonnet-5",
++        system="sys",
++        content=[{"type": "text", "text": "x"}],
++        output_schema=SCHEMA,
++        effort=effort,
++        cache_key={"document": document, "prompt": "v1"},
++    )
++
++
++def test_key_depends_on_identity_not_on_content_bytes() -> None:
++    a = cassette_key("anthropic", request())
++    same_with_other_content = request()
++    object.__setattr__(same_with_other_content, "content", [{"type": "text", "text": "y"}])
++    assert cassette_key("anthropic", same_with_other_content) == a
++    assert cassette_key("anthropic", request(document="doc-b")) != a
++    assert cassette_key("anthropic", request(effort="high")) != a
++    assert cassette_key("fake", request()) != a
++
++
++def test_record_then_replay(tmp_path: Path) -> None:
++    inner = FakeProvider(lambda req: {"n": len(inner.requests)})
++    recorder = CassetteProvider(inner, tmp_path, "record")
++
++    first = recorder.complete(request())
++    second = recorder.complete(request())  # already recorded → no inner call
++    assert first.text == second.text == '{"n": 1}'
++    assert len(inner.requests) == 1
++    assert (recorder.hits, recorder.misses) == (1, 1)
++    assert len(list(tmp_path.glob("*.json"))) == 1
++
++    replayer = CassetteProvider(FakeProvider(lambda req: {"never": True}), tmp_path, "replay")
++    assert replayer.complete(request()).text == '{"n": 1}'
++    with pytest.raises(LLMError) as info:
++        replayer.complete(request(document="doc-b"))
++    assert info.value.kind == "cassette_miss"
++
++
++def test_off_mode_is_a_passthrough(tmp_path: Path) -> None:
++    inner = FakeProvider(lambda req: {"ok": True})
++    provider = CassetteProvider(inner, tmp_path, "off")
++    provider.complete(request())
++    provider.complete(request())
++    assert len(inner.requests) == 2
++    assert not list(tmp_path.glob("*.json"))
+diff --git a/backend/tests/unit/test_confidence.py b/backend/tests/unit/test_confidence.py
+new file mode 100644
+index 0000000..2a6c1f5
+--- /dev/null
++++ b/backend/tests/unit/test_confidence.py
+@@ -0,0 +1,64 @@
++from fieldwise.documents.ocr import OcrSpan, OcrWord
++from fieldwise.extraction.confidence import flatten, score_fields, value_variants
++
++
++def span(text: str, box: tuple[int, int, int, int], words: list[str] | None = None) -> OcrSpan:
++    word_boxes = ()
++    if words:
++        step = (box[2] - box[0]) // len(words)
++        word_boxes = tuple(
++            OcrWord(w, (box[0] + i * step, box[1], box[0] + (i + 1) * step, box[3]), 0.9)
++            for i, w in enumerate(words)
++        )
++    return OcrSpan(text=text, box=box, conf=0.99, words=word_boxes)
++
++
++SPANS = [
++    span("1 REAL GANACHE", (119, 382, 260, 409), ["1", "REAL", "GANACHE"]),
++    span("16,500", (398, 379, 463, 408), ["16,500"]),
++    span("TOTAL", (137, 474, 242, 521)),
++    span("45,500", (341, 470, 466, 519), ["45,500"]),
++]
++
++
++def test_flatten_gives_concrete_paths() -> None:
++    assert flatten({"a": 1, "items": [{"n": "x"}, {"n": None}], "b": {"c": 2}}) == [
++        ("a", 1),
++        ("items[0].n", "x"),
++        ("items[1].n", None),
++        ("b.c", 2),
++    ]
++
++
++def test_value_variants_cover_printed_number_formats() -> None:
++    assert {"45500", "45,500", "45.500", "45500.00"} <= set(value_variants(45500))
++    assert "12,50" in value_variants(12.5)
++    assert value_variants(" Nasi  Goreng ") == ["Nasi Goreng"]
++    assert value_variants(True) == ["true"]
++    assert {"5,000", "5.000", "5000"} <= set(value_variants(-5000))
++
++
++def test_score_fields_grounds_values_in_spans() -> None:
++    result = {
++        "line_items": [{"name": "REAL GANACHE", "quantity": 1, "line_total": 16500.0}],
++        "total": 45500.0,
++        "tax": None,
++        "change": 999.0,
++    }
++    confidences, boxes = score_fields(result, SPANS)
++
++    assert confidences["total"] == 1.0
++    assert boxes["total"] == [(341, 470, 466, 519)]
++    assert confidences["line_items[0].name"] == 1.0
++    assert boxes["line_items[0].name"] == [(166, 382, 213, 409), (213, 382, 260, 409)]
++    assert confidences["line_items[0].line_total"] == 1.0
++    assert boxes["line_items[0].line_total"] == [(398, 379, 463, 408)]
++    assert "tax" not in confidences
++    assert confidences["change"] < 0.8
++    assert "change" not in boxes
++
++
++def test_score_fields_without_spans() -> None:
++    confidences, boxes = score_fields({"total": 1.0}, [])
++    assert confidences == {"total": 0.0}
++    assert boxes == {}
+diff --git a/backend/tests/unit/test_openai_compat.py b/backend/tests/unit/test_openai_compat.py
+new file mode 100644
+index 0000000..fd114a6
+--- /dev/null
++++ b/backend/tests/unit/test_openai_compat.py
+@@ -0,0 +1,172 @@
++import json
++from types import SimpleNamespace
++from typing import Any
++
++import httpx2 as httpx
++import openai
++import pytest
++
++from fieldwise.extraction.openai_compat import (
++    OpenAICompatibleProvider,
++    provider_name_for,
++    to_openai_content,
++)
++from fieldwise.extraction.provider import LLMError, LLMRequest
++
++SCHEMA = {"type": "object", "properties": {"total": {"type": "number"}}, "required": ["total"]}
++
++
++def request(model: str = "qwen/qwen3.8-27b:free") -> LLMRequest:
++    return LLMRequest(
++        model=model,
++        system="You extract.",
++        content=[
++            {"type": "text", "text": "Extract."},
++            {
++                "type": "image",
++                "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAA="},
++            },
++        ],
++        output_schema=SCHEMA,
++        cache_key={"document": "abc"},
++    )
++
++
++class StubCompletions:
++    def __init__(self, responses: list[Any]) -> None:
++        self.responses = responses
++        self.calls: list[dict[str, Any]] = []
++
++    def create(self, **kwargs: Any) -> Any:
++        self.calls.append(kwargs)
++        item = self.responses.pop(0)
++        if isinstance(item, Exception):
++            raise item
++        return item
++
++
++def stub_client(*responses: Any) -> tuple[Any, StubCompletions]:
++    completions = StubCompletions(list(responses))
++    return SimpleNamespace(chat=SimpleNamespace(completions=completions)), completions
++
++
++def completion(
++    model: str = "qwen/qwen3.8-27b",
++    text: str = '{"total": 1}',
++    finish: str = "stop",
++    cost: float | None = 0.0,
++) -> Any:
++    usage = SimpleNamespace(
++        prompt_tokens=120,
++        completion_tokens=10,
++        prompt_tokens_details=SimpleNamespace(cached_tokens=20),
++        cost=cost,
++    )
++    return SimpleNamespace(
++        id="gen-1",
++        model=model,
++        choices=[SimpleNamespace(message=SimpleNamespace(content=text), finish_reason=finish)],
++        usage=usage,
++    )
++
++
++def api_error(cls: type[openai.APIStatusError], status: int) -> openai.APIStatusError:
++    http_request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
++    return cls("boom", response=httpx.Response(status, request=http_request), body=None)
++
++
++def test_provider_name_follows_the_host() -> None:
++    assert provider_name_for("https://openrouter.ai/api/v1") == "openrouter"
++    assert provider_name_for("http://localhost:11434/v1") == "ollama"
++    assert provider_name_for("https://api.openai.com/v1") == "openai"
++
++
++def test_content_conversion() -> None:
++    parts = to_openai_content(request().content)
++    assert parts[0] == {"type": "text", "text": "Extract."}
++    assert parts[1] == {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA="}}
++
++
++def test_sends_json_schema_response_format_and_maps_usage() -> None:
++    client, completions = stub_client(completion(cost=0.00042))
++    provider = OpenAICompatibleProvider("https://openrouter.ai/api/v1", "key", client=client)
++
++    response = provider.complete(request())
++
++    call = completions.calls[0]
++    assert call["model"] == "qwen/qwen3.8-27b:free"
++    assert call["messages"][0] == {"role": "system", "content": "You extract."}
++    assert call["messages"][1]["role"] == "user"
++    assert call["response_format"]["type"] == "json_schema"
++    assert call["response_format"]["json_schema"]["schema"] == SCHEMA
++    assert call["extra_body"] == {"usage": {"include": True}}
++    assert call["temperature"] == 0
++    assert response.text == '{"total": 1}'
++    assert (response.usage.input_tokens, response.usage.cache_read_tokens) == (100, 20)
++    assert response.usage.output_tokens == 10
++    assert response.cost_usd == 0.00042
++    assert response.served_model == "qwen/qwen3.8-27b"
++    assert response.stop_reason == "end_turn"
++    assert response.request_id == "gen-1"
++    assert response.extra == {"json_mode": "schema"}
++
++
++def test_falls_back_to_json_object_when_the_schema_format_is_rejected() -> None:
++    client, completions = stub_client(
++        api_error(openai.BadRequestError, 400),
++        completion(model="qwen2.5vl:7b", text='```json\n{"total": 2}\n```'),
++    )
++    provider = OpenAICompatibleProvider("http://localhost:11434/v1", "ollama", client=client)
++
++    response = provider.complete(request(model="qwen2.5vl:7b"))
++
++    assert [c["response_format"]["type"] for c in completions.calls] == [
++        "json_schema",
++        "json_object",
++    ]
++    assert completions.calls[0]["extra_body"] is None
++    assert json.loads(response.text) == {"total": 2}
++    assert response.extra == {"json_mode": "object"}
++    assert response.cost_usd == 0.0  # ollama is free
++
++
++def test_length_finish_reason_means_truncated() -> None:
++    client, _ = stub_client(completion(finish="length"))
++    provider = OpenAICompatibleProvider("https://openrouter.ai/api/v1", "key", client=client)
++    assert provider.complete(request()).truncated
++
++
++def test_served_model_mismatch() -> None:
++    client, _ = stub_client(completion(model="google/gemma-4-31b-it"))
++    provider = OpenAICompatibleProvider("https://openrouter.ai/api/v1", "key", client=client)
++    with pytest.raises(LLMError) as info:
++        provider.complete(request())
++    assert info.value.kind == "served_model"
++
++
++@pytest.mark.parametrize(
++    ("error", "kind", "retryable"),
++    [
++        (api_error(openai.RateLimitError, 429), "rate_limit", True),
++        (api_error(openai.AuthenticationError, 401), "auth", False),
++        (api_error(openai.InternalServerError, 502), "server", True),
++        (openai.APIConnectionError(request=httpx.Request("POST", "https://x")), "network", True),
++    ],
++)
++def test_errors_are_classified(error: Exception, kind: str, retryable: bool) -> None:
++    client, _ = stub_client(error)
++    provider = OpenAICompatibleProvider("https://openrouter.ai/api/v1", "key", client=client)
++    with pytest.raises(LLMError) as info:
++        provider.complete(request())
++    assert (info.value.kind, info.value.retryable) == (kind, retryable)
++
++
++def test_a_second_bad_request_is_reported_not_retried() -> None:
++    client, completions = stub_client(
++        api_error(openai.BadRequestError, 400), api_error(openai.BadRequestError, 400)
++    )
++    provider = OpenAICompatibleProvider("https://openrouter.ai/api/v1", "key", client=client)
++    with pytest.raises(LLMError) as info:
++        provider.complete(request())
++    assert info.value.kind == "bad_request"
++    assert len(completions.calls) == 2
+diff --git a/backend/tests/unit/test_pricing.py b/backend/tests/unit/test_pricing.py
+new file mode 100644
+index 0000000..ed5cd26
+--- /dev/null
++++ b/backend/tests/unit/test_pricing.py
+@@ -0,0 +1,25 @@
++from fieldwise.extraction.pricing import cost_usd, price_for
++from fieldwise.extraction.provider import LLMUsage
++
++
++def test_price_lookup_uses_the_longest_matching_prefix() -> None:
++    assert price_for("claude-sonnet-5").input == 2.0
++    assert price_for("claude-sonnet-5-20260501").output == 10.0
++    assert price_for("claude-haiku-4-5").input == 1.0
++    assert price_for("gpt-x") is None
++
++
++def test_cost_from_usage_including_cache_rates() -> None:
++    usage = LLMUsage(
++        input_tokens=1_000_000, cache_write_tokens=0, cache_read_tokens=0, output_tokens=0
++    )
++    assert cost_usd("claude-sonnet-5", usage) == 2.0
++    cached = LLMUsage(
++        input_tokens=0,
++        cache_write_tokens=1_000_000,
++        cache_read_tokens=1_000_000,
++        output_tokens=100_000,
++    )
++    assert cost_usd("claude-sonnet-5", cached) == round(2.5 + 0.2 + 1.0, 6)
++    assert cost_usd("claude-sonnet-5", cached, batch=True) == round((2.5 + 0.2 + 1.0) / 2, 6)
++    assert cost_usd("unknown-model", usage) is None
+diff --git a/backend/tests/unit/test_provider.py b/backend/tests/unit/test_provider.py
+new file mode 100644
+index 0000000..e050e61
+--- /dev/null
++++ b/backend/tests/unit/test_provider.py
+@@ -0,0 +1,140 @@
++import json
++from types import SimpleNamespace
++from typing import Any
++
++import anthropic
++import httpx2 as httpx
++import pytest
++
++from fieldwise.extraction.provider import (
++    AnthropicProvider,
++    FakeProvider,
++    LLMError,
++    LLMRequest,
++    LLMResponse,
++    LLMUsage,
++)
++
++SCHEMA = {"type": "object", "properties": {"total": {"type": "number"}}, "required": ["total"]}
++
++
++def request(model: str = "claude-sonnet-5") -> LLMRequest:
++    return LLMRequest(
++        model=model,
++        system="You extract.",
++        content=[{"type": "text", "text": "Extract."}],
++        output_schema=SCHEMA,
++        effort="low",
++        cache_key={"document": "abc"},
++    )
++
++
++class StubMessages:
++    def __init__(self, response: Any = None, error: Exception | None = None) -> None:
++        self.response = response
++        self.error = error
++        self.calls: list[dict[str, Any]] = []
++
++    def create(self, **kwargs: Any) -> Any:
++        self.calls.append(kwargs)
++        if self.error:
++            raise self.error
++        return self.response
++
++
++def stub_client(messages: StubMessages) -> Any:
++    return SimpleNamespace(messages=messages)
++
++
++def message(model: str = "claude-sonnet-5-20260501", text: str = '{"total": 1}') -> Any:
++    return SimpleNamespace(
++        model=model,
++        content=[
++            SimpleNamespace(type="thinking", thinking=""),
++            SimpleNamespace(type="text", text=text),
++        ],
++        usage=SimpleNamespace(
++            input_tokens=100,
++            cache_creation_input_tokens=50,
++            cache_read_input_tokens=25,
++            output_tokens=10,
++        ),
++        stop_reason="end_turn",
++        _request_id="req_1",
++    )
++
++
++def api_error(cls: type[anthropic.APIStatusError], status: int) -> anthropic.APIStatusError:
++    http_request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
++    response = httpx.Response(status, request=http_request)
++    return cls("boom", response=response, body=None)
++
++
++def test_anthropic_provider_sends_cached_system_and_structured_output() -> None:
++    messages = StubMessages(response=message())
++    provider = AnthropicProvider(client=stub_client(messages))
++
++    response = provider.complete(request())
++
++    call = messages.calls[0]
++    assert call["model"] == "claude-sonnet-5"
++    assert call["max_tokens"] == 4096
++    assert call["system"] == [
++        {"type": "text", "text": "You extract.", "cache_control": {"type": "ephemeral"}}
++    ]
++    assert call["messages"] == [{"role": "user", "content": [{"type": "text", "text": "Extract."}]}]
++    assert call["output_config"] == {
++        "effort": "low",
++        "format": {"type": "json_schema", "schema": SCHEMA},
++    }
++    assert response.text == '{"total": 1}'
++    assert response.usage == LLMUsage(100, 50, 25, 10)
++    assert response.served_model == "claude-sonnet-5-20260501"
++    assert response.request_id == "req_1"
++    assert response.stop_reason == "end_turn"
++    assert response.latency_ms >= 0
++    assert not response.truncated
++
++
++def test_served_model_mismatch_is_an_error() -> None:
++    provider = AnthropicProvider(client=stub_client(StubMessages(response=message(model="other"))))
++    with pytest.raises(LLMError) as info:
++        provider.complete(request())
++    assert info.value.kind == "served_model"
++    assert not info.value.retryable
++
++
++@pytest.mark.parametrize(
++    ("error", "kind", "retryable"),
++    [
++        (api_error(anthropic.RateLimitError, 429), "rate_limit", True),
++        (api_error(anthropic.AuthenticationError, 401), "auth", False),
++        (api_error(anthropic.BadRequestError, 400), "bad_request", False),
++        (api_error(anthropic.InternalServerError, 500), "server", True),
++        (anthropic.APIConnectionError(request=httpx.Request("POST", "https://x")), "network", True),
++    ],
++)
++def test_sdk_errors_are_classified(error: Exception, kind: str, retryable: bool) -> None:
++    provider = AnthropicProvider(client=stub_client(StubMessages(error=error)))
++    with pytest.raises(LLMError) as info:
++        provider.complete(request())
++    assert info.value.kind == kind
++    assert info.value.retryable is retryable
++    assert str(info.value).startswith(f"{kind}: ")
++
++
++def test_fake_provider_serialises_dict_answers_and_records_requests() -> None:
++    provider = FakeProvider(lambda req: {"total": 5}, latency_ms=3)
++    response = provider.complete(request())
++    assert json.loads(response.text) == {"total": 5}
++    assert response.served_model == "claude-sonnet-5"
++    assert response.latency_ms == 3
++    assert provider.requests[0].cache_key == {"document": "abc"}
++
++
++def test_response_round_trips_through_dict() -> None:
++    response = LLMResponse("{}", LLMUsage(1, 2, 3, 4), "m", "max_tokens", 12, "req")
++    restored = LLMResponse.from_dict(response.to_dict())
++    assert restored == response
++    assert restored.truncated
++    assert restored.usage.total_input == 6
+diff --git a/backend/uv.lock b/backend/uv.lock
+index 45f040f..c786762 100644
+--- a/backend/uv.lock
++++ b/backend/uv.lock
+@@ -37,6 +37,24 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/99/91/8acff4f5e50511b911bbccb72b8628a49c68ce14148cd9f6431094859a90/annotated_types-0.8.0-py3-none-any.whl", hash = "sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0", size = 13427, upload-time = "2026-07-23T20:16:12.938Z" },
+ ]
+ 
++[[package]]
++name = "anthropic"
++version = "1.6.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "anyio" },
++    { name = "docstring-parser" },
++    { name = "httpx2" },
++    { name = "jiter" },
++    { name = "pydantic" },
++    { name = "sniffio" },
++    { name = "typing-extensions" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/a6/3d/4170318539de0c163e1806509b0bb9cd7d611ee15e7885f1d16a11a37d29/anthropic-1.6.0.tar.gz", hash = "sha256:ce3c032f940984f67c516db896375bff36959f8dc589973e386f8e6ea81bbec3", size = 1172375, upload-time = "2026-09-15T15:14:55.826Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/c1/32/57a8b6c5441d9e6a1f332f70ee02375af6d9b5b65b42689ba83f7c7d010a/anthropic-1.6.0-py3-none-any.whl", hash = "sha256:049434f013d3a874acdfee696ec626e19166d58f4277e8fa34e5d0a5ec250ad0", size = 1249068, upload-time = "2026-09-15T15:14:54.326Z" },
++]
++
+ [[package]]
+ name = "antlr4-python3-runtime"
+ version = "4.9.3"
+@@ -100,6 +118,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/91/a7/c8bbb2173f7a7131b3b2412035b2d814ab5ef2ce9799bd06f07c451640e4/ast_serialize-0.11.2-cp39-abi3-win_arm64.whl", hash = "sha256:dab599cbdcb7b45b18c41fad746645580b3a24357082b7f0e8921cd373804f27", size = 1136031, upload-time = "2026-09-13T18:48:54.04Z" },
+ ]
+ 
++[[package]]
++name = "attrs"
++version = "26.1.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/9a/8e/82a0fe20a541c03148528be8cac2408564a6c9a0cc7e9171802bc1d26985/attrs-26.1.0.tar.gz", hash = "sha256:d03ceb89cb322a8fd706d4fb91940737b6642aa36998fe130a9bc96c985eff32", size = 952055, upload-time = "2026-03-19T14:22:25.026Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/64/b4/17d4b0b2a2dc85a6df63d1157e028ed19f90d4cd97c36717afef2bc2f395/attrs-26.1.0-py3-none-any.whl", hash = "sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309", size = 67548, upload-time = "2026-03-19T14:22:23.645Z" },
++]
++
+ [[package]]
+ name = "boto3"
+ version = "1.43.97"
+@@ -319,6 +346,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/99/89/87ef49ffe383ef4e147d27b7bf2088fb0b54ea409dd87b5a89442e5828a5/cryptography-50.0.1-cp39-abi3-win_amd64.whl", hash = "sha256:55d16b1ef3ee0958d893a977b19777887e546c9954ea81b200c3301a864013f2", size = 3875429, upload-time = "2026-08-25T19:45:24.418Z" },
+ ]
+ 
++[[package]]
++name = "distro"
++version = "1.9.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/fc/f8/98eea607f65de6527f8a2e8885fc8015d3e6f5775df186e443e0964a11c3/distro-1.9.0.tar.gz", hash = "sha256:2fa77c6fd8940f116ee1d6b94a2f90b13b5ea8d019b98bc8bafdcabcdd9bdbed", size = 60722, upload-time = "2023-12-24T09:54:32.31Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/12/b3/231ffd4ab1fc9d679809f356cebee130ac7daa00d6d6f3206dd4fd137e9e/distro-1.9.0-py3-none-any.whl", hash = "sha256:7bffd925d65168f85027d8da9af6bddab658135b840670a223589bc0c8ef02b2", size = 20277, upload-time = "2023-12-24T09:54:30.421Z" },
++]
++
+ [[package]]
+ name = "docker"
+ version = "7.2.0"
+@@ -333,6 +369,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/75/23/529140fe1aab80fc6992f93a706deec709140a6397439139a054e1515c45/docker-7.2.0-py3-none-any.whl", hash = "sha256:a3f45fdeb9165e2d25d9a1d02ddf3bc70fb572cf5ebbf9b58558c22caf29b71f", size = 148775, upload-time = "2026-07-09T14:53:45.224Z" },
+ ]
+ 
++[[package]]
++name = "docstring-parser"
++version = "0.18.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/e0/4d/f332313098c1de1b2d2ff91cf2674415cc7cddab2ca1b01ae29774bd5fdf/docstring_parser-0.18.0.tar.gz", hash = "sha256:292510982205c12b1248696f44959db3cdd1740237a968ea1e2e7a900eeb2015", size = 29341, upload-time = "2026-04-14T04:09:19.867Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/a7/5f/ed01f9a3cdffbd5a008556fc7b2a08ddb1cc6ace7effa7340604b1d16699/docstring_parser-0.18.0-py3-none-any.whl", hash = "sha256:b3fcbed555c47d8479be0796ef7e19c2670d428d72e96da63f3a40122860374b", size = 22484, upload-time = "2026-04-14T04:09:18.638Z" },
++]
++
+ [[package]]
+ name = "fastapi"
+ version = "0.141.1"
+@@ -355,10 +400,13 @@ version = "0.1.0"
+ source = { editable = "." }
+ dependencies = [
+     { name = "alembic" },
++    { name = "anthropic" },
+     { name = "boto3" },
+     { name = "fastapi" },
+     { name = "huggingface-hub" },
++    { name = "jsonschema" },
+     { name = "onnxruntime" },
++    { name = "openai" },
+     { name = "opencv-python-headless" },
+     { name = "pgvector" },
+     { name = "pillow" },
+@@ -367,6 +415,7 @@ dependencies = [
+     { name = "pydantic" },
+     { name = "pydantic-settings" },
+     { name = "pypdfium2" },
++    { name = "rapidfuzz" },
+     { name = "rapidocr" },
+     { name = "rich" },
+     { name = "sqlalchemy" },
+@@ -386,15 +435,19 @@ dev = [
+     { name = "pytest-cov" },
+     { name = "ruff" },
+     { name = "testcontainers" },
++    { name = "types-jsonschema" },
+ ]
+ 
+ [package.metadata]
+ requires-dist = [
+     { name = "alembic", specifier = ">=1.20,<2" },
++    { name = "anthropic", specifier = ">=1.6,<2" },
+     { name = "boto3", specifier = ">=1.43,<2" },
+     { name = "fastapi", specifier = ">=0.141,<1" },
+     { name = "huggingface-hub", specifier = ">=0.35,<2" },
++    { name = "jsonschema", specifier = ">=4.26,<5" },
+     { name = "onnxruntime", specifier = ">=1.22,<2" },
++    { name = "openai", specifier = ">=2,<3" },
+     { name = "opencv-python-headless", specifier = ">=4.10,<5" },
+     { name = "pgvector", specifier = ">=0.5,<1" },
+     { name = "pillow", specifier = ">=12,<13" },
+@@ -403,6 +456,7 @@ requires-dist = [
+     { name = "pydantic", specifier = ">=2.13,<3" },
+     { name = "pydantic-settings", specifier = ">=2.15,<3" },
+     { name = "pypdfium2", specifier = ">=5.13,<6" },
++    { name = "rapidfuzz", specifier = ">=3.14,<4" },
+     { name = "rapidocr", specifier = ">=3.9,<4" },
+     { name = "rich", specifier = ">=15,<16" },
+     { name = "sqlalchemy", specifier = ">=2.0.54,<3" },
+@@ -422,6 +476,7 @@ dev = [
+     { name = "pytest-cov", specifier = ">=7,<8" },
+     { name = "ruff", specifier = ">=0.16,<1" },
+     { name = "testcontainers", extras = ["postgres"], specifier = ">=4.15,<5" },
++    { name = "types-jsonschema", specifier = ">=4.25" },
+ ]
+ 
+ [[package]]
+@@ -611,6 +666,32 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
+ ]
+ 
++[[package]]
++name = "jiter"
++version = "0.17.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/9c/1f/8176d92e001f86505424b41664032ae26a882bc9ca41a32c803f373f9195/jiter-0.17.0.tar.gz", hash = "sha256:03e432f226a453851079fb84cd17c6da9991eab723e28d716f14ae3d906e0c12", size = 229037, upload-time = "2026-09-12T15:14:14.253Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/aa/f8/07bd8c3a23f7a8a6875e6a820bbffe1483a18f18f9398a91b5495123176e/jiter-0.17.0-cp312-cp312-macosx_10_12_x86_64.whl", hash = "sha256:ebf918dfd6a74adc1b9ad71f63c4ab00902fcd3b7fd39f2e24d871db8d713b91", size = 291633, upload-time = "2026-09-12T15:11:49.431Z" },
++    { url = "https://files.pythonhosted.org/packages/0e/5e/0de4c6f84ffefa6809ffc2d550b9a314365acf7e7ec9b6c7375d49047900/jiter-0.17.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:61aed66ee042b3b49ef85fdf75714234d055d89d8496ac1c6e47f89e7a30d5e4", size = 321695, upload-time = "2026-09-12T15:11:52.727Z" },
++    { url = "https://files.pythonhosted.org/packages/20/ac/befe2e82065bee37a0252081666ed2f48c1ac5f5c6c318c2de8168ba393d/jiter-0.17.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:76eb4a5c20e86f9f848286f167024890f2862258a965d254774deb7fc1545ca1", size = 341967, upload-time = "2026-09-12T15:11:54.231Z" },
++    { url = "https://files.pythonhosted.org/packages/9f/cd/9797c1e529746750ae589da7c1a8c24373f00d88e11a989f9e5eb1959079/jiter-0.17.0-cp312-cp312-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:bcc064f99183a9cbe7f26ed648c352031a74145cd61ed75d34632c73eb46a5a8", size = 326546, upload-time = "2026-09-12T15:11:55.41Z" },
++    { url = "https://files.pythonhosted.org/packages/d9/fd/e6914c38d6347bab4ebff2b1f0c0f191db276e7a1d5c376176757da42fe3/jiter-0.17.0-cp312-cp312-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:73b64e69c4150748e020356d958af94bec33c70a0a93d665cfa8f6d580fe1a63", size = 340995, upload-time = "2026-09-12T15:11:58.211Z" },
++    { url = "https://files.pythonhosted.org/packages/9d/7d/611b3abf6f88945b5474da5cdc6d1a185e805ac9bf446bb7766dcda6ea87/jiter-0.17.0-cp312-cp312-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:f0bc7f684b65bcda9c20434267577db71bf9905ceddd32b60d1d93278d8c8d3a", size = 352188, upload-time = "2026-09-12T15:11:59.414Z" },
++    { url = "https://files.pythonhosted.org/packages/52/f8/b6e513ecbdf3b3cebe587c2279281ecf775b729a58cf4cc7bdf898ded029/jiter-0.17.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:8c21265b251d99bbb40080d178a8953e35601d3a1564e05c4de4c0d2ca616797", size = 345025, upload-time = "2026-09-12T15:12:00.697Z" },
++    { url = "https://files.pythonhosted.org/packages/28/a8/fe26d06c5a6c5a4cfe703c5154c8a140da1305671eb3681aba9422d4f393/jiter-0.17.0-cp312-cp312-manylinux_2_31_riscv64.whl", hash = "sha256:f3d7f7b34114f7ddc6d72a8e882d49de636b35d9fd12b4d420d3c5729f6c9812", size = 329180, upload-time = "2026-09-12T15:12:01.831Z" },
++    { url = "https://files.pythonhosted.org/packages/e1/58/e6d66a26af40a20e62486feb7e222fd50f6e7aaa4f107abd89675dcc835b/jiter-0.17.0-cp312-cp312-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:5078ab00664307fab2019b522a93aeb191122789f085daf5fd9e362154021d4a", size = 335805, upload-time = "2026-09-12T15:12:03.056Z" },
++    { url = "https://files.pythonhosted.org/packages/ef/3e/96520aa2fef5ef831d95483a902140bfab83dcac9eaa74f7df61b5e50a1b/jiter-0.17.0-cp312-cp312-musllinux_1_1_aarch64.whl", hash = "sha256:470e1b1e4c42f1ead2189166a299691871a2df5056c976e7fb96feafaf5f9d44", size = 484121, upload-time = "2026-09-12T15:12:04.414Z" },
++    { url = "https://files.pythonhosted.org/packages/6a/8f/5d9d92fe538bf36ff481a2278c48147e59c1cf8eb2f7be665260665febe5/jiter-0.17.0-cp312-cp312-musllinux_1_1_x86_64.whl", hash = "sha256:6eb6aedeb7352b8f3b6af9cbd67983840165c00428e63f1b420a85885128ea31", size = 521310, upload-time = "2026-09-12T15:12:05.612Z" },
++    { url = "https://files.pythonhosted.org/packages/50/06/a09f979b22e652afbc3de66c709b2ba92edcef555f7535ab937c86b4f21a/jiter-0.17.0-cp312-cp312-win32.whl", hash = "sha256:362bb47423886d45a9f705d2d9d4008c6eedd4e41eb1bab4e96fb6daa06b33fd", size = 185029, upload-time = "2026-09-12T15:12:06.994Z" },
++    { url = "https://files.pythonhosted.org/packages/6c/d9/98265a005b2473ec2be5a84e2b64c2f65382c673879f1574845cd4bcd77c/jiter-0.17.0-cp312-cp312-win_amd64.whl", hash = "sha256:9bd3caac219df476dd0cc3fe01d2f1581ed588906feac767abd9614c1c12f8b3", size = 227381, upload-time = "2026-09-12T15:12:08.823Z" },
++    { url = "https://files.pythonhosted.org/packages/a8/11/2e05bf5a56e57a543ebb8f585074adf09383e99d7b062dac92eab1f4d57f/jiter-0.17.0-cp312-cp312-win_arm64.whl", hash = "sha256:36ee6e69027396664e59995b9a635a947a5304ee9837279584a0bb8145c8f6b8", size = 183610, upload-time = "2026-09-12T15:12:10.374Z" },
++    { url = "https://files.pythonhosted.org/packages/17/31/4bb27f54333d3b9ef1e5bd3312dc0b4bbe59c68bb0885fdb40583a6b1567/jiter-0.17.0-graalpy312-graalpy250_312_native-macosx_10_12_x86_64.whl", hash = "sha256:454c4997d73cc466c71fd565d91e603b0274e48ea0c6b0b7a7aee6967e4ceb7c", size = 288415, upload-time = "2026-09-12T15:14:08.455Z" },
++    { url = "https://files.pythonhosted.org/packages/28/30/879570ecf82574eaea77c5eb10309f4b630dece5f2a556e9814a90ba3f2d/jiter-0.17.0-graalpy312-graalpy250_312_native-macosx_11_0_arm64.whl", hash = "sha256:40d2c240f8f80b5b0f201b29f0ae129c81448c60c772227a41747b5e0026f6a2", size = 279113, upload-time = "2026-09-12T15:14:10.117Z" },
++    { url = "https://files.pythonhosted.org/packages/77/7a/1f0b8a35fbd079a4f1752c31a15dc99cf277f863747c459be0af39e900e5/jiter-0.17.0-graalpy312-graalpy250_312_native-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:3e05f5adbf68c4bd11e1610f394034d984152988e84be6f8314235ce6f2139e5", size = 303708, upload-time = "2026-09-12T15:14:11.445Z" },
++    { url = "https://files.pythonhosted.org/packages/e1/8b/d76219ebdbcf3d4209d9d21a0810db4c8d0a6f88e3ee87d30bdea4e90d30/jiter-0.17.0-graalpy312-graalpy250_312_native-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:d2c0bf24c72fd0491405dce5d40194f2070e9021ce648c1a1d46234b93d848ff", size = 307147, upload-time = "2026-09-12T15:14:12.897Z" },
++]
++
+ [[package]]
+ name = "jmespath"
+ version = "1.1.0"
+@@ -620,6 +701,33 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/14/2f/967ba146e6d58cf6a652da73885f52fc68001525b4197effc174321d70b4/jmespath-1.1.0-py3-none-any.whl", hash = "sha256:a5663118de4908c91729bea0acadca56526eb2698e83de10cd116ae0f4e97c64", size = 20419, upload-time = "2026-01-22T16:35:24.919Z" },
+ ]
+ 
++[[package]]
++name = "jsonschema"
++version = "4.26.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "attrs" },
++    { name = "jsonschema-specifications" },
++    { name = "referencing" },
++    { name = "rpds-py" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/b3/fc/e067678238fa451312d4c62bf6e6cf5ec56375422aee02f9cb5f909b3047/jsonschema-4.26.0.tar.gz", hash = "sha256:0c26707e2efad8aa1bfc5b7ce170f3fccc2e4918ff85989ba9ffa9facb2be326", size = 366583, upload-time = "2026-01-07T13:41:07.246Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/69/90/f63fb5873511e014207a475e2bb4e8b2e570d655b00ac19a9a0ca0a385ee/jsonschema-4.26.0-py3-none-any.whl", hash = "sha256:d489f15263b8d200f8387e64b4c3a75f06629559fb73deb8fdfb525f2dab50ce", size = 90630, upload-time = "2026-01-07T13:41:05.306Z" },
++]
++
++[[package]]
++name = "jsonschema-specifications"
++version = "2025.9.1"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "referencing" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/19/74/a633ee74eb36c44aa6d1095e7cc5569bebf04342ee146178e2d36600708b/jsonschema_specifications-2025.9.1.tar.gz", hash = "sha256:b540987f239e745613c7a9176f3edb72b832a4ac465cf02712288397832b5e8d", size = 32855, upload-time = "2025-09-08T01:34:59.186Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/41/45/1a4ed80516f02155c51f51e8cedb3c1902296743db0bbc66608a0db2814f/jsonschema_specifications-2025.9.1-py3-none-any.whl", hash = "sha256:98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe", size = 18437, upload-time = "2025-09-08T01:34:57.871Z" },
++]
++
+ [[package]]
+ name = "librt"
+ version = "0.15.0"
+@@ -809,6 +917,25 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/a2/17/02b13e5f51461f0453b18ab854e2d0bc1b6ec353241b05a2ee6b79e35d87/onnxruntime-1.30.0-cp312-cp312-win_arm64.whl", hash = "sha256:dc4c706f1935ebb62356e6a095b047859badd854482c40560888e95c328ed262", size = 14175072, upload-time = "2026-09-10T16:31:34.541Z" },
+ ]
+ 
++[[package]]
++name = "openai"
++version = "2.54.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "anyio" },
++    { name = "distro" },
++    { name = "httpx" },
++    { name = "jiter" },
++    { name = "pydantic" },
++    { name = "sniffio" },
++    { name = "tqdm" },
++    { name = "typing-extensions" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/50/9a/8c75e8c8a5b407a0586faeb2afac91674ff955c191ecc1d6d3b6669f6788/openai-2.54.0.tar.gz", hash = "sha256:e3e6f8bc1ba30ddf381ace1a14340eed381cb984a1a59bd0f34b5be3b5d49cfa", size = 1100285, upload-time = "2026-08-11T18:46:59.035Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/64/a8/bb76c7356de8ad57f59d5ff993d434df0607f07f08bcc9c9a5c275e399c0/openai-2.54.0-py3-none-any.whl", hash = "sha256:89089789197ccdb87f173a03145ed1598d00795220c93e96cf712b1cbf5e5f2b", size = 1660351, upload-time = "2026-08-11T18:46:56.684Z" },
++]
++
+ [[package]]
+ name = "opencv-python-headless"
+ version = "4.14.0.94"
+@@ -1167,6 +1294,29 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/1a/08/67bd04656199bbb51dbed1439b7f27601dfb576fb864099c7ef0c3e55531/pyyaml-6.0.3-cp312-cp312-win_arm64.whl", hash = "sha256:64386e5e707d03a7e172c0701abfb7e10f0fb753ee1d773128192742712a98fd", size = 140344, upload-time = "2025-09-25T21:32:22.617Z" },
+ ]
+ 
++[[package]]
++name = "rapidfuzz"
++version = "3.14.6"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/18/97/226c43b7b5d957bc3840ed52ea99eed261f99834c4619be7a4742cbaeafa/rapidfuzz-3.14.6.tar.gz", hash = "sha256:e13a8160d017b499ec7a2fa9d0ce1ae2e7377080815785819f966fb235d4eb60", size = 57955060, upload-time = "2026-08-30T21:45:51.097Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/03/d2/5a7646b185a61400220e4783d23461c1e864a9ee82ba443b18c218e2364b/rapidfuzz-3.14.6-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:b46cecf27025e7a934332ade033e6a394da8a493f19fa1d835e3b2968a4ff7da", size = 1965178, upload-time = "2026-08-30T21:42:24.164Z" },
++    { url = "https://files.pythonhosted.org/packages/8b/72/10fc4e414eeed7963e2f1c315c731cb68196f0478cb244c78a21f5ce8662/rapidfuzz-3.14.6-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:1901414b135afb1a7f4b1ef940b95523b49cc5642aecf02af740f37567e98137", size = 1248230, upload-time = "2026-08-30T21:42:26.088Z" },
++    { url = "https://files.pythonhosted.org/packages/39/e9/0794043c1a0af09cacdbb6a9e8b9b2079cdf73337e7c29b4a9f117415bb9/rapidfuzz-3.14.6-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:96a548979cd939b2c69358a0f5088a408524fbf7454f04bf90939fa971e64310", size = 1380396, upload-time = "2026-08-30T21:42:27.97Z" },
++    { url = "https://files.pythonhosted.org/packages/2f/73/9218cf4424ab86260ee88ebdb612c5ed4d9bfd6b6d1e2f3c3bf4599d13bf/rapidfuzz-3.14.6-cp312-cp312-manylinux_2_26_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:b22ef7e5e2341efc6216b666491022027b984e5aef93446064742f43f3c1d926", size = 1674037, upload-time = "2026-08-30T21:42:29.754Z" },
++    { url = "https://files.pythonhosted.org/packages/a1/f5/bad528b6dfc608a48838508f270c79332ab05592703c9a46504ba95e9eab/rapidfuzz-3.14.6-cp312-cp312-manylinux_2_26_s390x.manylinux_2_28_s390x.whl", hash = "sha256:f0d2d95c787d812b9106cfbcb94ad37a49f59df9287e00a75eb61afc246e8759", size = 2722897, upload-time = "2026-08-30T21:42:31.737Z" },
++    { url = "https://files.pythonhosted.org/packages/13/da/49ab137f788a0e03e872d4c6b3d5c9c6c6bed4e4ccea381f69c4d186341b/rapidfuzz-3.14.6-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0debb5f43662ea84d2f0228a0c7407ff647f9c3d13f3b692efff0cde46eebce0", size = 3168023, upload-time = "2026-08-30T21:42:33.663Z" },
++    { url = "https://files.pythonhosted.org/packages/59/33/81ca664a15194b8b4a7e863b534e36c057724f9709c7781e9400d0edf024/rapidfuzz-3.14.6-cp312-cp312-manylinux_2_39_riscv64.whl", hash = "sha256:1d253e1fe44648242a0029b42ba23adf238ed2a7eb3d8ed0a03731a23f074ae0", size = 1474666, upload-time = "2026-08-30T21:42:35.5Z" },
++    { url = "https://files.pythonhosted.org/packages/87/eb/b16f9f8cc255c8dc7c0d7712aa7e7c12a6fd85c8b2b56665f2a24222a941/rapidfuzz-3.14.6-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:e06c6050c9bf6cd72305e3e6a293918b2b92cf2a067007585a53898624902e3c", size = 2402289, upload-time = "2026-08-30T21:42:37.309Z" },
++    { url = "https://files.pythonhosted.org/packages/4a/73/eaa1ca89f6ab12c0fe7f943226ce4ad1d2c67eb281dfd706279771fcff5a/rapidfuzz-3.14.6-cp312-cp312-musllinux_1_2_ppc64le.whl", hash = "sha256:d85a6e9180e53cde95c95dfeb05a2ac94ead4d9d803a8fd186d2719a678b8483", size = 2788332, upload-time = "2026-08-30T21:42:39.412Z" },
++    { url = "https://files.pythonhosted.org/packages/5d/ad/db927fbe23f621dd292a6332a19822703084617c0281a88156a8c138d4e0/rapidfuzz-3.14.6-cp312-cp312-musllinux_1_2_riscv64.whl", hash = "sha256:35db2670f69fa3a4eb4741055581477ff92f2cf39e7e06f43ebcb97c2192fe7c", size = 2510540, upload-time = "2026-08-30T21:42:41.629Z" },
++    { url = "https://files.pythonhosted.org/packages/2d/b2/8e9012968fab837babe1292edcbe1c972605f5b3af19c7fcac2ded731d39/rapidfuzz-3.14.6-cp312-cp312-musllinux_1_2_s390x.whl", hash = "sha256:f9d93e5424d1e4c103b57906b8beba270e680afda3ffdff7ea3bc6173b37083c", size = 3299876, upload-time = "2026-08-30T21:42:43.803Z" },
++    { url = "https://files.pythonhosted.org/packages/19/99/799ce99328ea97fe5d7510048ffea148b8ad4a838366f908691be52342a5/rapidfuzz-3.14.6-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:f9b0a501f37fb852c54469375baa25874246b3bbc8b6e21fb4cd186a32335868", size = 4277032, upload-time = "2026-08-30T21:42:46.08Z" },
++    { url = "https://files.pythonhosted.org/packages/07/8a/995b4746c5bc1f561e64de1fa546927183fec7a369fe988716ef394a6d0a/rapidfuzz-3.14.6-cp312-cp312-win32.whl", hash = "sha256:9e974251a9833791bc557b46f975676a56c2d58946f795cd2964b095496dfdcc", size = 1887051, upload-time = "2026-08-30T21:42:48.265Z" },
++    { url = "https://files.pythonhosted.org/packages/84/c4/12f01df5778227c8655fcd9b429fc001d43270f5d8d154edc9066bab1de3/rapidfuzz-3.14.6-cp312-cp312-win_amd64.whl", hash = "sha256:cfca36e4612208875e08611a779164b6cb8900ab8bbd3d82d4cfdfae9efbfac9", size = 1731992, upload-time = "2026-08-30T21:42:50.211Z" },
++    { url = "https://files.pythonhosted.org/packages/19/8d/92217f0bc81ec458b4134ad53714b1be0cd3be21494227d73510b06467d6/rapidfuzz-3.14.6-cp312-cp312-win_arm64.whl", hash = "sha256:96bbd5a1c67d135334d02fae74f1d933fdda204ea03d544a59dab6b1cbfbf565", size = 1186693, upload-time = "2026-08-30T21:42:52.63Z" },
++]
++
+ [[package]]
+ name = "rapidocr"
+ version = "3.9.2"
+@@ -1187,6 +1337,20 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/55/ed/0ee9b9281986974be9d2406ae0134c8d7c91d2fc613f16ffda9701eeda6f/rapidocr-3.9.2-py3-none-any.whl", hash = "sha256:04d6b8d151f823d930bd91910555f57bea897c0c44fa6794267b94cf9c1ef9a0", size = 27275208, upload-time = "2026-07-21T10:59:01.599Z" },
+ ]
+ 
++[[package]]
++name = "referencing"
++version = "0.37.0"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "attrs" },
++    { name = "rpds-py" },
++    { name = "typing-extensions" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/22/f5/df4e9027acead3ecc63e50fe1e36aca1523e1719559c499951bb4b53188f/referencing-0.37.0.tar.gz", hash = "sha256:44aefc3142c5b842538163acb373e24cce6632bd54bdb01b21ad5863489f50d8", size = 78036, upload-time = "2025-10-13T15:30:48.871Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/2c/58/ca301544e1fa93ed4f80d724bf5b194f6e4b945841c5bfd555878eea9fcb/referencing-0.37.0-py3-none-any.whl", hash = "sha256:381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231", size = 26766, upload-time = "2025-10-13T15:30:47.625Z" },
++]
++
+ [[package]]
+ name = "requests"
+ version = "2.34.2"
+@@ -1229,6 +1393,29 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/82/3b/64d4899d73f91ba49a8c18a8ff3f0ea8f1c1d75481760df8c68ef5235bf5/rich-15.0.0-py3-none-any.whl", hash = "sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb", size = 310654, upload-time = "2026-04-12T08:24:02.83Z" },
+ ]
+ 
++[[package]]
++name = "rpds-py"
++version = "2026.6.3"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/aa/2a/9618a122aeb2a169a28b03889a2995fe297588964333d4a7d67bdf46e147/rpds_py-2026.6.3.tar.gz", hash = "sha256:1cebd1337c242e4ec2293e541f712b2da849b29f48f0c293684b71c0632625d4", size = 64051, upload-time = "2026-06-30T07:17:53.009Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/5c/be/2e8974163072e7bab7df1a5acd54c4498e75e35d6d18b864d3a9d5dadc92/rpds_py-2026.6.3-cp312-cp312-macosx_10_12_x86_64.whl", hash = "sha256:a0811d33247c3d6128a3001d763f2aa056bb3425204335400ac54f89eec3a0d0", size = 343691, upload-time = "2026-06-30T07:15:14.96Z" },
++    { url = "https://files.pythonhosted.org/packages/a4/73/319dfa745dd668efe89309141ded489126461fcecd2b8f3a3cda185129b6/rpds_py-2026.6.3-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:538949e262e46caa31ac01bdb3c1e8f642622922cacbabbae6a8445d9dc33eaf", size = 338542, upload-time = "2026-06-30T07:15:16.267Z" },
++    { url = "https://files.pythonhosted.org/packages/21/63/4239893be1c4d09b709b1a8f6be4188f0870084ff547f46606b8a75f1b03/rpds_py-2026.6.3-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:55927d532399c2c646100ff7feb48eaa940ad70f42cd68e1328f3ded9f81ca24", size = 368180, upload-time = "2026-06-30T07:15:17.62Z" },
++    { url = "https://files.pythonhosted.org/packages/1c/ca/9c5de382225234ceb37b1844ebdb140db12b2a278bb9efe2fcd19f6c82ce/rpds_py-2026.6.3-cp312-cp312-manylinux_2_17_armv7l.manylinux2014_armv7l.whl", hash = "sha256:f56f1695bc5c0871cbc33dc0130fcf503aab0c57dcc5a6700a4f49eba4f2652e", size = 375067, upload-time = "2026-06-30T07:15:18.952Z" },
++    { url = "https://files.pythonhosted.org/packages/87/dc/863f69d1bf04ade34b7fe0d59b9fdf6f0135fe2d7cbca74f1d665589559d/rpds_py-2026.6.3-cp312-cp312-manylinux_2_17_ppc64le.manylinux2014_ppc64le.whl", hash = "sha256:270b293dae9058fc9fcedab50f13cebf46fb8ed1d1d54e0521a9da5d6b211975", size = 490509, upload-time = "2026-06-30T07:15:20.434Z" },
++    { url = "https://files.pythonhosted.org/packages/ce/ef/eac16a12048b45ec7c7fa94f2be3438a5f26bf9cc8580b18a1cfd609b7f6/rpds_py-2026.6.3-cp312-cp312-manylinux_2_17_s390x.manylinux2014_s390x.whl", hash = "sha256:127565fead0a10943b282957bd5447804ff3160ad79f2ad2635e6d249e380680", size = 382754, upload-time = "2026-06-30T07:15:21.831Z" },
++    { url = "https://files.pythonhosted.org/packages/04/8f/d2f3f532616be4d06c316ef119683e832bd3d41e112bf3a88f4151c95b17/rpds_py-2026.6.3-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:ecabd69db66de867690f9797f2f8fa27ba501bbc24540cbdbdc649cd15888ba6", size = 366189, upload-time = "2026-06-30T07:15:23.371Z" },
++    { url = "https://files.pythonhosted.org/packages/e3/29/41a7b0e98a4b44cd676ab7598419623373eb43b20be68c084935c1a8cf88/rpds_py-2026.6.3-cp312-cp312-manylinux_2_31_riscv64.whl", hash = "sha256:58eadac9cd119677b60e1cf8ac4052f35949d71b8a9e5556efccbe82533cf22a", size = 377750, upload-time = "2026-06-30T07:15:24.659Z" },
++    { url = "https://files.pythonhosted.org/packages/2e/05/ecda0bec46f9a1565090bcdc941d023f6a25aff85fda28f89f8d19878152/rpds_py-2026.6.3-cp312-cp312-manylinux_2_5_i686.manylinux1_i686.whl", hash = "sha256:7491ee23305ac3eb59e492b6945881f5cd77a6f731061a3f25b77fd40f9e99a4", size = 395576, upload-time = "2026-06-30T07:15:25.987Z" },
++    { url = "https://files.pythonhosted.org/packages/68/a8/6ed52f03ee6cb854ce78785cc9a9a672eb880e83fd7224d471f667d151f1/rpds_py-2026.6.3-cp312-cp312-musllinux_1_2_aarch64.whl", hash = "sha256:2c99f7e8ccb3dd6e3e4bfeac657a7b208c9bac8075f4b078c02d7404c34107fa", size = 543807, upload-time = "2026-06-30T07:15:27.356Z" },
++    { url = "https://files.pythonhosted.org/packages/8f/d6/156c0d3eea27ba09b92562ba2364ba124c0a061b199e17eac637cd25a5e2/rpds_py-2026.6.3-cp312-cp312-musllinux_1_2_i686.whl", hash = "sha256:62698275682bf121181861295c9181e789030a2d516071f5b8f3c23c170cd0fc", size = 611187, upload-time = "2026-06-30T07:15:28.931Z" },
++    { url = "https://files.pythonhosted.org/packages/f1/31/774212ed989c62f7f310220089f9b0a3fb8f40f5443d1727abd5d9f52bc9/rpds_py-2026.6.3-cp312-cp312-musllinux_1_2_x86_64.whl", hash = "sha256:a214c993455f99a89aaeadc9b21241900037adc9d97203e374d75513c5911822", size = 573030, upload-time = "2026-06-30T07:15:30.553Z" },
++    { url = "https://files.pythonhosted.org/packages/c9/50/22f73127a41f1ce4f87fe39aadfb9a126345801c274aa93ae88456249327/rpds_py-2026.6.3-cp312-cp312-win32.whl", hash = "sha256:501f9f04a588d6a09179368c57071301445191767c64e4b52a6aa9871f1ef5ed", size = 202185, upload-time = "2026-06-30T07:15:32.027Z" },
++    { url = "https://files.pythonhosted.org/packages/04/3a/f0ee4d4dde9d3b69dedf1b5f74e7a40017046d55052d173e418c6a94f960/rpds_py-2026.6.3-cp312-cp312-win_amd64.whl", hash = "sha256:2c958bf94822e9290a40aaf2a822d4bc5c88099093e3948ad6c571eca9272e5f", size = 220394, upload-time = "2026-06-30T07:15:33.359Z" },
++    { url = "https://files.pythonhosted.org/packages/f3/83/3382fe37f809b59f02aac04dbc4e765b480b46ee0227ed516e3bdc4d3dfc/rpds_py-2026.6.3-cp312-cp312-win_arm64.whl", hash = "sha256:22bffe6042b9bcb0822bcd1955ec00e245daf17b4344e4ed8e9551b976b63e96", size = 215753, upload-time = "2026-06-30T07:15:34.778Z" },
++]
++
+ [[package]]
+ name = "ruff"
+ version = "0.16.8"
+@@ -1303,6 +1490,15 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+ ]
+ 
++[[package]]
++name = "sniffio"
++version = "1.3.1"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/a2/87/a6771e1546d97e7e041b6ae58d80074f81b7d5121207425c964ddf5cfdbd/sniffio-1.3.1.tar.gz", hash = "sha256:f4324edc670a0f49750a81b895f35c3adb843cca46f0530f79fc1babb23789dc", size = 20372, upload-time = "2024-02-25T23:20:04.057Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/e9/44/75a9c9421471a6c4805dbf2356f7c181a29c1879239abab1ea2cc8f38b40/sniffio-1.3.1-py3-none-any.whl", hash = "sha256:2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2", size = 10235, upload-time = "2024-02-25T23:20:01.196Z" },
++]
++
+ [[package]]
+ name = "sqlalchemy"
+ version = "2.0.54"
+@@ -1397,6 +1593,18 @@ wheels = [
+     { url = "https://files.pythonhosted.org/packages/dc/bf/205d0004930ede8f542fb58f601526fccf4ae7626075ca1e6c4de5d3d652/typer-0.27.2-py3-none-any.whl", hash = "sha256:b3a5fc4342d5fc8fda8fc3010b1cf117e9249aab7fae800c2eff62fd3842d97d", size = 123130, upload-time = "2026-08-28T10:26:53.752Z" },
+ ]
+ 
++[[package]]
++name = "types-jsonschema"
++version = "4.26.0.20260518"
++source = { registry = "https://pypi.org/simple" }
++dependencies = [
++    { name = "referencing" },
++]
++sdist = { url = "https://files.pythonhosted.org/packages/dd/46/73b6a5d61a61015c4248030a8cb07e5bdddb4041430fae9e585a68692578/types_jsonschema-4.26.0.20260518.tar.gz", hash = "sha256:e1dd53dc97a64f5eccdd6fa9839666e09bb500a8ebba2db6fdaf1789faea81a6", size = 16638, upload-time = "2026-05-18T06:06:44.106Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/07/d5/134f8a147dcecda10db7f60cfc6af0578a25a5c53c87b3907a64385e0184/types_jsonschema-4.26.0.20260518-py3-none-any.whl", hash = "sha256:30b30a518c7fe335df85c919fcbcc631b69c03d4a4b5b632fa916bea03065307", size = 16072, upload-time = "2026-05-18T06:06:43.264Z" },
++]
++
+ [[package]]
+ name = "types-s3transfer"
+ version = "0.16.0"

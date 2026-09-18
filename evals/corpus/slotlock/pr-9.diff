@@ -1,0 +1,269 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 8f84fbb..e3d0ba7 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -6,22 +6,33 @@ Testcontainers, fast-check, k6.
+ 
+ ## Commands
+ - `just up` — Postgres + Redis; `just migrate`, `just seed`, `just api` (Swagger at /docs), `just worker`
+-- `just check` — Biome, tsc, Vitest unit + integration (integration tests start containers; Docker needed)
++- `just app` — the whole stack in Docker; `just demo` — the walkthrough against :3000
++- `just check` — Biome, tsc, migration drift, Vitest unit + integration (integration tests start
++  containers and boot the API and the worker in-process; Docker needed)
++- `just bench <strategy>` / `just bench-all` — the k6 race and the verifier; writes docs/benchmarks/
+ - `pnpm prisma migrate dev --name <name>` after schema changes; hand-written SQL (extensions,
+   exclusion constraints) goes into the migration file — Prisma's schema does not model it
+ - `pnpm prisma:generate` after schema changes (the generated client is committed)
++- Dev and bench run the API with `node -r @swc-node/register` — tsx cannot emit the decorator
++  metadata Nest's DI needs; tests use unplugin-swc for the same reason
+ 
+ ## Rules of the codebase
+ - Every invariant has a test that fails without its mechanism (the race, idempotency, webhook
+   ordering, hold expiry, exactly-once consumers). A change that weakens a mechanism must make
+   that test red first.
+ - The five reserve strategies share one interface and are selected by `BOOKING_STRATEGY`; the
+-  exclusion constraint is toggled at startup so the others are measured without it.
++  exclusion constraint is toggled at startup so the others are measured without it. `naive` is
++  the control and must stay broken.
++- Postgres errors reach us in three shapes under Prisma 7; always go through `pgCode()` and
++  `isRetryableConflict()` in `src/common/errors.ts`, never match on messages in place.
++- Anything that updates a booking row after a reserve runs through `retryOnConflict` (the
++  exclusion constraint is rechecked on non-HOT updates and can make them deadlock victims).
+ - HTTP semantics are part of the contract: 201 booked, 409 no capacity / request in flight,
+   422 idempotency key reused with a different body, 400 validation.
+ - Webhooks are applied by provider timestamp, deduplicated by event id, and never regress a
+   CONFIRMED booking. Handlers return 200 fast; work happens in a transaction.
+-- Numbers in the README come only from `docs/benchmarks/` written by `bench/run.ts`.
++- Numbers in the README come only from `docs/benchmarks/` written by `bench/run.ts`; regenerate
++  with `just bench-all` after touching a strategy and update the README's reading of them.
+ 
+ ## Review checklist for PRs
+ - Does the test prove the invariant, or only that the code ran?
+diff --git a/README.md b/README.md
+index 0492848..bf87800 100644
+--- a/README.md
++++ b/README.md
+@@ -1,7 +1,174 @@
+ # slotlock
+ 
+-A coworking-space reservation API that cannot double-book: five ways to serialise a booking
+-(advisory lock, `SELECT … FOR UPDATE`, optimistic versioning, `SERIALIZABLE`, an exclusion
+-constraint), each proven by tests and measured under the same load.
++**A reservation API that cannot double-book — five ways to make sure, tested and measured.**
+ 
+-Work in progress — assembled in small pull requests; the README grows with the benchmark results.
++[![CI](https://github.com/ilia-muravev-dev/slotlock/actions/workflows/ci.yml/badge.svg)](https://github.com/ilia-muravev-dev/slotlock/actions/workflows/ci.yml)
++
++Meeting rooms are exclusive; hot-desk pools have a capacity. A booking is *held* while the
++customer pays, *confirmed* by the payment webhook, or *expired* by a worker. Every way a second
++booking could sneak into the same seat is closed and proven: concurrent requests, retried
++requests, webhooks arriving out of order or twice, lost expiry jobs, duplicate queue deliveries.
++
++The reserve step exists in five implementations behind one interface, selected by
++`BOOKING_STRATEGY`, plus a sixth — `naive`, the bug — kept as a control. The same k6 race runs
++against each and a verifier judges the database afterwards.
++
++## The numbers
++
++2026-09-18T18:57:11.898Z, commit `2b1bbff`, Apple M1 Pro (8 cores, 16 GB), darwin arm64, Node v24.21.0, PostgreSQL 17.11 in Docker, pool size 20. 100 VUs for 20s per strategy, release ratio 0.8.
++
++| Strategy | req/s | p50 ms | p95 ms | p99 ms | 201 / 409 / other | retries | overlaps / over capacity | invariants |
++| --- | ---: | ---: | ---: | ---: | --- | ---: | --- | :---: |
++| `advisory` | 1416 | 66.6 | 92.6 | 138.0 | 1106 / 26359 / 0 | – | 0 / 0 | ✅ |
++| `for_update` | 1407 | 66.9 | 91.9 | 138.8 | 1062 / 26261 / 0 | – | 0 / 0 | ✅ |
++| `optimistic` | 1405 | 64.9 | 89.8 | 206.3 | 909 / 26499 / 34 | 1078 | 0 / 0 | ✅ |
++| `serializable` | 1508 | 60.0 | 80.7 | 174.4 | 981 / 28437 / 9 | 944 | 0 / 0 | ✅ |
++| `exclusion` | 1867 | 49.4 | 70.9 | 126.2 | 1019 / 35545 / 0 | 0 | 0 / 0 | ✅ |
++| `naive` | 1643 | 57.1 | 75.5 | 114.2 | 1070 / 30992 / 0 | – | 18 / 5 | ❌ |
++
++Written by `just bench-all` into [`docs/benchmarks/`](docs/benchmarks/README.md), never edited by
++hand; the per-strategy reports carry the full latency distribution and the run parameters.
++
++What they say:
++
++- **All five keep both invariants; the control breaks them within seconds.** The verifier
++  (`bench/verify.ts`) counts a booking as holding its seat from creation until it was cancelled
++  or expired, so a double booking that was cancelled a moment later still counts. `naive`
++  double-booked rooms 18 times and overfilled the pool
++  5 times in 20 s.
++- **Waiting is cheaper than retrying under this contention.** `advisory` and `for_update` queue
++  callers per resource and never fail; `optimistic` and `serializable` detect the conflict after
++  the fact and try again — `optimistic` retried 1078 times and gave up
++  34 times (503 `retry_exhausted`), `serializable` retried
++  944 times and gave up 9 times. The optimistic
++  version lives on the *resource* row, so two bookings of different slots of the same room
++  conflict with each other; a per-slot version would fix that and is left as the obvious next
++  step.
++- **The exclusion constraint is the fastest and the least code, with two catches.** Its 409 path
++  is a single `INSERT … ON CONFLICT DO NOTHING`; the others count first. But it cannot express
++  "at most N" (pools fall back to advisory), and a *plain* insert against it deadlocks under
++  contention — [ADR 0001](docs/adr/0001-five-ways-to-serialise-a-booking.md) records how the
++  first version of this repository found that out.
++- Latency here is dominated by 100 virtual users sharing a pool of 20 connections on one laptop;
++  read the columns against each other, not as absolute numbers.
++
++## What is proven, and where
++
++| Invariant | Mechanism | Proof |
++| --- | --- | --- |
++| A room never has two active bookings that overlap; a pool never exceeds its capacity | one of five reserve strategies, in the database | [`bookings.race.test.ts`](test/integration/bookings.race.test.ts): 50 concurrent requests for one slot → 1 × 201, 49 × 409, one row — for every strategy; 20 on a pool of 3 → exactly 3; the `naive` control double-books |
++| A retried request never creates a second booking | `Idempotency-Key` per user: in-flight → 409, done → stored answer replayed, different body → 422, 5xx → released ([ADR 0002](docs/adr/0002-idempotency-keys.md)) | [`idempotency.test.ts`](test/integration/idempotency.test.ts), including a gated first request with nine duplicates behind it |
++| Payment webhooks in any order, with duplicates, converge to one state | ordered by the provider's timestamp, deduplicated by event id, applied under a row lock, a state machine that never leaves CONFIRMED ([ADR 0003](docs/adr/0003-webhooks-ordered-by-provider-time.md)) | [`webhooks.test.ts`](test/integration/webhooks.test.ts): reversed, duplicated, three shuffled copies delivered concurrently |
++| An unpaid hold releases its seat even if its expiry job was lost | a delayed BullMQ job per hold plus a periodic sweeper; expiry is one guarded `UPDATE` judged by the database clock | [`holds.test.ts`](test/integration/holds.test.ts) |
++| Side effects happen exactly once per event, and never for a transaction that rolled back | transactional outbox, relay with `SKIP LOCKED`, consumer that claims the job id in a transaction ([ADR 0004](docs/adr/0004-outbox-and-an-idempotent-consumer.md)) | [`outbox.test.ts`](test/integration/outbox.test.ts) |
++| All of the above, in any interleaving | — | [`booking-sequences.property.test.ts`](test/integration/booking-sequences.property.test.ts): fast-check drives random sequences of book / replay / pay / cancel / expire / sweep against the real database and checks every invariant after every step |
++
++The integration tests start Postgres 17 and Redis 8 in Testcontainers and boot the API and the
++worker in-process; nothing is mocked below the HTTP layer.
++
++## The booking path
++
++```
++POST /bookings  (Idempotency-Key, X-User-Id)
++  │ claim the key IN_FLIGHT ─────────── duplicate in flight → 409 request_in_flight
++  │ validate (startsAt < endsAt, ≤ 8 h, resource exists)
++  │ reserve under BOOKING_STRATEGY ──── no capacity → 409 no_capacity
++  │ create a payment intent ─────────── provider down → hold cancelled, 502
++  │ attach it, write outbox booking.held, schedule the expiry job
++  └ 201 { booking, payment: { id, clientSecret } }   ·   store the answer under the key
++
++POST /webhooks/payments (Stripe-Signature) → APPLIED | STALE | DUPLICATE | ORPHANED | IGNORED | UNKNOWN
++DELETE /bookings/:id (owner) → CANCELLED; a paid booking also requests a refund through the outbox
++worker: expire-hold jobs, the sweeper, the outbox relay, the notifications consumer
++```
++
++| Status | Meaning |
++| --- | --- |
++| 201 | held; pay within `HOLD_TTL_SECONDS` |
++| 409 `no_capacity` | someone else has the seat for that time |
++| 409 `request_in_flight` | the same key is still being processed — retry later with the same key |
++| 422 `idempotency_key_reused` | the same key with a different request |
++| 400 | validation, missing `Idempotency-Key` or `X-User-Id` |
++| 503 `retry_exhausted` | a retrying strategy gave up under contention; retry with backoff |
++
++Swagger UI at `/docs`, the document at `/openapi.json`. There is no authentication: the demo
++identifies users by the `X-User-Id` header, which is the one thing you would not ship.
++
++## Payments
++
++Stripe when `STRIPE_SECRET_KEY` is set (PaymentIntents, `Stripe-Signature` verification with
++`STRIPE_WEBHOOK_SECRET`); otherwise an in-repo fake provider whose intents live in the database
++and whose events are Stripe-shaped and **signed with the real Stripe scheme**, so the webhook
++endpoint runs one verification path for both. `POST /fake-psp/payments/:id/pay` plays the
++customer paying, delivering `created / processing / succeeded` shuffled and with a duplicate —
++the tests and the demo use it; it answers 404 when Stripe is configured.
++
++## Try it
++
++```bash
++just up && just migrate && just seed   # Postgres 17 + Redis 8 in Docker, schema, seven resources
++just api                               # http://localhost:3000/docs
++just worker                            # expiry, sweeper, outbox relay, notifications (another terminal)
++just demo                              # the story: hold, retry, race, shuffled webhooks, cancel, expiry
++```
++
++Or the whole stack in Docker (`HOLD_TTL_SECONDS=20` to watch a hold expire during the demo):
++
++```bash
++HOLD_TTL_SECONDS=20 just app && just demo
++```
++
++Pick a strategy with `BOOKING_STRATEGY=advisory|for_update|optimistic|serializable|exclusion`
++(`naive` is refused in production). Run the benchmark with `just bench <strategy>` or
++`just bench-all` (needs `brew install k6`); `just check` runs what CI runs.
++
++## Design notes
++
++- [ADR 0001 — five ways to serialise a booking, all kept, one active](docs/adr/0001-five-ways-to-serialise-a-booking.md)
++- [ADR 0002 — idempotency keys: in-flight is a conflict, answers are stored, a reused key is an error](docs/adr/0002-idempotency-keys.md)
++- [ADR 0003 — webhooks ordered by the provider's clock, not by arrival](docs/adr/0003-webhooks-ordered-by-provider-time.md)
++- [ADR 0004 — a transactional outbox and an idempotent consumer](docs/adr/0004-outbox-and-an-idempotent-consumer.md)
++
++Things I would want a reviewer to notice:
++
++- The exclusion constraint is added and dropped at startup by the strategy module, so the other
++  four are measured without it. Prisma does not model exclusion constraints; the index on
++  `tstzrange("startsAt","endsAt")` is hand-written in the first migration.
++- Prisma 7 surfaces Postgres errors three different ways (driver-adapter `cause.kind`, `P2xxx`
++  codes, raw-query `meta.code`); `pgCode()` in `src/common/errors.ts` normalises them, and the
++  serializable strategy answered 500 instead of retrying until it did.
++- Expiry, cancellation and webhook application all update the booking row while inserts for the
++  same slot may be in flight; under the exclusion strategy those updates can be deadlock victims,
++  so they run through `retryOnConflict`.
++- Desk pools count a booking against every slot it overlaps (a booking blocks a desk for its
++  whole duration). It is simpler than interval colouring and slightly conservative.
++
++## Layout
++
++```
++src/
++  bookings/        controller, service, booking.state.ts (payment transitions)
++    strategies/    reserve.strategy.ts + advisory · for-update · optimistic · serializable · exclusion · naive
++    holds/         hold.scheduler.ts (delayed jobs), hold-expiry.service.ts (guarded UPDATE, sweeper), processor
++  idempotency/     interceptor + service (claim / replay / mismatch / release)
++  payments/        payment.provider.ts, stripe.provider.ts, fake.provider.ts, payment-events.service.ts, webhooks
++  outbox/          outbox.service.ts (write in tx), outbox.relay.ts, notifications.processor.ts, sink
++  resources/       list, availability
++  common/          errors + pgCode, retryOnConflict, the exception filter, Zod pipe, OpenAPI helpers
++  core.module.ts   config · pino · Prisma · BullMQ, shared by app.module.ts (HTTP) and worker.module.ts
++prisma/            schema, migrations (btree_gist, the GiST index), seed
++bench/             race.js (k6), verify.ts (the judge), run.ts (fresh DB → API → k6 → verdict → report)
++test/              unit · integration (Testcontainers) · the property test
++docs/              adr/, benchmarks/
++```
++
++## Stack
++
++Node 24 · TypeScript 6 · NestJS 12 on Fastify · Prisma 7 with the `pg` driver adapter · Postgres 17
++(`btree_gist`) · Redis 8 + BullMQ 6 · Zod 4 · Stripe SDK · pino · Biome · Vitest + SWC ·
++Testcontainers · fast-check · k6 · Docker Compose.
++
++## What is missing on purpose
++
++Authentication (a header stands in for it), rate limiting, outbox retention, multi-region
++anything. They are not the point of the repository; the invariants are.
+diff --git a/docs/adr/0002-idempotency-keys.md b/docs/adr/0002-idempotency-keys.md
+new file mode 100644
+index 0000000..ca46f2b
+--- /dev/null
++++ b/docs/adr/0002-idempotency-keys.md
+@@ -0,0 +1,39 @@
++# ADR 0002: Idempotency keys — in-flight is a conflict, answers are stored, a reused key is an error
++
++Status: accepted · 2026-09-18
++
++## Context
++
++A client that times out on `POST /bookings` does not know whether the hold was made. If it
++retries without protection it may hold the seat twice (and pay twice); if it gives up it may
++lose a seat it already has. The retry has to be safe by construction, including the case where
++the retry arrives while the first attempt is still running.
++
++## Decision
++
++`POST /bookings` requires an `Idempotency-Key` (1–128 characters), scoped to the `X-User-Id` so
++two users cannot collide on `"1"`. The interceptor in `src/idempotency/`:
++
++1. Inserts the key as `IN_FLIGHT` with a hash of `(user, method, path, body)` before the handler
++   runs. The primary key is the fence: a concurrent insert of the same key fails with a unique
++   violation and that request is answered **409 `request_in_flight`** — it must retry later, not
++   wait, because the first attempt may be holding locks.
++2. When the handler finishes, stores the status and body (2xx and 4xx alike) and marks the key
++   `DONE`. A later request with the same key and the same hash gets the stored answer back with
++   `Idempotency-Replayed: true` — a replayed 409 is still a 409: losing the race once is losing it.
++3. A request with the same key and a different hash is **422 `idempotency_key_reused`**. Silently
++   replaying the old answer would hide a client bug; silently running the new request would
++   defeat the key.
++4. A 5xx or a crash **releases** the key (the row is deleted) so the client's retry runs again.
++   Whatever the failed attempt did to the seat is compensated by the handler itself (a hold whose
++   payment intent could not be created is cancelled before the 502 leaves).
++5. Keys expire after 24 hours; an expired key is simply a new key.
++
++## Consequences
++
++- The client contract is small: generate a key per attempt, reuse it on retry, treat 409
++  `request_in_flight` as "back off and retry with the same key".
++- Storing 4xx answers means validation errors are replayed too — deliberate: the answer to that
++  exact request is that error, and replay is cheaper than re-validation.
++- The key row is a second write per booking. It is the price of the guarantee; the benchmark
++  numbers include it.

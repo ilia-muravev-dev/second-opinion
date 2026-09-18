@@ -12,7 +12,7 @@ from second_opinion.findings import Finding
 from second_opinion.llm.pricing import cost_usd
 from second_opinion.llm.provider import LLMError, LLMProvider, LLMRequest, LLMUsage
 from second_opinion.review.merge import MergeStats, merge_findings
-from second_opinion.review.registry import load_prompt
+from second_opinion.review.registry import load_prompt, prompt_config
 from second_opinion.review.schema import REVIEW_SCHEMA, ModelFinding, ReviewOutput
 
 
@@ -97,7 +97,8 @@ def review_diff(
     effort: str = "none",
 ) -> ReviewResult:
     context = context or ReviewContext()
-    system = load_prompt(prompt_version)
+    config = prompt_config(prompt_version)
+    system = load_prompt(config.review)
     chunks = chunk_diff(diff, max_request_tokens)
     raw: list[ModelFinding] = []
     summaries: list[str] = []

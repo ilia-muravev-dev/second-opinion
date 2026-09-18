@@ -95,6 +95,8 @@ def run_cases(
                 "usage": run.report.usage.__dict__,
                 "cost_usd": run.report.cost_usd,
                 "errors": run.report.errors,
+                "verified": run.report.verified,
+                "rejected": run.report.rejected,
                 "elapsed_s": round(time.perf_counter() - case_started, 1),
                 "findings": [
                     {

@@ -23,8 +23,8 @@ TOKEN_SHAPES: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 ASSIGNMENT = re.compile(
-    r"(?i)\b(password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key)"
-    r"['\"]?\s*[:=]\s*['\"]([^'\"]{8,})['\"]"
+    r"(?i)\b[\w-]*?(password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|"
+    r"private[_-]?key)\b['\"]?\s*[:=]\s*['\"]([^'\"]{8,})['\"]"
 )
 # A value that says what it is — a test, a sample, a dev default — is not a leaked credential.
 PLACEHOLDER = re.compile(

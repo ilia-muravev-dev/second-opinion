@@ -38,10 +38,10 @@ inputs:
     description: review (inline + summary) | summary | none
     default: review
   fail-on:
-    description: Fail the check when a finding of this severity or worse exists (none | high | medium | low)
+    description: "Fail the check when a finding of this severity or worse exists (none | high | medium | low)"
     default: none
   pr-number:
-    description: Pull request number (default: from the event)
+    description: "Pull request number (default: from the event)"
     default: ""
 outputs:
   findings:

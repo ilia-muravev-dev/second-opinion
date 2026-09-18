@@ -191,7 +191,7 @@ def test_runner_resumes_stops_on_rate_limits_and_reports(tmp_path: Path) -> None
     assert outcome.stopped_by is not None
     assert "rate_limit" in outcome.stopped_by
 
-    outcome = run_cases(cases, settings, oracle, runs_dir=runs)
+    outcome = run_cases(cases, settings, oracle, runs_dir=runs, workers=3)
     assert (outcome.done, outcome.skipped) == (3, 3)
     rows = load_run(run_path(outcome.slug, runs))
     assert len(rows) == 6

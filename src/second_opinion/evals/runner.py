@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -52,6 +54,48 @@ class RunOutcome:
     elapsed_s: float
 
 
+def _review_case(
+    case: Case, settings: Settings, provider: LLMProvider, cassette_mode: CassetteMode
+) -> dict[str, Any]:
+    case_started = time.perf_counter()
+    run = run_review(case.diff, settings, provider, case_id=case.id)
+    score = score_case(case.id, case.kind, list(case.labels), run.report.findings)
+    return {
+        "case_id": case.id,
+        "kind": case.kind,
+        "repo": case.repo,
+        "pr": case.pr,
+        "labels": [label.to_dict() for label in case.labels],
+        "model": settings.model,
+        "prompt": settings.prompt_version,
+        "provider": provider.name,
+        "cassette": cassette_mode,
+        "requests": run.report.requests,
+        "usage": run.report.usage.__dict__,
+        "cost_usd": run.report.cost_usd,
+        "errors": run.report.errors,
+        "verified": run.report.verified,
+        "rejected": run.report.rejected,
+        "elapsed_s": round(time.perf_counter() - case_started, 1),
+        "findings": [
+            {
+                "source": f.source,
+                "check": f.check,
+                "file": f.file,
+                "line": f.line,
+                "end_line": f.end_line,
+                "severity": f.severity,
+                "category": f.category,
+                "title": f.title,
+                "confidence": f.confidence,
+                "verdict": f.verdict,
+            }
+            for f in run.report.findings
+        ],
+        "score": score.__dict__,
+    }
+
+
 def run_cases(
     cases: list[Case],
     settings: Settings,
@@ -61,63 +105,46 @@ def run_cases(
     resume: bool = True,
     on_case: Callable[[str, dict[str, Any]], None] | None = None,
     cassette_mode: CassetteMode = "off",
+    workers: int = 1,
 ) -> RunOutcome:
+    """Cases run in order (or `workers` at a time); rows are appended as they finish. The first
+    rate limit or auth failure stops the run: cases still in flight finish, no new ones start."""
     slug = slugify(settings.model, settings.prompt_version)
     path = run_path(slug, runs_dir)
     runs_dir.mkdir(parents=True, exist_ok=True)
     already = {row["case_id"] for row in load_run(path)} if resume else set()
     started = time.perf_counter()
-    done = skipped = 0
+    todo = [case for case in cases if case.id not in already]
+    skipped = len(cases) - len(todo)
+    done = 0
     stopped_by: str | None = None
-    with path.open("a", encoding="utf-8") as handle:
-        for case in cases:
-            if case.id in already:
-                skipped += 1
-                continue
-            case_started = time.perf_counter()
-            try:
-                run = run_review(case.diff, settings, provider, case_id=case.id)
-            except LLMError as error:
-                stopped_by = f"{error.kind}: {error}"
-                break
-            score = score_case(case.id, case.kind, list(case.labels), run.report.findings)
-            row = {
-                "case_id": case.id,
-                "kind": case.kind,
-                "repo": case.repo,
-                "pr": case.pr,
-                "labels": [label.to_dict() for label in case.labels],
-                "model": settings.model,
-                "prompt": settings.prompt_version,
-                "provider": provider.name,
-                "cassette": cassette_mode,
-                "requests": run.report.requests,
-                "usage": run.report.usage.__dict__,
-                "cost_usd": run.report.cost_usd,
-                "errors": run.report.errors,
-                "verified": run.report.verified,
-                "rejected": run.report.rejected,
-                "elapsed_s": round(time.perf_counter() - case_started, 1),
-                "findings": [
-                    {
-                        "source": f.source,
-                        "check": f.check,
-                        "file": f.file,
-                        "line": f.line,
-                        "end_line": f.end_line,
-                        "severity": f.severity,
-                        "category": f.category,
-                        "title": f.title,
-                        "confidence": f.confidence,
-                        "verdict": f.verdict,
-                    }
-                    for f in run.report.findings
-                ],
-                "score": score.__dict__,
-            }
+    lock = threading.Lock()
+    stop = threading.Event()
+
+    def work(case: Case) -> None:
+        nonlocal done, stopped_by
+        if stop.is_set():
+            return
+        try:
+            row = _review_case(case, settings, provider, cassette_mode)
+        except LLMError as error:
+            with lock:
+                if stopped_by is None:
+                    stopped_by = f"{error.kind}: {error}"
+            stop.set()
+            return
+        with lock, path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-            handle.flush()
             done += 1
             if on_case is not None:
                 on_case(case.id, row)
+
+    if workers <= 1:
+        for case in todo:
+            work(case)
+            if stop.is_set():
+                break
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(work, todo))
     return RunOutcome(slug, done, skipped, stopped_by, round(time.perf_counter() - started, 1))

@@ -280,6 +280,7 @@ def eval_run(
         bool, typer.Option("--force", help="Re-run cases already in the run file")
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not ask before spending")] = False,
+    workers: Annotated[int, typer.Option(help="Cases reviewed at a time")] = 1,
 ) -> None:
     """Review every case (resumable) and append results to evals/runs/<model>--<prompt>.jsonl."""
     settings = settings_from(provider, model, prompt)
@@ -318,6 +319,7 @@ def eval_run(
         resume=not force,
         on_case=progress,
         cassette_mode=cassette,  # type: ignore[arg-type]
+        workers=max(1, workers),
     )
     typer.echo(
         f"run {outcome.slug}: {outcome.done} done, {outcome.skipped} already there, "

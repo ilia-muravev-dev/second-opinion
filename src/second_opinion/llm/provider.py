@@ -27,7 +27,7 @@ class LLMRequest:
     system: str
     user: str
     output_schema: dict[str, Any]
-    max_tokens: int = 8192
+    max_tokens: int = 16384
     temperature: float = 0.0
     # How much thinking to ask for; reasoning models spend output tokens on it.
     effort: str = "low"

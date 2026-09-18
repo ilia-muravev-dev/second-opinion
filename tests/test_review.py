@@ -153,6 +153,14 @@ def test_rate_limits_stop_the_review_immediately() -> None:
         run_review(DIFF, settings(), fake)
 
 
+def test_other_model_errors_are_reported_and_the_review_goes_on() -> None:
+    fake = FakeProvider([LLMError("bad_request", "no answer", retryable=False)])
+    run = run_review(DIFF, settings(), fake)
+    assert run.report.model_findings == []
+    assert run.report.errors == ["part 1/1: bad_request: no answer"]
+    assert run.report.check_findings == []  # the deterministic layer still reports
+
+
 def test_big_diffs_are_reviewed_in_parts() -> None:
     corpus = Path(__file__).resolve().parents[1] / "evals" / "corpus" / "slotlock" / "pr-2.diff"
     fake = FakeProvider()

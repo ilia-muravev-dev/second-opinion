@@ -41,6 +41,11 @@ def to_finding(raw: ModelFinding, diff: Diff, stats: MergeStats) -> Finding | No
         and (end_line < line or not file.covers_new_line(end_line))
     ):
         end_line = None
+    hunk_range = None
+    if line is not None:
+        hunk = next((h for h in file.hunks if h.new_start <= line <= h.new_end), None)
+        if hunk is not None:
+            hunk_range = (hunk.new_start, hunk.new_end)
     return Finding(
         source="model",
         file=raw.file,

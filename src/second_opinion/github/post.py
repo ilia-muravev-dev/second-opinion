@@ -74,7 +74,8 @@ def post_review(
                 # goes out; if that fails too, the error propagates from upsert_summary below
                 outcome.inline_fell_back = True
                 outcome.notes.append(
-                    f"inline comments could not be posted ({error}); findings are in the summary only"
+                    f"inline comments could not be posted ({error}); "
+                    "findings are in the summary only"
                 )
     summary = render_markdown(report)
     if outcome.notes:

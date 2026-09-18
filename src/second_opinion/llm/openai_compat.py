@@ -49,7 +49,7 @@ class OpenAICompatibleProvider:
             }
         return {"type": "json_object"}
 
-    def _create(self, request: LLMRequest, mode: str) -> Any:
+    def _create(self, request: LLMRequest, mode: str, *, effort: str | None = None) -> Any:
         messages = cast(
             list[ChatCompletionMessageParam],
             [
@@ -60,6 +60,11 @@ class OpenAICompatibleProvider:
         extra_body: dict[str, Any] = {}
         if self.name == "openrouter":
             extra_body["usage"] = {"include": True}
+            # Reasoning models otherwise think until max_tokens and answer with nothing.
+            chosen = effort if effort is not None else request.effort
+            extra_body["reasoning"] = (
+                {"enabled": False} if chosen == "none" else {"effort": chosen, "exclude": True}
+            )
         return self.client.chat.completions.create(
             model=request.model,
             messages=messages,
@@ -72,6 +77,7 @@ class OpenAICompatibleProvider:
     def complete(self, request: LLMRequest) -> LLMResponse:
         started = time.perf_counter()
         mode = self.json_mode
+        effort: str | None = None
         try:
             try:
                 completion = self._create(request, mode)
@@ -80,6 +86,10 @@ class OpenAICompatibleProvider:
                     raise
                 mode = "object"
                 completion = self._create(request, mode)
+            if _answer_eaten_by_reasoning(completion) and request.effort != "none":
+                # the model thought until max_tokens: once more with thinking switched off
+                effort = "none"
+                completion = self._create(request, mode, effort=effort)
         except openai.RateLimitError as error:
             raise LLMError("rate_limit", str(error), retryable=True) from error
         except openai.AuthenticationError as error:
@@ -108,8 +118,15 @@ class OpenAICompatibleProvider:
         prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
         cached = _cached_tokens(usage)
         reported_cost = _reported_cost(usage)
+        text = choice.message.content or ""
+        if not text.strip() and str(choice.finish_reason) == "length":
+            raise LLMError(
+                "bad_request",
+                "the model spent its whole output budget without answering",
+                retryable=False,
+            )
         return LLMResponse(
-            text=strip_fences(choice.message.content or ""),
+            text=strip_fences(text),
             usage=LLMUsage(
                 input_tokens=max(prompt_tokens - cached, 0),
                 cache_read_tokens=cached,
@@ -122,8 +139,15 @@ class OpenAICompatibleProvider:
             cost_usd=reported_cost
             if reported_cost is not None
             else (0.0 if self.name == "ollama" else None),
-            extra={"json_mode": mode},
+            extra={"json_mode": mode, **({"effort": effort} if effort else {})},
         )
+
+
+def _answer_eaten_by_reasoning(completion: Any) -> bool:
+    choice = completion.choices[0] if completion.choices else None
+    if choice is None:
+        return False
+    return not (choice.message.content or "").strip() and str(choice.finish_reason) == "length"
 
 
 def _base_model(model: str) -> str:

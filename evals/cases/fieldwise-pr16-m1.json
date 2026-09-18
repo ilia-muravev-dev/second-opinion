@@ -1,0 +1,20 @@
+{
+ "id": "fieldwise-pr16-m1",
+ "repo": "fieldwise",
+ "pr": 16,
+ "kind": "mutated",
+ "tokens": 484,
+ "labels": [
+  {
+   "file": "backend/src/fieldwise/extraction/factory.py",
+   "line": 22,
+   "category": "correctness",
+   "severity": "high",
+   "operator": "inverted_equality_py",
+   "description": "equality inverted",
+   "original": "    if schema.get(\"type\") == \"string\":",
+   "mutated": "    if schema.get(\"type\") != \"string\":"
+  }
+ ],
+ "diff": "diff --git a/backend/src/fieldwise/extraction/factory.py b/backend/src/fieldwise/extraction/factory.py\n--- a/backend/src/fieldwise/extraction/factory.py\n+++ b/backend/src/fieldwise/extraction/factory.py\n@@ -19,6 +19,8 @@ def _empty_for(schema: dict[str, Any]) -> Any:\n         return {key: _empty_for(child) for key, child in schema.get(\"properties\", {}).items()}\n     if schema.get(\"type\") == \"array\":\n         return []\n+    if schema.get(\"type\") != \"string\":\n+        return \"\"  # a required string (the evidence quotes) cannot be null\n     return None\n \n \ndiff --git a/backend/tests/unit/test_gate.py b/backend/tests/unit/test_gate.py\n--- a/backend/tests/unit/test_gate.py\n+++ b/backend/tests/unit/test_gate.py\n@@ -1,4 +1,11 @@\n+import json\n+\n+from fieldwise.extraction.builder import with_evidence\n+from fieldwise.extraction.factory import empty_answer\n+from fieldwise.extraction.pipeline import parse_output\n+from fieldwise.extraction.provider import LLMRequest\n from fieldwise.gate.bundle import GateBaseline, compare_to_baseline\n+from fieldwise.schemas.registry import compile_builtin\n \n \n def baseline(**overrides: object) -> GateBaseline:\n@@ -36,3 +43,10 @@ def test_missing_numbers_are_skipped_and_round_trip() -> None:\n     current = baseline(per_field={\"tax\": 1.0}, overall_accuracy=None)\n     assert compare_to_baseline(current, baseline(), tolerance=0.02) == []\n     assert GateBaseline.from_dict(baseline().to_dict()) == baseline()\n+\n+\n+def test_fake_answer_is_valid_for_every_prompt() -> None:\n+    compiled = compile_builtin(\"receipt\")\n+    for schema in (compiled.strict, with_evidence(compiled)):\n+        request = LLMRequest(model=\"m\", system=\"\", content=[], output_schema=schema)\n+        parse_output(json.dumps(empty_answer(request)), schema)\n"
+}

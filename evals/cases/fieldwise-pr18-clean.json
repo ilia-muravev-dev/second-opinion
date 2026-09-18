@@ -1,0 +1,9 @@
+{
+ "id": "fieldwise-pr18-clean",
+ "repo": "fieldwise",
+ "pr": 18,
+ "kind": "clean",
+ "tokens": 264,
+ "labels": [],
+ "diff": "diff --git a/backend/.env.example b/backend/.env.example\n--- a/backend/.env.example\n+++ b/backend/.env.example\n@@ -16,9 +16,11 @@ ANTHROPIC_API_KEY=\n #   OPENAI_BASE_URL=https://openrouter.ai/api/v1\n #   OPENAI_API_KEY=sk-or-...\n #   DEFAULT_MODEL=qwen/qwen3.8-27b:free\n-# A local Ollama model (brew install ollama; ollama pull qwen2.5vl:7b):\n+# A local Ollama model (brew install ollama; ollama pull qwen2.5vl:7b). Ollama's default context\n+# is 4096 tokens, too small for prompts with few-shot examples: derive a 16k variant once with\n+#   printf 'FROM qwen2.5vl:7b\\nPARAMETER num_ctx 16384\\n' > Modelfile && ollama create qwen2.5vl:7b-16k -f Modelfile\n #   OPENAI_BASE_URL=http://localhost:11434/v1        (from Docker: http://host.docker.internal:11434/v1)\n #   OPENAI_API_KEY=ollama\n-#   DEFAULT_MODEL=qwen2.5vl:7b\n+#   DEFAULT_MODEL=qwen2.5vl:7b-16k\n OPENAI_BASE_URL=https://openrouter.ai/api/v1\n OPENAI_API_KEY=\n"
+}

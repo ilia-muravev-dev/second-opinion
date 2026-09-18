@@ -40,9 +40,13 @@ class AnthropicProvider:
                     }
                 ],
                 messages=[{"role": "user", "content": request.user}],
-                output_config={
-                    "format": {"type": "json_schema", "schema": request.output_schema},
-                },
+                output_config=cast(
+                    Any,
+                    {
+                        "format": {"type": "json_schema", "schema": request.output_schema},
+                        **({"effort": request.effort} if request.effort != "none" else {}),
+                    },
+                ),
             )
         except anthropic.RateLimitError as error:
             raise LLMError("rate_limit", str(error), retryable=True) from error

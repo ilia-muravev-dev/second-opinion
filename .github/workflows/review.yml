@@ -1,0 +1,27 @@
+name: Second opinion
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: second-opinion-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Review this pull request with the action from this branch
+    # Fork pull requests get no secrets; there is nothing to review them with.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./
+        with:
+          provider: openai
+          model: ${{ vars.SO_MODEL || 'deepseek/deepseek-v4-flash-0731:free' }}
+          openai-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          prompt: ${{ vars.SO_PROMPT_VERSION || 'v1' }}

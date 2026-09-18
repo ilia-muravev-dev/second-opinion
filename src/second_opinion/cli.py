@@ -18,7 +18,7 @@ from second_opinion.config import Settings, load_settings
 from second_opinion.diff import filter_diff, parse_diff
 from second_opinion.findings import SEVERITY_ORDER, Finding
 from second_opinion.github import GitHubClient, event_pull_number, post_review, repo_from_env
-from second_opinion.llm import make_provider
+from second_opinion.llm import LLMError, make_provider
 from second_opinion.pipeline import ReviewRun, run_review
 from second_opinion.report import render_markdown
 
@@ -95,7 +95,7 @@ def review(
         raise typer.BadParameter("--fail-on must be none, high, medium or low")
     llm = None if checks_only else make_provider(settings)
     if diff is not None:
-        run = run_review(
+        run = guarded_review(
             diff.read_text(encoding="utf-8"), settings, llm, title=title, checks_only=checks_only
         )
     else:
@@ -108,7 +108,7 @@ def review(
             raise typer.BadParameter("a GitHub token is required: SO_GITHUB_TOKEN or GITHUB_TOKEN")
         client = GitHubClient(token)
         pull = client.get_pull(slug[0], slug[1], number)
-        run = run_review(
+        run = guarded_review(
             client.get_diff(slug[0], slug[1], number),
             settings,
             llm,
@@ -130,6 +130,35 @@ def review(
         SEVERITY_ORDER[f.severity] <= SEVERITY_ORDER[fail_on] for f in run.report.findings
     ):
         raise typer.Exit(code=2)
+
+
+def guarded_review(
+    diff_text: str,
+    settings: Settings,
+    llm: object | None,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    checks_only: bool = False,
+) -> ReviewRun:
+    """A rate limit or a bad key must not fail the pull request's check: the deterministic
+    findings are still reported, with a note that the model did not run."""
+    try:
+        return run_review(
+            diff_text,
+            settings,
+            llm,  # type: ignore[arg-type]
+            title=title,
+            description=description,
+            checks_only=checks_only,
+        )
+    except LLMError as error:
+        if error.kind not in {"rate_limit", "auth"}:
+            raise
+        typer.echo(f"model review skipped: {error}", err=True)
+        run = run_review(diff_text, settings, None, title=title, description=description)
+        run.report.errors.append(f"the model did not run ({error.kind}): {error}")
+        return run
 
 
 def emit(run: ReviewRun, as_json: bool) -> None:

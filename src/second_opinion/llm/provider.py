@@ -29,8 +29,9 @@ class LLMRequest:
     output_schema: dict[str, Any]
     max_tokens: int = 16384
     temperature: float = 0.0
-    # How much thinking to ask for; reasoning models spend output tokens on it.
-    effort: str = "low"
+    # How much thinking to ask for (none | low | medium | high); reasoning models spend output
+    # tokens on it.
+    effort: str = "none"
     # What identifies this request for the cassette: normally the case id, prompt version and
     # chunk index — never the bytes of the diff, so a cosmetic re-render does not miss.
     cache_key: dict[str, str] = field(default_factory=dict)

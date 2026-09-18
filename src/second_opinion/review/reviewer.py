@@ -94,7 +94,7 @@ def review_diff(
     min_confidence: float,
     max_findings: int,
     case_id: str | None = None,
-    effort: str = "low",
+    effort: str = "none",
 ) -> ReviewResult:
     context = context or ReviewContext()
     system = load_prompt(prompt_version)

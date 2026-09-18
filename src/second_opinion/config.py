@@ -24,8 +24,9 @@ class Settings(BaseSettings):
     max_pr_tokens: int = Field(default=120_000, ge=2_000)
     max_findings: int = Field(default=15, ge=1)
     min_confidence: float = Field(default=0.5, ge=0, le=1)
-    # low | medium | high: thinking budget for models that reason
-    effort: str = "low"
+    # none | low | medium | high: thinking budget for models that reason. Off by default: a
+    # review is a reading task, and free reasoning models think for minutes.
+    effort: str = "none"
     github_token: str | None = None
     log_level: str = "info"
 

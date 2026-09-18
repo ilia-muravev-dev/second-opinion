@@ -1,0 +1,643 @@
+diff --git a/backend/src/fieldwise/evals/runner.py b/backend/src/fieldwise/evals/runner.py
+index b1d4ce2..6be1230 100644
+--- a/backend/src/fieldwise/evals/runner.py
++++ b/backend/src/fieldwise/evals/runner.py
+@@ -27,6 +27,7 @@
+     ExtractionOptions,
+     PreparedExtraction,
+     finish_extraction,
++    pending_repair,
+     prepare_extraction,
+ )
+ from fieldwise.extraction.prompts.registry import get_prompt
+@@ -230,7 +231,13 @@ def run_eval(
+     outcomes = _execute(provider, requests, config, progress=progress, on_status=on_batch_status)
+ 
+     _grade_and_summarise(
+-        session, eval_run, compiled=compiled, prepared=prepared, outcomes=outcomes, config=config
++        session,
++        eval_run,
++        compiled=compiled,
++        prepared=prepared,
++        outcomes=outcomes,
++        config=config,
++        provider=provider,
+     )
+     session.flush()
+     return eval_run
+@@ -244,14 +251,28 @@ def _grade_and_summarise(
+     prepared: list[tuple[PreparedExtraction, dict[str, Any], int]],
+     outcomes: list[LLMResponse | LLMError],
+     config: EvalConfig,
++    provider: LLMProvider,
+ ) -> None:
+     graded: list[DocumentOutcome] = []
+     latencies: list[float] = []
+     costs: list[float] = []
+     counts = Counter[str]()
+     errors: list[dict[str, Any]] = []
+-    for (item, golden, rep), outcome in zip(prepared, outcomes, strict=True):
+-        run = finish_extraction(item, outcome, batch_pricing=config.mode == "batch")
++    for (item, _golden, _rep), outcome in zip(prepared, outcomes, strict=True):
++        finish_extraction(item, outcome, batch_pricing=config.mode == "batch")
++    repairs = [
++        (index, request)
++        for index, (item, _, _) in enumerate(prepared)
++        if (request := pending_repair(item))
++    ]
++    if repairs:
++        repaired = _execute(
++            provider, [r for _, r in repairs], config, progress=None, on_status=None
++        )
++        for (index, _), outcome in zip(repairs, repaired, strict=True):
++            finish_extraction(prepared[index][0], outcome, batch_pricing=config.mode == "batch")
++    for item, golden, rep in prepared:
++        run = item.run
+         counts[run.status] += 1
+         result = EvalResult(
+             eval_run_id=eval_run.id,
+diff --git a/backend/src/fieldwise/extraction/builder.py b/backend/src/fieldwise/extraction/builder.py
+index cb86eb6..f703d97 100644
+--- a/backend/src/fieldwise/extraction/builder.py
++++ b/backend/src/fieldwise/extraction/builder.py
+@@ -14,6 +14,30 @@
+ MODEL_IMAGE_MAX_EDGE = 1568  # the largest edge the vision encoder uses without downscaling
+ 
+ 
++def with_evidence(compiled: CompiledSchema) -> dict[str, Any]:
++    """Wraps the strict schema: {"fields": <values>, "evidence": {<top-level scalar>: string}}."""
++    scalar_paths = [
++        f.path
++        for f in compiled.fields
++        if "." not in f.path and "[]" not in f.path and f.matcher not in ("list", "object")
++    ]
++    return {
++        "type": "object",
++        "properties": {
++            "fields": compiled.strict,
++            "evidence": {
++                "type": "object",
++                "description": "Printed text each top-level amount was read from; empty when null.",
++                "properties": {path: {"type": "string"} for path in scalar_paths},
++                "required": scalar_paths,
++                "additionalProperties": False,
++            },
++        },
++        "required": ["fields", "evidence"],
++        "additionalProperties": False,
++    }
++
++
+ @dataclass(frozen=True)
+ class FewShotExample:
+     document_id: str
+@@ -80,7 +104,7 @@ def build_request(
+         model=model,
+         system=spec.render_system(authored_schema),
+         content=content,
+-        output_schema=compiled.strict,
++        output_schema=with_evidence(compiled) if spec.use_evidence else compiled.strict,
+         effort=effort,
+         max_tokens=max_tokens,
+         cache_key={
+diff --git a/backend/src/fieldwise/extraction/openai_compat.py b/backend/src/fieldwise/extraction/openai_compat.py
+index c2d01ac..f3fea20 100644
+--- a/backend/src/fieldwise/extraction/openai_compat.py
++++ b/backend/src/fieldwise/extraction/openai_compat.py
+@@ -88,13 +88,19 @@ def _response_format(self, request: LLMRequest, mode: str) -> dict[str, Any]:
+         return {"type": "json_object"}
+ 
+     def _create(self, request: LLMRequest, mode: str) -> Any:
+-        messages: list[ChatCompletionMessageParam] = cast(
+-            list[ChatCompletionMessageParam],
+-            [
+-                {"role": "system", "content": request.system},
+-                {"role": "user", "content": to_openai_content(request.content)},
+-            ],
+-        )
++        turns: list[dict[str, Any]] = [
++            {"role": "system", "content": request.system},
++            {"role": "user", "content": to_openai_content(request.content)},
++        ]
++        for turn in request.follow_up:
++            content = turn["content"]
++            turns.append(
++                {
++                    "role": turn["role"],
++                    "content": to_openai_content(content) if isinstance(content, list) else content,
++                }
++            )
++        messages = cast(list[ChatCompletionMessageParam], turns)
+         extra_body: dict[str, Any] = {}
+         if self.name == "openrouter":
+             extra_body["usage"] = {"include": True}
+diff --git a/backend/src/fieldwise/extraction/pipeline.py b/backend/src/fieldwise/extraction/pipeline.py
+index e603205..e988987 100644
+--- a/backend/src/fieldwise/extraction/pipeline.py
++++ b/backend/src/fieldwise/extraction/pipeline.py
+@@ -4,7 +4,8 @@
+ straight-through version."""
+ 
+ import json
+-from dataclasses import dataclass, replace
++from dataclasses import dataclass, field, replace
++from decimal import Decimal
+ from typing import Any
+ 
+ import jsonschema
+@@ -16,10 +17,11 @@
+ from fieldwise.extraction.builder import FewShotExample, build_request
+ from fieldwise.extraction.confidence import score_fields
+ from fieldwise.extraction.pricing import cost_usd
+-from fieldwise.extraction.prompts.registry import get_prompt
++from fieldwise.extraction.prompts.registry import PromptSpec, get_prompt
+ from fieldwise.extraction.provider import LLMError, LLMProvider, LLMRequest, LLMResponse
+ from fieldwise.schemas.compiler import CompiledSchema, compile_schema
+ from fieldwise.storage import Storage
++from fieldwise.values import parse_money
+ 
+ log = structlog.get_logger(__name__)
+ 
+@@ -35,25 +37,27 @@ class ExtractionOptions:
+     batch_pricing: bool = False
+ 
+ 
+-@dataclass(frozen=True)
++@dataclass
+ class PreparedExtraction:
+     run: ExtractionRun
+     request: LLMRequest
+     document: Document
+     compiled: CompiledSchema
+     spans: list[OcrSpan]
++    spec: PromptSpec
++    rounds: list[dict[str, Any]] = field(default_factory=list)  # per round: text + data
+ 
+ 
+ class InvalidOutputError(ValueError):
+     pass
+ 
+ 
+-def parse_output(text: str, strict_schema: dict[str, Any]) -> dict[str, Any]:
++def parse_output(text: str, output_schema: dict[str, Any]) -> dict[str, Any]:
+     try:
+         data = json.loads(text)
+     except json.JSONDecodeError as error:
+         raise InvalidOutputError(f"not JSON: {error.msg} at {error.pos}") from error
+-    validator = jsonschema.Draft202012Validator(strict_schema)
++    validator = jsonschema.Draft202012Validator(output_schema)
+     errors = sorted(validator.iter_errors(data), key=lambda e: list(e.path))
+     if errors:
+         first = errors[0]
+@@ -64,6 +68,56 @@ def parse_output(text: str, strict_schema: dict[str, Any]) -> dict[str, Any]:
+     return data
+ 
+ 
++def split_evidence(data: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
++    """{"fields": ..., "evidence": ...} → (fields, evidence); plain results pass through."""
++    if set(data) == {"fields", "evidence"} and isinstance(data["fields"], dict):
++        evidence = {k: v for k, v in dict(data["evidence"]).items() if v not in (None, "")}
++        return data["fields"], evidence
++    return data, None
++
++
++def inconsistency(result: dict[str, Any]) -> str | None:
++    """Explains why the amounts do not add up, or None. Line totals must reach the subtotal, or
++    the total when nothing sits between them; tolerance 1% (and at least one unit)."""
++    items = result.get("line_items")
++    if not isinstance(items, list) or not items:
++        return None
++    totals = [parse_money(item.get("line_total")) for item in items if isinstance(item, dict)]
++    if any(t is None for t in totals):
++        return None  # some line totals are not printed: nothing to reconcile
++    items_sum = sum((t for t in totals if t is not None), Decimal(0))
++    subtotal = parse_money(result.get("subtotal"))
++    adjustments = [result.get(k) for k in ("discount", "service_charge", "tax")]
++    target, name = (subtotal, "subtotal")
++    if target is None and all(a in (None, "") for a in adjustments):
++        target, name = (parse_money(result.get("total")), "total")
++    if target is None:
++        return None
++    tolerance = max(abs(target) * Decimal("0.01"), Decimal(1))
++    if abs(items_sum - target) <= tolerance:
++        return None
++    return f"the line totals add up to {items_sum} but the {name} is {target}"
++
++
++def repair_request(prepared: PreparedExtraction, previous_text: str, reason: str) -> LLMRequest:
++    """One more turn: the model sees its own answer and what does not add up."""
++    follow_up = [
++        {"role": "assistant", "content": previous_text},
++        {
++            "role": "user",
++            "content": (
++                f"Check again: {reason}. Re-read the receipt and return the corrected JSON object "
++                "only — fix the line items or the amounts, whichever the receipt actually shows."
++            ),
++        },
++    ]
++    return replace(
++        prepared.request,
++        follow_up=follow_up,
++        cache_key={**prepared.request.cache_key, "round": "repair"},
++    )
++
++
+ def document_spans(document: Document) -> list[OcrSpan]:
+     return deserialise_spans(document.ocr_words or [])
+ 
+@@ -121,6 +175,7 @@ def prepare_extraction(
+         document=document,
+         compiled=compiled,
+         spans=document_spans(document),
++        spec=spec,
+     )
+ 
+ 
+@@ -130,32 +185,61 @@ def finish_extraction(
+     *,
+     batch_pricing: bool = False,
+ ) -> ExtractionRun:
++    """Grades one response into the run. Call it again with the repair round's response: usage
++    adds up, and the later answer replaces the earlier one only when it parses."""
+     run = prepared.run
+     if isinstance(outcome, LLMError):
+-        run.status = "failed"
+-        run.error = str(outcome)
+-        log.warning("extraction.failed", document=prepared.document.name, error=str(outcome))
+-        return run
++        return _fail(prepared, "failed", str(outcome))
+     _record_usage(run, outcome, batch=batch_pricing)
+     if outcome.truncated:
+-        run.status = "truncated"
+-        run.error = "stop_reason=max_tokens"
+-        return run
++        return _fail(prepared, "truncated", "stop_reason=max_tokens")
+     try:
+-        data = parse_output(outcome.text, prepared.compiled.strict)
++        data = parse_output(outcome.text, prepared.request.output_schema)
+     except InvalidOutputError as error:
+-        run.status = "failed"
+-        run.error = f"invalid_output: {error}"
+-        log.warning("extraction.invalid_output", document=prepared.document.name, error=str(error))
+-        return run
+-    confidences, boxes = score_fields(data, prepared.spans)
+-    run.result = data
++        return _fail(prepared, "failed", f"invalid_output: {error}")
++    is_repair = bool(prepared.rounds)
++    fields, evidence = split_evidence(data)
++    confidences, boxes = score_fields(fields, prepared.spans)
++    run.result = fields
++    run.evidence = evidence
+     run.confidences = confidences
+     run.boxes = {path: [list(b) for b in box_list] for path, box_list in boxes.items()}
+     run.status = "succeeded"
++    if is_repair:
++        run.repair_rounds = len(prepared.rounds)
++        run.error = None
++    prepared.rounds.append({"text": outcome.text, "fields": fields})
++    return run
++
++
++def _fail(prepared: PreparedExtraction, status: str, message: str) -> ExtractionRun:
++    """A failed round: the first one fails the run, a failed repair keeps the first answer."""
++    run = prepared.run
++    if prepared.rounds:
++        run.error = f"repair skipped: {message}"
++        return run
++    run.status = status
++    run.error = message
++    log.warning("extraction.failed", document=prepared.document.name, status=status, error=message)
+     return run
+ 
+ 
++def pending_repair(prepared: PreparedExtraction) -> LLMRequest | None:
++    """After a successful first round: the repair request when the spec asks for a check and
++    the amounts do not add up; None otherwise (or once a repair has already run)."""
++    run = prepared.run
++    if (
++        not prepared.spec.consistency_check
++        or run.status != "succeeded"
++        or len(prepared.rounds) != 1
++    ):
++        return None
++    reason = inconsistency(run.result or {})
++    if reason is None:
++        return None
++    return repair_request(prepared, prepared.rounds[0]["text"], reason)
++
++
+ def run_extraction(
+     session: Session,
+     storage: Storage,
+@@ -175,26 +259,36 @@ def run_extraction(
+         provider_name=provider.name,
+         examples=examples,
+     )
+-    outcome: LLMResponse | LLMError
+-    try:
+-        outcome = provider.complete(prepared.request)
+-    except LLMError as error:
+-        outcome = error
+-    run = finish_extraction(prepared, outcome, batch_pricing=options.batch_pricing)
++    run = finish_extraction(
++        prepared, _call(provider, prepared.request), batch_pricing=options.batch_pricing
++    )
++    repair = pending_repair(prepared)
++    if repair is not None:
++        finish_extraction(prepared, _call(provider, repair), batch_pricing=options.batch_pricing)
+     session.flush()
+     return run
+ 
+ 
++def _call(provider: LLMProvider, request: LLMRequest) -> LLMResponse | LLMError:
++    try:
++        return provider.complete(request)
++    except LLMError as error:
++        return error
++
++
+ def _record_usage(run: ExtractionRun, response: LLMResponse, *, batch: bool) -> None:
+-    run.input_tokens = response.usage.input_tokens
+-    run.cache_write_tokens = response.usage.cache_write_tokens
+-    run.cache_read_tokens = response.usage.cache_read_tokens
+-    run.output_tokens = response.usage.output_tokens
+-    run.cost_usd = (
++    cost = (
+         response.cost_usd
+         if response.cost_usd is not None
+         else cost_usd(run.model, response.usage, batch=batch)
+     )
+-    run.latency_ms = response.latency_ms
++    run.input_tokens = (run.input_tokens or 0) + response.usage.input_tokens
++    run.cache_write_tokens = (run.cache_write_tokens or 0) + response.usage.cache_write_tokens
++    run.cache_read_tokens = (run.cache_read_tokens or 0) + response.usage.cache_read_tokens
++    run.output_tokens = (run.output_tokens or 0) + response.usage.output_tokens
++    run.cost_usd = (
++        None if cost is None and run.cost_usd is None else (run.cost_usd or 0.0) + (cost or 0.0)
++    )
++    run.latency_ms = (run.latency_ms or 0) + response.latency_ms
+     run.served_model = response.served_model
+     run.request_id = response.request_id
+diff --git a/backend/src/fieldwise/extraction/prompts/registry.py b/backend/src/fieldwise/extraction/prompts/registry.py
+index b107456..63b7cf4 100644
+--- a/backend/src/fieldwise/extraction/prompts/registry.py
++++ b/backend/src/fieldwise/extraction/prompts/registry.py
+@@ -45,6 +45,17 @@ def render_system(self, authored_schema: dict[str, Any]) -> str:
+         use_ocr_text=True,
+         fewshot_k=3,
+     ),
++    "v4": PromptSpec(
++        name="v4",
++        notes=(
++            "v3 plus a per-field evidence quote for the top-level amounts, a self-check that the "
++            "line totals add up, and one repair round when they do not."
++        ),
++        use_ocr_text=True,
++        fewshot_k=3,
++        use_evidence=True,
++        consistency_check=True,
++    ),
+ }
+ 
+ 
+diff --git a/backend/src/fieldwise/extraction/prompts/v4.md b/backend/src/fieldwise/extraction/prompts/v4.md
+new file mode 100644
+index 0000000..ba1f7ee
+--- /dev/null
++++ b/backend/src/fieldwise/extraction/prompts/v4.md
+@@ -0,0 +1,19 @@
++You extract structured data from receipts. You will be shown the receipt image and, when available, the OCR text of the same receipt in reading order. Return the fields of the schema below as JSON, together with evidence for the amounts.
++
++Before the receipt you may be given a few examples: the OCR text of similar receipts together with their correct output. They show the conventions to follow — how line items are split, what counts as a sub-item, how amounts are written — but every value you return must come from the receipt you are asked about, never from an example.
++
++How to read values:
++- Copy every value from the receipt. Do not guess, infer or compute values that are not printed.
++- Amounts are plain numbers. Remove currency symbols, words and separators, and keep the magnitude as printed. On these receipts a "." or "," between groups of three digits is a thousands separator: "60.000" and "60,000" both mean 60000; "5.455" means 5455; "Rp 45.500" means 45500; "12,50" means 12.5. Never turn a thousands separator into a decimal point.
++- Copy item names exactly as printed, including abbreviations and misspellings ("ICE BLACKCOFFE" stays "ICE BLACKCOFFE"). Do not correct or expand them. Leave the quantity and price out of the name.
++- A line item is one purchased product. Toppings, modifiers, options and free add-ons printed under an item (often at 0 or as "+ price") belong to that item and are not separate line items. Voided or cancelled lines are not line items either.
++- quantity is the printed count for the line; use 1 when no count is printed. unit_price is only the price per unit when it is printed separately from the line total.
++- subtotal is the sum before discounts, service charge and tax; total is the final amount to pay. When only one amount is printed, it is the total, not the subtotal.
++- Use null for anything that is not printed. An empty field is better than a guessed one.
++
++Check yourself before answering: the line totals should add up to the subtotal — or to the total when no subtotal, discount, service charge or tax is printed. If they do not, re-read the receipt: you probably missed an item, merged two lines, counted a sub-item as an item, or misread a digit.
++
++Evidence: for every top-level amount you fill in (subtotal, discount, service charge, tax, total, cash paid, change, card paid, item count), quote in the evidence object the exact printed text of the line it came from, e.g. "TOTAL 45,500". Use an empty string when the field is null.
++
++Schema:
++$schema_json
+diff --git a/backend/src/fieldwise/extraction/provider.py b/backend/src/fieldwise/extraction/provider.py
+index d24a538..4ba69f5 100644
+--- a/backend/src/fieldwise/extraction/provider.py
++++ b/backend/src/fieldwise/extraction/provider.py
+@@ -36,9 +36,15 @@ class LLMRequest:
+     # Stable identity of the request for the cassette provider: what it was built from, not the
+     # bytes it contains (image encoding must not change the key).
+     cache_key: dict[str, str] = field(default_factory=dict)
++    # Follow-up turns after the main user message (assistant answer, user repair instruction).
++    follow_up: list[dict[str, Any]] = field(default_factory=list)
+ 
+     def messages(self) -> list[MessageParam]:
+-        return [{"role": "user", "content": cast(list[ContentBlockParam], self.content)}]
++        first: MessageParam = {
++            "role": "user",
++            "content": cast(list[ContentBlockParam], self.content),
++        }
++        return [first, *cast(list[MessageParam], self.follow_up)]
+ 
+     def system_blocks(self) -> list[TextBlockParam]:
+         return [{"type": "text", "text": self.system, "cache_control": {"type": "ephemeral"}}]
+diff --git a/backend/tests/integration/test_api.py b/backend/tests/integration/test_api.py
+index d815a3a..3cdd8d3 100644
+--- a/backend/tests/integration/test_api.py
++++ b/backend/tests/integration/test_api.py
+@@ -64,7 +64,7 @@ def test_meta_endpoints(api: tuple[TestClient, Delayed, Delayed, Delayed]) -> No
+     client = api[0]
+     assert client.get("/health").json()["status"] == "ok"
+     prompts = client.get("/prompts").json()
+-    assert [p["name"] for p in prompts] == ["v1", "v2", "v3"]
++    assert [p["name"] for p in prompts] == ["v1", "v2", "v3", "v4"]
+     assert prompts[2]["fewshot_k"] == 3
+     assert any(m["id"] == "claude-sonnet-5" for m in client.get("/models").json())
+ 
+diff --git a/backend/tests/integration/test_pipeline.py b/backend/tests/integration/test_pipeline.py
+index 2607985..b77fabe 100644
+--- a/backend/tests/integration/test_pipeline.py
++++ b/backend/tests/integration/test_pipeline.py
+@@ -16,6 +16,17 @@
+ 
+ pytestmark = pytest.mark.integration
+ 
++EVIDENCE_KEYS = [
++    "subtotal",
++    "discount",
++    "service_charge",
++    "tax",
++    "total",
++    "cash_paid",
++    "change",
++    "card_paid",
++    "item_count",
++]
+ FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "cord"
+ STEM = "cord-v2_validation_0000"
+ 
+@@ -126,3 +137,68 @@ def explode(request: LLMRequest) -> dict[str, object]:
+     assert failed.status == "failed"
+     assert failed.error == "rate_limit: 429"
+     assert failed.input_tokens is None
++
++
++def test_repair_round_fixes_an_inconsistent_answer(
++    session: Session, storage: LocalStorage, receipt: tuple[object, object, dict[str, object]]
++) -> None:
++    document, schema, golden = receipt
++    wrong = json.loads(json.dumps(golden))
++    wrong["total"] = 55500.0  # items add up to 45500
++    answers = iter(
++        [
++            {"fields": wrong, "evidence": {k: "" for k in EVIDENCE_KEYS}},
++            {
++                "fields": golden,
++                "evidence": {**{k: "" for k in EVIDENCE_KEYS}, "total": "TOTAL 45,500"},
++            },
++        ]
++    )
++    provider = FakeProvider(lambda req: next(answers))
++
++    run = run_extraction(
++        session,
++        storage,
++        document,  # type: ignore[arg-type]
++        schema=schema,  # type: ignore[arg-type]
++        options=ExtractionOptions(prompt="v4", fewshot_k=0),
++        provider=provider,
++    )
++
++    assert run.status == "succeeded"
++    assert run.repair_rounds == 1
++    assert run.result == golden
++    assert run.evidence == {"total": "TOTAL 45,500"}
++    assert len(provider.requests) == 2
++    repair = provider.requests[1]
++    assert repair.cache_key["round"] == "repair"
++    assert repair.follow_up[0]["role"] == "assistant"
++    assert "add up to 45500" in repair.follow_up[1]["content"]
++
++
++def test_failed_repair_keeps_the_first_answer(
++    session: Session, storage: LocalStorage, receipt: tuple[object, object, dict[str, object]]
++) -> None:
++    document, schema, golden = receipt
++    wrong = json.loads(json.dumps(golden))
++    wrong["total"] = 55500.0
++    calls = {"n": 0}
++
++    def responder(request: LLMRequest) -> dict[str, object]:
++        calls["n"] += 1
++        if calls["n"] == 1:
++            return {"fields": wrong, "evidence": {k: "" for k in EVIDENCE_KEYS}}
++        raise LLMError("rate_limit", "429", retryable=True)
++
++    run = run_extraction(
++        session,
++        storage,
++        document,  # type: ignore[arg-type]
++        schema=schema,  # type: ignore[arg-type]
++        options=ExtractionOptions(prompt="v4", fewshot_k=0),
++        provider=FakeProvider(responder),
++    )
++    assert run.status == "succeeded"
++    assert run.result == wrong
++    assert run.repair_rounds == 0
++    assert run.error == "repair skipped: rate_limit: 429"
+diff --git a/backend/tests/unit/test_repair.py b/backend/tests/unit/test_repair.py
+new file mode 100644
+index 0000000..f420298
+--- /dev/null
++++ b/backend/tests/unit/test_repair.py
+@@ -0,0 +1,84 @@
++import json
++from pathlib import Path
++
++from fieldwise.documents.cord_import import map_gt_parse
++from fieldwise.extraction.builder import with_evidence
++from fieldwise.extraction.pipeline import inconsistency, split_evidence
++from fieldwise.extraction.prompts.registry import get_prompt
++from fieldwise.schemas.registry import compile_builtin
++
++FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "cord"
++
++
++def golden() -> dict[str, object]:
++    return map_gt_parse(json.loads((FIXTURES / "cord-v2_validation_0000.json").read_text()))
++
++
++def test_evidence_schema_wraps_the_values_and_lists_top_level_amounts() -> None:
++    wrapped = with_evidence(compile_builtin("receipt"))
++    assert wrapped["required"] == ["fields", "evidence"]
++    assert wrapped["properties"]["fields"] == compile_builtin("receipt").strict
++    evidence = wrapped["properties"]["evidence"]
++    assert evidence["required"] == [
++        "subtotal",
++        "discount",
++        "service_charge",
++        "tax",
++        "total",
++        "cash_paid",
++        "change",
++        "card_paid",
++        "item_count",
++    ]
++    assert evidence["additionalProperties"] is False
++
++
++def test_split_evidence() -> None:
++    fields, evidence = split_evidence(
++        {"fields": {"total": 1}, "evidence": {"total": "TOTAL 1", "tax": ""}}
++    )
++    assert fields == {"total": 1}
++    assert evidence == {"total": "TOTAL 1"}
++    assert split_evidence({"total": 1}) == ({"total": 1}, None)
++
++
++def test_inconsistency_detects_sums_that_do_not_add_up() -> None:
++    consistent = golden()  # 16500 + 13000 + 16000 = 45500 = total, no subtotal
++    assert inconsistency(consistent) is None
++
++    off = golden()
++    off["total"] = 55500.0
++    assert inconsistency(off) == "the line totals add up to 45500.0 but the total is 55500.0"
++
++    with_subtotal = golden()
++    with_subtotal["subtotal"] = 45500.0
++    with_subtotal["tax"] = 4550.0
++    with_subtotal["total"] = 50050.0
++    assert inconsistency(with_subtotal) is None  # items reach the subtotal; tax explains the total
++
++    taxed_without_subtotal = golden()
++    taxed_without_subtotal["tax"] = 4550.0
++    taxed_without_subtotal["total"] = 50050.0
++    assert inconsistency(taxed_without_subtotal) is None  # nothing to reconcile against
++
++    missing_line_total = golden()
++    missing_line_total["line_items"][0]["line_total"] = None  # type: ignore[index]
++    assert inconsistency(missing_line_total) is None
++
++    small_rounding = golden()
++    small_rounding["total"] = 45500.9
++    assert inconsistency(small_rounding) is None
++    assert inconsistency({"line_items": [], "total": 1.0}) is None
++
++
++def test_v4_spec_switches_everything_on() -> None:
++    spec = get_prompt("v4")
++    assert (spec.use_ocr_text, spec.fewshot_k, spec.use_evidence, spec.consistency_check) == (
++        True,
++        3,
++        True,
++        True,
++    )
++    rendered = spec.render_system({"title": "receipt", "type": "object", "properties": {}})
++    assert "evidence" in rendered
++    assert "add up" in rendered

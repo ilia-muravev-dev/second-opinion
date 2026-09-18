@@ -1,0 +1,18 @@
+diff --git a/backend/.env.example b/backend/.env.example
+index 48b0d83..1d9fd42 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -16,9 +16,11 @@ ANTHROPIC_API_KEY=
+ #   OPENAI_BASE_URL=https://openrouter.ai/api/v1
+ #   OPENAI_API_KEY=sk-or-...
+ #   DEFAULT_MODEL=qwen/qwen3.8-27b:free
+-# A local Ollama model (brew install ollama; ollama pull qwen2.5vl:7b):
++# A local Ollama model (brew install ollama; ollama pull qwen2.5vl:7b). Ollama's default context
++# is 4096 tokens, too small for prompts with few-shot examples: derive a 16k variant once with
++#   printf 'FROM qwen2.5vl:7b\nPARAMETER num_ctx 16384\n' > Modelfile && ollama create qwen2.5vl:7b-16k -f Modelfile
+ #   OPENAI_BASE_URL=http://localhost:11434/v1        (from Docker: http://host.docker.internal:11434/v1)
+ #   OPENAI_API_KEY=ollama
+-#   DEFAULT_MODEL=qwen2.5vl:7b
++#   DEFAULT_MODEL=qwen2.5vl:7b-16k
+ OPENAI_BASE_URL=https://openrouter.ai/api/v1
+ OPENAI_API_KEY=

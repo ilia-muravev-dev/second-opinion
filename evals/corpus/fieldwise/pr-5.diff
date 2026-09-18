@@ -1,0 +1,1407 @@
+diff --git a/backend/evals/cassettes/000642f7355958cbf9521a8593834330.json b/backend/evals/cassettes/000642f7355958cbf9521a8593834330.json
+new file mode 100644
+index 0000000..2d32267
+--- /dev/null
++++ b/backend/evals/cassettes/000642f7355958cbf9521a8593834330.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "88c35bbd2e2a634e89f2c5bfd30f7b530b1082c1f4e6e7cb3cb913f0b46c3868",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 32940,
++    "request_id": "gen-1789741441-xfuIoBL4BftjXqoAkrfn",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 156000,\n  \"change\": 0,\n  \"discount\": null,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 156000,\n      \"name\": \"Propolis Cair\",\n      \"quantity\": 1,\n      \"unit_price\": 156000\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": 156000,\n  \"tax\": null,\n  \"total\": null\n}",
++    "usage": {
++      "cache_read_tokens": 0,
++      "cache_write_tokens": 0,
++      "input_tokens": 1873,
++      "output_tokens": 1290
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/163689d9ec5b8eb362c3532197c8f4ac.json b/backend/evals/cassettes/163689d9ec5b8eb362c3532197c8f4ac.json
+new file mode 100644
+index 0000000..062f7c5
+--- /dev/null
++++ b/backend/evals/cassettes/163689d9ec5b8eb362c3532197c8f4ac.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "5852cbe48df03646524e717e987eb3d0ac329a52fd192070b5fda1222a053789",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 23214,
++    "request_id": "gen-1789740683-BLUXn5YKbGn9GVeRpE11",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 91000,\n  \"change\": null,\n  \"discount\": null,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 17500,\n      \"name\": \"J.STB PROMO\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 46000,\n      \"name\": \"Y.B.BAT\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 27500,\n      \"name\": \"Y.BASO PROM\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": null,\n  \"tax\": null,\n  \"total\": 91000\n}",
++    "usage": {
++      "cache_read_tokens": 0,
++      "cache_write_tokens": 0,
++      "input_tokens": 2591,
++      "output_tokens": 479
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/1b171572308676e6af4ea8fb3f533433.json b/backend/evals/cassettes/1b171572308676e6af4ea8fb3f533433.json
+new file mode 100644
+index 0000000..6b15c6a
+--- /dev/null
++++ b/backend/evals/cassettes/1b171572308676e6af4ea8fb3f533433.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "1c091eb7436b3e5a813eb6492c0350ef4eb14e3fdad78d42da35df669c757292",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 67197,
++    "request_id": "gen-1789740932-uUqMwAKMFoXxaYelNSmw",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 50000,\n  \"change\": 4000,\n  \"discount\": null,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 13000,\n      \"name\": \"EGG TART\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 24000,\n      \"name\": \"CHOCO CUSTARD PASTRY\",\n      \"quantity\": 2,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 9000,\n      \"name\": \"REDBEAN BREAD\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": null,\n  \"tax\": null,\n  \"total\": 46000\n}",
++    "usage": {
++      "cache_read_tokens": 0,
++      "cache_write_tokens": 0,
++      "input_tokens": 2492,
++      "output_tokens": 1857
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/26f8345fd4a676be0c2a615a5277bdae.json b/backend/evals/cassettes/26f8345fd4a676be0c2a615a5277bdae.json
+new file mode 100644
+index 0000000..5721913
+--- /dev/null
++++ b/backend/evals/cassettes/26f8345fd4a676be0c2a615a5277bdae.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "8f73f0c4803ea8815040a50e3389d4f3fa15e8c28cb6d50ea9854f6f6c22bd63",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 35283,
++    "request_id": "gen-1789740795-yBub5uCfNf3kB4qvFDlt",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 11000,\n  \"change\": null,\n  \"discount\": null,\n  \"item_count\": 1,\n  \"line_items\": [\n    {\n      \"line_total\": 11000,\n      \"name\": \"DONAT GULA\",\n      \"quantity\": 1,\n      \"unit_price\": 11000\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": 11000,\n  \"tax\": null,\n  \"total\": 11000\n}",
++    "usage": {
++      "cache_read_tokens": 1280,
++      "cache_write_tokens": 0,
++      "input_tokens": 1203,
++      "output_tokens": 459
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/328e2fc4a6b45f72238e1f4aad78694a.json b/backend/evals/cassettes/328e2fc4a6b45f72238e1f4aad78694a.json
+new file mode 100644
+index 0000000..958c2cc
+--- /dev/null
++++ b/backend/evals/cassettes/328e2fc4a6b45f72238e1f4aad78694a.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "810d3545f4105b19757c4b8b35934a477cde8cd1875302d9092315d2f960ef93",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 20986,
++    "request_id": "gen-1789740999-ALHpsdn2nKYVcRUvo9sz",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 111000,\n  \"change\": null,\n  \"discount\": null,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 100000,\n      \"name\": \"Kupon 15\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 909,\n      \"name\": \"ADD CHICKEN BOX\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": 100909,\n  \"tax\": 10091,\n  \"total\": 111000\n}",
++    "usage": {
++      "cache_read_tokens": 1280,
++      "cache_write_tokens": 0,
++      "input_tokens": 619,
++      "output_tokens": 872
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/48274841fb3a6512a3d63eefd1c5ed57.json b/backend/evals/cassettes/48274841fb3a6512a3d63eefd1c5ed57.json
+new file mode 100644
+index 0000000..39c1c45
+--- /dev/null
++++ b/backend/evals/cassettes/48274841fb3a6512a3d63eefd1c5ed57.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "58716693a6c0733358e66e64d7064a5a845424280bb55f9b5fa137b1af8c92fe",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 80562,
++    "request_id": "gen-1789741020-Ysr4mSrNUcyw5f4cJJ0x",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": 50000,\n  \"cash_paid\": null,\n  \"change\": null,\n  \"discount\": null,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 45455,\n      \"name\": \"[REG] BLACK SAKURA\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": 45455,\n  \"tax\": 4545,\n  \"total\": 50000\n}",
++    "usage": {
++      "cache_read_tokens": 1280,
++      "cache_write_tokens": 0,
++      "input_tokens": 1232,
++      "output_tokens": 2241
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/4d5624d963772ec5cf976ba554fa12e8.json b/backend/evals/cassettes/4d5624d963772ec5cf976ba554fa12e8.json
+new file mode 100644
+index 0000000..2a7a352
+--- /dev/null
++++ b/backend/evals/cassettes/4d5624d963772ec5cf976ba554fa12e8.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "b5f8a3a9a5431b8e38a8e5a16011d6a5a457f7ae4c4ef31da77e589c0b1ad882",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 15463,
++    "request_id": "gen-1789741153-9NZvdNeDPgxuQsUrcwQS",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": 120000,\n  \"cash_paid\": null,\n  \"change\": 0,\n  \"discount\": null,\n  \"item_count\": 2,\n  \"line_items\": [\n    {\n      \"line_total\": 120000,\n      \"name\": \"BLUS WANITA\",\n      \"quantity\": 1,\n      \"unit_price\": 120000\n    },\n    {\n      \"line_total\": 0,\n      \"name\": \"SHOPPING BAG\",\n      \"quantity\": 1,\n      \"unit_price\": 880\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": null,\n  \"tax\": null,\n  \"total\": 120000\n}",
++    "usage": {
++      "cache_read_tokens": 0,
++      "cache_write_tokens": 0,
++      "input_tokens": 1921,
++      "output_tokens": 594
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/63389e8591f3075be57375627c823c0e.json b/backend/evals/cassettes/63389e8591f3075be57375627c823c0e.json
+new file mode 100644
+index 0000000..5ccfcfd
+--- /dev/null
++++ b/backend/evals/cassettes/63389e8591f3075be57375627c823c0e.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "8f3eee7068c96e86cdb2e4b5c53085cb5e1439462edd55c373548cb1962801ad",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 50625,
++    "request_id": "gen-1789740831-bcvX0iD5MKru8lYpy0It",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 200000,\n  \"change\": 28400,\n  \"discount\": 19400,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 82000,\n      \"name\": \"ICE BLACKCOFFE\",\n      \"quantity\": 2,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 61000,\n      \"name\": \"AVOCADO COFFEE\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 51000,\n      \"name\": \"CHIKEN KATSU FF\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": 194000,\n  \"tax\": null,\n  \"total\": 174600\n}",
++    "usage": {
++      "cache_read_tokens": 1280,
++      "cache_write_tokens": 0,
++      "input_tokens": 1284,
++      "output_tokens": 1648
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/65251eb6a394f5428348252a91fff024.json b/backend/evals/cassettes/65251eb6a394f5428348252a91fff024.json
+new file mode 100644
+index 0000000..57397dc
+--- /dev/null
++++ b/backend/evals/cassettes/65251eb6a394f5428348252a91fff024.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "0b63b666b54ea615d1d05733ee2c6fc24f20e1a6c77b333872fa80fff28b2c48",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 50488,
++    "request_id": "gen-1789740881-bcxuHReFDuQ8WwuBzJf2",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 31000,\n  \"change\": null,\n  \"discount\": null,\n  \"item_count\": 1,\n  \"line_items\": [\n    {\n      \"line_total\": 28182,\n      \"name\": \"TRAD KY TOAST CARTE\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": 28182,\n  \"tax\": 2818,\n  \"total\": 31000\n}",
++    "usage": {
++      "cache_read_tokens": 1280,
++      "cache_write_tokens": 0,
++      "input_tokens": 1499,
++      "output_tokens": 438
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/70fecbfea4c56e0f2bcca6e0c0d36c39.json b/backend/evals/cassettes/70fecbfea4c56e0f2bcca6e0c0d36c39.json
+new file mode 100644
+index 0000000..b268e27
+--- /dev/null
++++ b/backend/evals/cassettes/70fecbfea4c56e0f2bcca6e0c0d36c39.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "2a5d18c199bdbb75010a54430429cf694b35bdca8bf560d1d0db1fbb090dedb8",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 11322,
++    "request_id": "gen-1789741122-j9AWAbBkE6ILN6yWNMrq",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 20000,\n  \"change\": 3000,\n  \"discount\": null,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 17000,\n      \"name\": \"CINNAMON SUGAR\",\n      \"quantity\": 1,\n      \"unit_price\": 17000\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": 17000,\n  \"tax\": null,\n  \"total\": 17000\n}",
++    "usage": {
++      "cache_read_tokens": 1280,
++      "cache_write_tokens": 0,
++      "input_tokens": 612,
++      "output_tokens": 382
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/83cfb767a717e510eb6e6a733e11a055.json b/backend/evals/cassettes/83cfb767a717e510eb6e6a733e11a055.json
+new file mode 100644
+index 0000000..b39b89f
+--- /dev/null
++++ b/backend/evals/cassettes/83cfb767a717e510eb6e6a733e11a055.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "9dcf1f9f86c909b762767cb07d1cc0db30773d556154ce42e0210f65270ee39d",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 77379,
++    "request_id": "gen-1789741186-ZPQyFbqx4dMITV3imuw2",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 200000,\n  \"change\": 18565,\n  \"discount\": 100000,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 38000,\n      \"name\": \"RedVelvet Cheese Slc\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 55000,\n      \"name\": \"Chicken Baked Rice\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 65000,\n      \"name\": \"Fish n Chips\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 35000,\n      \"name\": \"Mushroom Soup\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 25000,\n      \"name\": \"Chamomile\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 20000,\n      \"name\": \"Iced Tea\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    }\n  ],\n  \"service_charge\": 17850,\n  \"subtotal\": 238000,\n  \"tax\": 25585,\n  \"total\": 281435\n}",
++    "usage": {
++      "cache_read_tokens": 1280,
++      "cache_write_tokens": 0,
++      "input_tokens": 1586,
++      "output_tokens": 1784
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/8935e4437fb9bc98c27ff639587f3c07.json b/backend/evals/cassettes/8935e4437fb9bc98c27ff639587f3c07.json
+new file mode 100644
+index 0000000..a8aded6
+--- /dev/null
++++ b/backend/evals/cassettes/8935e4437fb9bc98c27ff639587f3c07.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "d92479ab212713e7a65e56aacc5e68c0713597476608cbc394d997971043010b",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 19656,
++    "request_id": "gen-1789741133-AHf2tGXd21Bfh3Zuxj7K",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 230000,\n  \"change\": 0,\n  \"discount\": null,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 230000,\n      \"name\": \"BANABERRY FRESH CREAM CAK\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": null,\n  \"tax\": null,\n  \"total\": 230000\n}",
++    "usage": {
++      "cache_read_tokens": 0,
++      "cache_write_tokens": 0,
++      "input_tokens": 1868,
++      "output_tokens": 380
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/96a7175e1858def7fc3f74e1592134a8.json b/backend/evals/cassettes/96a7175e1858def7fc3f74e1592134a8.json
+new file mode 100644
+index 0000000..01524a1
+--- /dev/null
++++ b/backend/evals/cassettes/96a7175e1858def7fc3f74e1592134a8.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "f1cd67a7d67d04ba8d5b685553b1b5addbf2039d5954ab08c92139c0ad88a796",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 22619,
++    "request_id": "gen-1789741263-K1DlF4sXc0IddJuM4EjA",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 70000,\n  \"change\": 7000,\n  \"discount\": null,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 25000,\n      \"name\": \"Lemon Tea (L)\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 38000,\n      \"name\": \"Caramel Small\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": null,\n  \"tax\": null,\n  \"total\": 63000\n}",
++    "usage": {
++      "cache_read_tokens": 1280,
++      "cache_write_tokens": 0,
++      "input_tokens": 599,
++      "output_tokens": 450
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/ace98f7914c6cf3d623e02d339d28ee8.json b/backend/evals/cassettes/ace98f7914c6cf3d623e02d339d28ee8.json
+new file mode 100644
+index 0000000..b7cc0a8
+--- /dev/null
++++ b/backend/evals/cassettes/ace98f7914c6cf3d623e02d339d28ee8.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "0411c4d9beb9be65165fdb70c2b60f8bbf9035cc9661be2b8d4c73bbfcff7972",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 21649,
++    "request_id": "gen-1789741101-Rq43cQ9TXDx44Wd1LLI7",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 50000,\n  \"change\": 14000,\n  \"discount\": null,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 36000,\n      \"name\": \"Bumbu Kaldu Ayam\",\n      \"quantity\": 1,\n      \"unit_price\": 36000\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": 36000,\n  \"tax\": null,\n  \"total\": null\n}",
++    "usage": {
++      "cache_read_tokens": 0,
++      "cache_write_tokens": 0,
++      "input_tokens": 1880,
++      "output_tokens": 737
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/af45c11fbe20103c881aa02675b6e150.json b/backend/evals/cassettes/af45c11fbe20103c881aa02675b6e150.json
+new file mode 100644
+index 0000000..b015c7a
+--- /dev/null
++++ b/backend/evals/cassettes/af45c11fbe20103c881aa02675b6e150.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "eef326565b3945217a69afd84c893afdffd03a2f487943661c2423e6d6ec0d7d",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 27231,
++    "request_id": "gen-1789741286-txefXKtfdKupZhU2eSu8",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 100000,\n  \"change\": 30000,\n  \"discount\": null,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 59091,\n      \"name\": \"[LG] BLACK SAKURA\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 0,\n      \"name\": \"LONGAN\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 0,\n      \"name\": \"ROASTED ALMOND\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 0,\n      \"name\": \"NANGGO\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 4545,\n      \"name\": \"MINERAL WATER (bundling) 5k\",\n      \"quantity\": 1,\n      \"unit_price\": null\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": 63636,\n  \"tax\": 6364,\n  \"total\": 70000\n}",
++    "usage": {
++      "cache_read_tokens": 0,
++      "cache_write_tokens": 0,
++      "input_tokens": 2540,
++      "output_tokens": 789
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/c922655fb1df19317cf148682e074a7b.json b/backend/evals/cassettes/c922655fb1df19317cf148682e074a7b.json
+new file mode 100644
+index 0000000..75e056d
+--- /dev/null
++++ b/backend/evals/cassettes/c922655fb1df19317cf148682e074a7b.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "b076921ed83bdf900cab539f219cac8dddfaa4a99c13f7d66d7303d9f8c4c8c7",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 17204,
++    "request_id": "gen-1789741474-MX4wLixV25ed4OGWtSc5",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": null,\n  \"change\": null,\n  \"discount\": null,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 60000,\n      \"name\": \"AMBUSH DBL CHS\",\n      \"quantity\": 4,\n      \"unit_price\": null\n    },\n    {\n      \"line_total\": 100000,\n      \"name\": \"AMBUSH CHS BUR\",\n      \"quantity\": 10,\n      \"unit_price\": null\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": 160000,\n  \"tax\": 16000,\n  \"total\": 176000\n}",
++    "usage": {
++      "cache_read_tokens": 1280,
++      "cache_write_tokens": 0,
++      "input_tokens": 597,
++      "output_tokens": 639
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/faec4a139089b4fe751d7f0b3d9eecf8.json b/backend/evals/cassettes/faec4a139089b4fe751d7f0b3d9eecf8.json
+new file mode 100644
+index 0000000..b33223b
+--- /dev/null
++++ b/backend/evals/cassettes/faec4a139089b4fe751d7f0b3d9eecf8.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "ca4bf89562b3f55c2c91968ca221a629e48386744a5322596d9c7345648ada13",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 17355,
++    "request_id": "gen-1789741168-iDZHnCQYo5CgiP5GOFFr",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": null,\n  \"cash_paid\": 52000,\n  \"change\": 700,\n  \"discount\": null,\n  \"item_count\": null,\n  \"line_items\": [\n    {\n      \"line_total\": 43000,\n      \"name\": \"BASO KUAH\",\n      \"quantity\": 1,\n      \"unit_price\": 43000\n    },\n    {\n      \"line_total\": 3000,\n      \"name\": \"A.MINERAL GELAS\",\n      \"quantity\": 1,\n      \"unit_price\": 3000\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": 46000,\n  \"tax\": 4664,\n  \"total\": 51300\n}",
++    "usage": {
++      "cache_read_tokens": 0,
++      "cache_write_tokens": 0,
++      "input_tokens": 2467,
++      "output_tokens": 682
++    }
++  }
++}
+diff --git a/backend/evals/cassettes/ff79fede366a57266926b0de5f4ca35a.json b/backend/evals/cassettes/ff79fede366a57266926b0de5f4ca35a.json
+new file mode 100644
+index 0000000..d34a62a
+--- /dev/null
++++ b/backend/evals/cassettes/ff79fede366a57266926b0de5f4ca35a.json
+@@ -0,0 +1,27 @@
++{
++  "key": {
++    "document": "8612d04b70f430f3aef07fbbd5200e382dcc4152b344cc2eff9f735f05a257c8",
++    "fewshot": "",
++    "ocr_text": "True",
++    "prompt": "v2",
++    "schema": "receipt@1"
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "response": {
++    "cost_usd": 0.0,
++    "extra": {
++      "json_mode": "schema"
++    },
++    "latency_ms": 52535,
++    "request_id": "gen-1789741518-aQWkfgrZxMrrGByDe7Pw",
++    "served_model": "nex-agi/nex-n2.5-pro:free",
++    "stop_reason": "end_turn",
++    "text": "{\n  \"card_paid\": 60000,\n  \"cash_paid\": null,\n  \"change\": null,\n  \"discount\": -60000,\n  \"item_count\": 2,\n  \"line_items\": [\n    {\n      \"line_total\": 60000,\n      \"name\": \"-TICKET CP\",\n      \"quantity\": 2,\n      \"unit_price\": 60000\n    }\n  ],\n  \"service_charge\": null,\n  \"subtotal\": 60000,\n  \"tax\": 5455,\n  \"total\": 60000\n}",
++    "usage": {
++      "cache_read_tokens": 1280,
++      "cache_write_tokens": 0,
++      "input_tokens": 448,
++      "output_tokens": 1368
++    }
++  }
++}
+diff --git a/backend/src/fieldwise/cli.py b/backend/src/fieldwise/cli.py
+index 4e98305..a7b4359 100644
+--- a/backend/src/fieldwise/cli.py
++++ b/backend/src/fieldwise/cli.py
+@@ -16,7 +16,7 @@
+ from fieldwise.db import migrate
+ from fieldwise.db.engine import get_engine, session_factory
+ from fieldwise.db.models import Document, EvalRun
+-from fieldwise.documents.cord_import import import_split
++from fieldwise.documents.cord_import import import_split, remap_labels
+ from fieldwise.documents.ocr import RapidOcrProvider
+ from fieldwise.documents.ocr_service import ocr_document, pending_documents
+ from fieldwise.evals.report import print_summary, render_comparison, write_report
+@@ -112,6 +112,18 @@ def ingest_cord(
+                 console.print(f"  [red]{error}[/red]")
+ 
+ 
++@ingest_app.command("remap")
++def ingest_remap(schema: Annotated[str, typer.Option(help="Schema name.")] = "receipt") -> None:
++    """Re-map stored dataset annotations after a parser or mapper change."""
++    with session_factory()() as session:
++        schema_row = get_schema(session, schema)
++        if schema_row is None:
++            raise typer.BadParameter(f"schema {schema!r} is not in the database")
++        changed = remap_labels(session, schema_row)
++        session.commit()
++        console.print(f"re-mapped labels: {changed} changed")
++
++
+ @ocr_app.command("run")
+ def ocr_run(
+     split: Annotated[str | None, typer.Option(help="Only documents of this split.")] = None,
+diff --git a/backend/src/fieldwise/db/migrations/versions/0004_golden_raw.py b/backend/src/fieldwise/db/migrations/versions/0004_golden_raw.py
+new file mode 100644
+index 0000000..22a0aa6
+--- /dev/null
++++ b/backend/src/fieldwise/db/migrations/versions/0004_golden_raw.py
+@@ -0,0 +1,25 @@
++"""raw annotation on golden labels
++
++Revision ID: 0004
++Revises: 0003
++Create Date: 2026-09-18
++"""
++
++from collections.abc import Sequence
++
++import sqlalchemy as sa
++from alembic import op
++from sqlalchemy.dialects import postgresql
++
++revision: str = "0004"
++down_revision: str | None = "0003"
++branch_labels: str | Sequence[str] | None = None
++depends_on: str | Sequence[str] | None = None
++
++
++def upgrade() -> None:
++    op.add_column("golden_labels", sa.Column("raw", postgresql.JSONB(), nullable=True))
++
++
++def downgrade() -> None:
++    op.drop_column("golden_labels", "raw")
+diff --git a/backend/src/fieldwise/db/models.py b/backend/src/fieldwise/db/models.py
+index 0b23d92..460bedd 100644
+--- a/backend/src/fieldwise/db/models.py
++++ b/backend/src/fieldwise/db/models.py
+@@ -80,6 +80,8 @@ class GoldenLabel(Base):
+     )
+     schema_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("schemas.id", ondelete="CASCADE"))
+     data: Mapped[dict[str, Any]] = mapped_column(JSONB)
++    # The dataset's own annotation, kept so labels can be re-mapped when the mapper improves.
++    raw: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+     source: Mapped[str] = mapped_column(String(16))  # dataset | correction
+     created_at: Mapped[datetime] = mapped_column(
+         DateTime(timezone=True), default=utcnow, server_default=func.now()
+diff --git a/backend/src/fieldwise/documents/cord_import.py b/backend/src/fieldwise/documents/cord_import.py
+index 5dc25e9..948b071 100644
+--- a/backend/src/fieldwise/documents/cord_import.py
++++ b/backend/src/fieldwise/documents/cord_import.py
+@@ -118,12 +118,15 @@ def map_gt_parse(gt_parse: dict[str, Any]) -> dict[str, Any]:
+         if not isinstance(raw, dict):
+             continue
+         quantity = parse_int(raw.get("cnt"))
++        line_total = _money(raw.get("price"))
++        if line_total is None:  # some receipts only print the item subtotal
++            line_total = _money(raw.get("itemsubtotal"))
+         items.append(
+             {
+                 "name": _text(raw.get("nm")),
+                 "quantity": quantity if quantity is not None else 1,
+                 "unit_price": _money(raw.get("unitprice")),
+-                "line_total": _money(raw.get("price")),
++                "line_total": line_total,
+             }
+         )
+     sub_total = _first_dict(gt_parse.get("sub_total"))
+@@ -186,6 +189,7 @@ def import_rows(
+                     document_id=document.id,
+                     schema_id=schema.id,
+                     data=map_gt_parse(row.gt_parse),
++                    raw=row.gt_parse,
+                     source="dataset",
+                 )
+             )
+@@ -207,3 +211,22 @@ def import_split(
+         raise RuntimeError("receipt schema missing from the database; run `fieldwise schemas sync`")
+     paths = download_split(split)
+     return import_rows(session, storage, iter_rows(split, paths), schema, limit=limit)
++
++
++def remap_labels(session: Session, schema: Schema) -> int:
++    """Re-runs the mapper over stored raw annotations (after a mapper or parser fix)."""
++    labels = session.scalars(
++        select(GoldenLabel).where(
++            GoldenLabel.schema_id == schema.id, GoldenLabel.source == "dataset"
++        )
++    ).all()
++    changed = 0
++    for label in labels:
++        if label.raw is None:
++            continue
++        data = map_gt_parse(label.raw)
++        if data != label.data:
++            label.data = data
++            changed += 1
++    session.flush()
++    return changed
+diff --git a/backend/src/fieldwise/extraction/prompts/registry.py b/backend/src/fieldwise/extraction/prompts/registry.py
+index e8efe59..b6d14ea 100644
+--- a/backend/src/fieldwise/extraction/prompts/registry.py
++++ b/backend/src/fieldwise/extraction/prompts/registry.py
+@@ -27,6 +27,15 @@ def render_system(self, authored_schema: dict[str, Any]) -> str:
+ 
+ PROMPTS: dict[str, PromptSpec] = {
+     "v1": PromptSpec(name="v1", notes="Baseline: instructions and the schema; the image only."),
++    "v2": PromptSpec(
++        name="v2",
++        notes=(
++            "OCR text in reading order next to the image; explicit rules for thousands "
++            "separators, names copied as printed, sub-items folded into their parent, "
++            "subtotal vs total, null when absent."
++        ),
++        use_ocr_text=True,
++    ),
+ }
+ 
+ 
+diff --git a/backend/src/fieldwise/extraction/prompts/v2.md b/backend/src/fieldwise/extraction/prompts/v2.md
+new file mode 100644
+index 0000000..63fa5fb
+--- /dev/null
++++ b/backend/src/fieldwise/extraction/prompts/v2.md
+@@ -0,0 +1,13 @@
++You extract structured data from receipts. You will be shown the receipt image and, when available, the OCR text of the same receipt in reading order. Return the fields of the schema below as JSON.
++
++How to read values:
++- Copy every value from the receipt. Do not guess, infer or compute values that are not printed.
++- Amounts are plain numbers. Remove currency symbols, words and separators, and keep the magnitude as printed. On these receipts a "." or "," between groups of three digits is a thousands separator: "60.000" and "60,000" both mean 60000; "5.455" means 5455; "Rp 45.500" means 45500; "12,50" means 12.5. Never turn a thousands separator into a decimal point.
++- Copy item names exactly as printed, including abbreviations and misspellings ("ICE BLACKCOFFE" stays "ICE BLACKCOFFE"). Do not correct or expand them. Leave the quantity and price out of the name.
++- A line item is one purchased product. Toppings, modifiers, options and free add-ons printed under an item (often at 0 or as "+ price") belong to that item and are not separate line items. Voided or cancelled lines are not line items either.
++- quantity is the printed count for the line; use 1 when no count is printed. unit_price is only the price per unit when it is printed separately from the line total.
++- subtotal is the sum before discounts, service charge and tax; total is the final amount to pay. When only one amount is printed, it is the total, not the subtotal.
++- Use null for anything that is not printed. An empty field is better than a guessed one.
++
++Schema:
++$schema_json
+diff --git a/backend/src/fieldwise/values.py b/backend/src/fieldwise/values.py
+index d8b491d..bdea307 100644
+--- a/backend/src/fieldwise/values.py
++++ b/backend/src/fieldwise/values.py
+@@ -27,7 +27,8 @@ def parse_money(raw: object) -> Decimal | None:
+ def _parse_money_text(raw: str) -> Decimal | None:
+     text = _MONEY_JUNK.sub("", raw)
+     negative = text.startswith("-") or (text.startswith("(") and text.endswith(")"))
+-    digits = text.strip("-()")
++    # "Rp. 111,000" leaves a stray leading "."; a separator at either end is never a separator.
++    digits = text.strip("-()").strip(".,")
+     if not any(ch.isdigit() for ch in digits):
+         return None
+     try:
+diff --git a/backend/tests/integration/test_documents.py b/backend/tests/integration/test_documents.py
+index dea7f00..8694adc 100644
+--- a/backend/tests/integration/test_documents.py
++++ b/backend/tests/integration/test_documents.py
+@@ -6,7 +6,7 @@
+ from sqlalchemy.orm import Session
+ 
+ from fieldwise.db.models import Document, GoldenLabel
+-from fieldwise.documents.cord_import import CordRow, import_rows
++from fieldwise.documents.cord_import import CordRow, import_rows, remap_labels
+ from fieldwise.documents.service import create_document
+ from fieldwise.schemas.registry import get_schema, load_builtin, sync_builtins, upsert_schema
+ from fieldwise.storage import LocalStorage
+@@ -74,3 +74,20 @@ def test_import_rows_creates_documents_with_golden_labels(
+     by_doc = {label.document_id: label.data for label in labels}
+     assert by_doc[documents[0].id]["line_items"][0]["line_total"] == 1000.0
+     assert by_doc[documents[1].id]["total"] == 2000.0
++
++
++def test_remap_labels_recomputes_data_from_the_raw_annotation(
++    session: Session, storage: LocalStorage
++) -> None:
++    schema = sync_builtins(session)[0]
++    row = CordRow("validation", 0, _jpeg(30), {"total": {"total_price": "Rp. 111,000"}})
++    import_rows(session, storage, iter([row]), schema)
++    label = session.scalars(select(GoldenLabel)).one()
++    assert label.raw == {"total": {"total_price": "Rp. 111,000"}}
++    assert label.data["total"] == 111000.0
++
++    label.data = {**label.data, "total": 111.0}  # what an older parser produced
++    session.flush()
++    assert remap_labels(session, schema) == 1
++    assert session.scalars(select(GoldenLabel)).one().data["total"] == 111000.0
++    assert remap_labels(session, schema) == 0
+diff --git a/backend/tests/unit/test_cord_import.py b/backend/tests/unit/test_cord_import.py
+index 0284d23..aba93b0 100644
+--- a/backend/tests/unit/test_cord_import.py
++++ b/backend/tests/unit/test_cord_import.py
+@@ -57,6 +57,22 @@ def test_map_gt_parse_accepts_single_menu_dict_and_list_sections() -> None:
+     assert golden["item_count"] == 2
+ 
+ 
++def test_map_gt_parse_falls_back_to_the_item_subtotal() -> None:
++    golden = map_gt_parse(
++        {
++            "menu": {
++                "nm": "BLUS WANITA",
++                "unitprice": "@120,000",
++                "cnt": "1",
++                "itemsubtotal": "120,000",
++            }
++        }
++    )
++    assert golden["line_items"] == [
++        {"name": "BLUS WANITA", "quantity": 1, "unit_price": 120000.0, "line_total": 120000.0}
++    ]
++
++
+ def test_map_gt_parse_of_empty_ground_truth() -> None:
+     golden = map_gt_parse({})
+     assert golden["line_items"] == []
+diff --git a/backend/tests/unit/test_values.py b/backend/tests/unit/test_values.py
+index 77e1111..1a8891a 100644
+--- a/backend/tests/unit/test_values.py
++++ b/backend/tests/unit/test_values.py
+@@ -17,6 +17,10 @@
+         ("1,234.50", Decimal("1234.50")),
+         ("Rp 60.000", Decimal("60000")),
+         ("IDR60.000,-", Decimal("60000")),
++        ("Rp. 111,000", Decimal("111000")),
++        ("Rp.91,000", Decimal("91000")),
++        ("@120,000", Decimal("120000")),
++        ("36000.", Decimal("36000")),
+         ("-60.000", Decimal("-60000")),
+         ("(60.000)", Decimal("-60000")),
+         ("@ 15.000", Decimal("15000")),
+diff --git a/docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-37d35c46.json b/docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-31250643.json
+similarity index 80%
+rename from docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-37d35c46.json
+rename to docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-31250643.json
+index 1b00226..e64c9f8 100644
+--- a/docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-37d35c46.json
++++ b/docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-31250643.json
+@@ -1,5 +1,5 @@
+ {
+-  "id": "37d35c46-e332-46f8-b2ce-4ad893f3357f",
++  "id": "31250643-4256-4370-9daa-14e04f23d605",
+   "prompt_version": "v1",
+   "model": "nex-agi/nex-n2.5-pro:free",
+   "effort": "low",
+@@ -13,10 +13,10 @@
+   "succeeded": 19,
+   "truncated": 1,
+   "failed": 0,
+-  "overall_accuracy": 0.8338028169014085,
+-  "lenient_accuracy": 0.8450704225352113,
+-  "value_accuracy": 0.8514851485148515,
+-  "doc_exact_rate": 0.3157894736842105,
++  "overall_accuracy": 0.8450704225352113,
++  "lenient_accuracy": 0.856338028169014,
++  "value_accuracy": 0.8627450980392157,
++  "doc_exact_rate": 0.3684210526315789,
+   "cost_usd": 0.0,
+   "cost_per_doc": 0.0,
+   "p50_ms": 29585,
+@@ -42,17 +42,17 @@
+     "total": {
+       "matcher": "money",
+       "n": 19,
+-      "accuracy": 0.7368421052631579,
++      "accuracy": 0.7894736842105263,
+       "ci": [
+-        0.5120803155892935,
+-        0.8819376166045982
++        0.5666528575973392,
++        0.9149246150840843
+       ],
+-      "lenient": 0.7368421052631579,
++      "lenient": 0.7894736842105263,
+       "value_n": 18,
+-      "value_accuracy": 0.7222222222222222,
++      "value_accuracy": 0.7777777777777778,
+       "counts": {
+-        "wrong": 4,
+-        "correct": 13,
++        "wrong": 3,
++        "correct": 14,
+         "null_match": 1,
+         "missing": 1
+       }
+@@ -129,18 +129,18 @@
+     "cash_paid": {
+       "matcher": "money",
+       "n": 19,
+-      "accuracy": 0.8421052631578947,
++      "accuracy": 0.8947368421052632,
+       "ci": [
+-        0.6243407235682331,
+-        0.9447962896007217
++        0.686054495051583,
++        0.9706420586049034
+       ],
+-      "lenient": 0.8421052631578947,
++      "lenient": 0.8947368421052632,
+       "value_n": 14,
+-      "value_accuracy": 0.7857142857142857,
++      "value_accuracy": 0.8571428571428571,
+       "counts": {
+         "null_match": 5,
+-        "correct": 11,
+-        "wrong": 3
++        "correct": 12,
++        "wrong": 2
+       }
+     },
+     "item_count": {
+@@ -196,18 +196,18 @@
+     "line_items[].line_total": {
+       "matcher": "money",
+       "n": 46,
+-      "accuracy": 0.6956521739130435,
++      "accuracy": 0.7391304347826086,
+       "ci": [
+-        0.5519408125976183,
+-        0.8092032919255109
++        0.5974057019172069,
++        0.8439926480555066
+       ],
+-      "lenient": 0.6956521739130435,
+-      "value_n": 38,
+-      "value_accuracy": 0.8421052631578947,
++      "lenient": 0.7391304347826086,
++      "value_n": 40,
++      "value_accuracy": 0.85,
+       "counts": {
+         "wrong": 6,
+-        "correct": 32,
+-        "spurious": 8
++        "correct": 34,
++        "spurious": 6
+       }
+     },
+     "line_items[].unit_price": {
+@@ -248,13 +248,13 @@
+   "lists": {
+     "line_items": {
+       "docs": 19,
+-      "exact_rate": 0.3684210526315789,
++      "exact_rate": 0.42105263157894735,
+       "ci": [
+-        0.19149272376273843,
+-        0.5896084250184328
++        0.2314162039203038,
++        0.6372444853483988
+       ],
+-      "item_precision": 0.6086956521739131,
+-      "item_recall": 0.7,
++      "item_precision": 0.6521739130434783,
++      "item_recall": 0.75,
+       "golden_items": 40,
+       "predicted_items": 46
+     }
+@@ -266,6 +266,6 @@
+       "error": "stop_reason=max_tokens"
+     }
+   ],
+-  "created_at": "2026-09-18T13:58:19.022229+00:00",
+-  "notes": "v1 baseline, free model, reasoning effort low"
++  "created_at": "2026-09-18T14:06:22.813765+00:00",
++  "notes": "v1 baseline, re-scored after the golden parser fix (Rp. prefix)"
+ }
+diff --git a/docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-37d35c46.md b/docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-31250643.md
+similarity index 71%
+rename from docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-37d35c46.md
+rename to docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-31250643.md
+index 9d3688d..821faa7 100644
+--- a/docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-37d35c46.md
++++ b/docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-31250643.md
+@@ -1,17 +1,17 @@
+-# Eval 37d35c46 — v1 / nex-agi/nex-n2.5-pro:free
++# Eval 31250643 — v1 / nex-agi/nex-n2.5-pro:free
+ 
+ prompt **v1** · model `nex-agi/nex-n2.5-pro:free` · effort low · few-shot k=0 · OCR text off · provider openrouter · split test · 20 docs x 1 rep(s) · mode sync
+ 
+-Run at 2026-09-18 13:58 UTC · v1 baseline, free model, reasoning effort low
++Run at 2026-09-18 14:06 UTC · v1 baseline, re-scored after the golden parser fix (Rp. prefix)
+ 
+ ## Summary
+ 
+ | Metric | Value |
+ | --- | ---: |
+-| Field accuracy (strict, every leaf) | 83.4% |
+-| Value accuracy (leaves with a golden value) | 85.1% |
+-| Field accuracy (lenient: fuzzy text counts) | 84.5% |
+-| Documents fully correct | 31.6% |
++| Field accuracy (strict, every leaf) | 84.5% |
++| Value accuracy (leaves with a golden value) | 86.3% |
++| Field accuracy (lenient: fuzzy text counts) | 85.6% |
++| Documents fully correct | 36.8% |
+ | Extractions succeeded / truncated / failed | 19 / 1 / 0 |
+ | Cost total / per document | $0.0000 / $0.0000 |
+ | Latency p50 / p95 | 29585 ms / 124146 ms |
+@@ -21,16 +21,16 @@ Run at 2026-09-18 13:58 UTC · v1 baseline, free model, reasoning effort low
+ | Field | Matcher | n | Accuracy | 95% CI | Value acc. (n) | wrong | missing | spurious |
+ | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+ | `tax` | money | 19 | 84.2% | 62-94 | 62.5% (8) | 3 | 0 | 0 |
+-| `total` | money | 19 | 73.7% | 51-88 | 72.2% (18) | 4 | 1 | 0 |
++| `total` | money | 19 | 78.9% | 57-91 | 77.8% (18) | 3 | 1 | 0 |
+ | `change` | money | 19 | 100.0% | 83-100 | 100.0% (11) | 0 | 0 | 0 |
+ | `discount` | money | 19 | 89.5% | 69-97 | 66.7% (3) | 1 | 0 | 1 |
+ | `subtotal` | money | 19 | 78.9% | 57-91 | 76.9% (13) | 3 | 0 | 1 |
+ | `card_paid` | money | 19 | 94.7% | 75-99 | 75.0% (4) | 1 | 0 | 0 |
+-| `cash_paid` | money | 19 | 84.2% | 62-94 | 78.6% (14) | 3 | 0 | 0 |
++| `cash_paid` | money | 19 | 89.5% | 69-97 | 85.7% (14) | 2 | 0 | 0 |
+ | `item_count` | integer | 19 | 100.0% | 83-100 | 100.0% (4) | 0 | 0 | 0 |
+ | `line_items[].name` | text | 46 | 73.9% | 60-84 | 85.0% (40) | 2 | 0 | 6 |
+ | `line_items[].quantity` | integer | 46 | 87.0% | 74-94 | 100.0% (40) | 0 | 0 | 6 |
+-| `line_items[].line_total` | money | 46 | 69.6% | 55-81 | 84.2% (38) | 6 | 0 | 8 |
++| `line_items[].line_total` | money | 46 | 73.9% | 60-84 | 85.0% (40) | 6 | 0 | 6 |
+ | `line_items[].unit_price` | money | 46 | 80.4% | 67-89 | 75.0% (8) | 2 | 0 | 7 |
+ | `service_charge` | money | 19 | 100.0% | 83-100 | 100.0% (1) | 0 | 0 | 0 |
+ 
+@@ -38,7 +38,7 @@ Run at 2026-09-18 13:58 UTC · v1 baseline, free model, reasoning effort low
+ 
+ | List | Docs | Exact match | 95% CI | Item precision | Item recall | Items (golden / predicted) |
+ | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+-| `line_items` | 19 | 36.8% | 19-59 | 60.9% | 70.0% | 40 / 46 |
++| `line_items` | 19 | 42.1% | 23-64 | 65.2% | 75.0% | 40 / 46 |
+ 
+ ## Not scored (infrastructure or output failures)
+ 
+diff --git a/docs/evals/2026-09-18-v2-nex-agi-nex-n2.5-pro-free-894681a4.json b/docs/evals/2026-09-18-v2-nex-agi-nex-n2.5-pro-free-894681a4.json
+new file mode 100644
+index 0000000..0e3fcb3
+--- /dev/null
++++ b/docs/evals/2026-09-18-v2-nex-agi-nex-n2.5-pro-free-894681a4.json
+@@ -0,0 +1,272 @@
++{
++  "id": "894681a4-b7d5-41d4-8c28-f0c3dd5b3cd5",
++  "prompt_version": "v2",
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "effort": "low",
++  "fewshot_k": 0,
++  "use_ocr_text": true,
++  "provider": "openrouter",
++  "split": "test",
++  "mode": "sync",
++  "doc_count": 20,
++  "reps": 1,
++  "succeeded": 18,
++  "truncated": 0,
++  "failed": 2,
++  "overall_accuracy": 0.910828025477707,
++  "lenient_accuracy": 0.9171974522292994,
++  "value_accuracy": 0.9505494505494505,
++  "doc_exact_rate": 0.5,
++  "cost_usd": 0.0,
++  "cost_per_doc": 0.0,
++  "p50_ms": 23214,
++  "p95_ms": 80562,
++  "per_field": {
++    "tax": {
++      "matcher": "money",
++      "n": 18,
++      "accuracy": 1.0,
++      "ci": [
++        0.8241154494176252,
++        1.0
++      ],
++      "lenient": 1.0,
++      "value_n": 8,
++      "value_accuracy": 1.0,
++      "counts": {
++        "correct": 8,
++        "null_match": 10
++      }
++    },
++    "total": {
++      "matcher": "money",
++      "n": 18,
++      "accuracy": 0.9444444444444444,
++      "ci": [
++        0.7424220019799247,
++        0.9901250641690756
++      ],
++      "lenient": 0.9444444444444444,
++      "value_n": 17,
++      "value_accuracy": 0.9411764705882353,
++      "counts": {
++        "correct": 16,
++        "null_match": 1,
++        "missing": 1
++      }
++    },
++    "change": {
++      "matcher": "money",
++      "n": 18,
++      "accuracy": 0.9444444444444444,
++      "ci": [
++        0.7424220019799247,
++        0.9901250641690756
++      ],
++      "lenient": 0.9444444444444444,
++      "value_n": 11,
++      "value_accuracy": 0.9090909090909091,
++      "counts": {
++        "null_match": 7,
++        "wrong": 1,
++        "correct": 10
++      }
++    },
++    "discount": {
++      "matcher": "money",
++      "n": 18,
++      "accuracy": 0.9444444444444444,
++      "ci": [
++        0.7424220019799247,
++        0.9901250641690756
++      ],
++      "lenient": 0.9444444444444444,
++      "value_n": 2,
++      "value_accuracy": 1.0,
++      "counts": {
++        "correct": 2,
++        "null_match": 15,
++        "spurious": 1
++      }
++    },
++    "subtotal": {
++      "matcher": "money",
++      "n": 18,
++      "accuracy": 0.8888888888888888,
++      "ci": [
++        0.6719975513339578,
++        0.9689811315464172
++      ],
++      "lenient": 0.8888888888888888,
++      "value_n": 12,
++      "value_accuracy": 0.9166666666666666,
++      "counts": {
++        "correct": 11,
++        "null_match": 5,
++        "wrong": 1,
++        "spurious": 1
++      }
++    },
++    "card_paid": {
++      "matcher": "money",
++      "n": 18,
++      "accuracy": 1.0,
++      "ci": [
++        0.8241154494176252,
++        1.0
++      ],
++      "lenient": 1.0,
++      "value_n": 3,
++      "value_accuracy": 1.0,
++      "counts": {
++        "correct": 3,
++        "null_match": 15
++      }
++    },
++    "cash_paid": {
++      "matcher": "money",
++      "n": 18,
++      "accuracy": 1.0,
++      "ci": [
++        0.8241154494176252,
++        1.0
++      ],
++      "lenient": 1.0,
++      "value_n": 14,
++      "value_accuracy": 1.0,
++      "counts": {
++        "null_match": 4,
++        "correct": 14
++      }
++    },
++    "item_count": {
++      "matcher": "integer",
++      "n": 18,
++      "accuracy": 1.0,
++      "ci": [
++        0.8241154494176252,
++        1.0
++      ],
++      "lenient": 1.0,
++      "value_n": 4,
++      "value_accuracy": 1.0,
++      "counts": {
++        "correct": 4,
++        "null_match": 14
++      }
++    },
++    "line_items[].name": {
++      "matcher": "text",
++      "n": 38,
++      "accuracy": 0.8157894736842105,
++      "ci": [
++        0.6658083165848865,
++        0.907783515467425
++      ],
++      "lenient": 0.868421052631579,
++      "value_n": 34,
++      "value_accuracy": 0.9117647058823529,
++      "counts": {
++        "correct": 31,
++        "fuzzy": 2,
++        "spurious": 4,
++        "wrong": 1
++      }
++    },
++    "line_items[].quantity": {
++      "matcher": "integer",
++      "n": 38,
++      "accuracy": 0.8947368421052632,
++      "ci": [
++        0.7586916879980553,
++        0.9582981020673341
++      ],
++      "lenient": 0.8947368421052632,
++      "value_n": 34,
++      "value_accuracy": 1.0,
++      "counts": {
++        "correct": 34,
++        "spurious": 4
++      }
++    },
++    "line_items[].line_total": {
++      "matcher": "money",
++      "n": 38,
++      "accuracy": 0.8421052631578947,
++      "ci": [
++        0.6958287736272311,
++        0.9255623777627731
++      ],
++      "lenient": 0.8421052631578947,
++      "value_n": 34,
++      "value_accuracy": 0.9411764705882353,
++      "counts": {
++        "correct": 32,
++        "spurious": 4,
++        "wrong": 2
++      }
++    },
++    "line_items[].unit_price": {
++      "matcher": "money",
++      "n": 38,
++      "accuracy": 0.8421052631578947,
++      "ci": [
++        0.6958287736272311,
++        0.9255623777627731
++      ],
++      "lenient": 0.8421052631578947,
++      "value_n": 8,
++      "value_accuracy": 0.875,
++      "counts": {
++        "spurious": 5,
++        "null_match": 25,
++        "correct": 7,
++        "wrong": 1
++      }
++    },
++    "service_charge": {
++      "matcher": "money",
++      "n": 18,
++      "accuracy": 1.0,
++      "ci": [
++        0.8241154494176252,
++        1.0
++      ],
++      "lenient": 1.0,
++      "value_n": 1,
++      "value_accuracy": 1.0,
++      "counts": {
++        "null_match": 17,
++        "correct": 1
++      }
++    }
++  },
++  "lists": {
++    "line_items": {
++      "docs": 18,
++      "exact_rate": 0.6666666666666666,
++      "ci": [
++        0.4374906934425036,
++        0.8372144563633714
++      ],
++      "item_precision": 0.7631578947368421,
++      "item_recall": 0.8529411764705882,
++      "golden_items": 34,
++      "predicted_items": 38
++    }
++  },
++  "errors": [
++    {
++      "document": "cord-v2/test/0002",
++      "status": "failed",
++      "error": "rate_limit: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1789776000000'}, 'limit_source': 'openrouter_free_tier_daily', 'remedy_hint': 'Wait for the daily reset (see X-RateLimit-Reset), or purchase credits to raise your free-model daily limit.', 'provider_name': None}}, 'user_id': 'user_3JVEOj9bxnAR9NDSFOC5SWUvdbF'}"
++    },
++    {
++      "document": "cord-v2/test/0017",
++      "status": "failed",
++      "error": "rate_limit: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-RateLimit-Limit': '50', 'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1789776000000'}, 'limit_source': 'openrouter_free_tier_daily', 'remedy_hint': 'Wait for the daily reset (see X-RateLimit-Reset), or purchase credits to raise your free-model daily limit.', 'provider_name': None}}, 'user_id': 'user_3JVEOj9bxnAR9NDSFOC5SWUvdbF'}"
++    }
++  ],
++  "created_at": "2026-09-18T14:25:17.068364+00:00",
++  "notes": "v2: OCR text + normalisation rules"
++}
+diff --git a/docs/evals/2026-09-18-v2-nex-agi-nex-n2.5-pro-free-894681a4.md b/docs/evals/2026-09-18-v2-nex-agi-nex-n2.5-pro-free-894681a4.md
+new file mode 100644
+index 0000000..749683b
+--- /dev/null
++++ b/docs/evals/2026-09-18-v2-nex-agi-nex-n2.5-pro-free-894681a4.md
+@@ -0,0 +1,46 @@
++# Eval 894681a4 — v2 / nex-agi/nex-n2.5-pro:free
++
++prompt **v2** · model `nex-agi/nex-n2.5-pro:free` · effort low · few-shot k=0 · OCR text on · provider openrouter · split test · 20 docs x 1 rep(s) · mode sync
++
++Run at 2026-09-18 14:25 UTC · v2: OCR text + normalisation rules
++
++## Summary
++
++| Metric | Value |
++| --- | ---: |
++| Field accuracy (strict, every leaf) | 91.1% |
++| Value accuracy (leaves with a golden value) | 95.1% |
++| Field accuracy (lenient: fuzzy text counts) | 91.7% |
++| Documents fully correct | 50.0% |
++| Extractions succeeded / truncated / failed | 18 / 0 / 2 |
++| Cost total / per document | $0.0000 / $0.0000 |
++| Latency p50 / p95 | 23214 ms / 80562 ms |
++
++## Per field
++
++| Field | Matcher | n | Accuracy | 95% CI | Value acc. (n) | wrong | missing | spurious |
++| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
++| `tax` | money | 18 | 100.0% | 82-100 | 100.0% (8) | 0 | 0 | 0 |
++| `total` | money | 18 | 94.4% | 74-99 | 94.1% (17) | 0 | 1 | 0 |
++| `change` | money | 18 | 94.4% | 74-99 | 90.9% (11) | 1 | 0 | 0 |
++| `discount` | money | 18 | 94.4% | 74-99 | 100.0% (2) | 0 | 0 | 1 |
++| `subtotal` | money | 18 | 88.9% | 67-97 | 91.7% (12) | 1 | 0 | 1 |
++| `card_paid` | money | 18 | 100.0% | 82-100 | 100.0% (3) | 0 | 0 | 0 |
++| `cash_paid` | money | 18 | 100.0% | 82-100 | 100.0% (14) | 0 | 0 | 0 |
++| `item_count` | integer | 18 | 100.0% | 82-100 | 100.0% (4) | 0 | 0 | 0 |
++| `line_items[].name` | text | 38 | 81.6% | 67-91 | 91.2% (34) | 1 | 0 | 4 |
++| `line_items[].quantity` | integer | 38 | 89.5% | 76-96 | 100.0% (34) | 0 | 0 | 4 |
++| `line_items[].line_total` | money | 38 | 84.2% | 70-93 | 94.1% (34) | 2 | 0 | 4 |
++| `line_items[].unit_price` | money | 38 | 84.2% | 70-93 | 87.5% (8) | 1 | 0 | 5 |
++| `service_charge` | money | 18 | 100.0% | 82-100 | 100.0% (1) | 0 | 0 | 0 |
++
++## Lists
++
++| List | Docs | Exact match | 95% CI | Item precision | Item recall | Items (golden / predicted) |
++| --- | ---: | ---: | ---: | ---: | ---: | ---: |
++| `line_items` | 18 | 66.7% | 44-84 | 76.3% | 85.3% | 34 / 38 |
++
++## Not scored (infrastructure or output failures)
++
++- `cord-v2/test/0002` — failed: rate_limit: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-Rate
++- `cord-v2/test/0017` — failed: rate_limit: Error code: 429 - {'error': {'message': 'Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day', 'code': 429, 'metadata': {'headers': {'X-Rate
+diff --git a/docs/evals/compare-31250643-894681a4.md b/docs/evals/compare-31250643-894681a4.md
+new file mode 100644
+index 0000000..4c7c99a
+--- /dev/null
++++ b/docs/evals/compare-31250643-894681a4.md
+@@ -0,0 +1,25 @@
++| Metric | v1 / nex-agi/nex-n2.5-pro:free | v2 / nex-agi/nex-n2.5-pro:free |
++| --- | ---: | ---: |
++| Field accuracy (strict) | 84.5% | 91.1% |
++| Value accuracy | 86.3% | 95.1% |
++| Field accuracy (lenient) | 85.6% | 91.7% |
++| Documents fully correct | 36.8% | 50.0% |
++| Cost per document | $0.0000 | $0.0000 |
++| Latency p50 | 29585 ms | 23214 ms |
++| Not scored (trunc./failed) | 1/0 | 0/2 |
++| `tax` | 84.2% | 100.0% |
++| `total` | 78.9% | 94.4% |
++| `change` | 100.0% | 94.4% |
++| `discount` | 89.5% | 94.4% |
++| `subtotal` | 78.9% | 88.9% |
++| `card_paid` | 94.7% | 100.0% |
++| `cash_paid` | 89.5% | 100.0% |
++| `item_count` | 100.0% | 100.0% |
++| `line_items[].name` | 73.9% | 81.6% |
++| `line_items[].quantity` | 87.0% | 89.5% |
++| `line_items[].line_total` | 73.9% | 84.2% |
++| `line_items[].unit_price` | 80.4% | 84.2% |
++| `service_charge` | 100.0% | 100.0% |
++| `line_items` exact | 42.1% | 66.7% |
++
++Runs: `31250643`, `894681a4`

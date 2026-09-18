@@ -1,0 +1,497 @@
+diff --git a/.github/dependabot.yml b/.github/dependabot.yml
+index fad5ae1..858d972 100644
+--- a/.github/dependabot.yml
++++ b/.github/dependabot.yml
+@@ -7,6 +7,13 @@ updates:
+     groups:
+       dev-dependencies:
+         dependency-type: development
++    ignore:
++      # TypeScript 6 is the last JS-based compiler line tsdown's d.ts bundling is verified against.
++      - dependency-name: typescript
++        update-types: ['version-update:semver-major']
++      # @types/node follows the Node LTS this package is tested on.
++      - dependency-name: '@types/node'
++        update-types: ['version-update:semver-major']
+   - package-ecosystem: github-actions
+     directory: /
+     schedule:
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index f106c79..194b140 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -18,7 +18,7 @@ jobs:
+         node: [22, 24]
+     steps:
+       - uses: actions/checkout@v7
+-      - uses: pnpm/action-setup@v4
++      - uses: pnpm/action-setup@v6
+       - uses: actions/setup-node@v7
+         with:
+           node-version: ${{ matrix.node }}
+@@ -30,3 +30,26 @@ jobs:
+       - run: pnpm build
+       - run: pnpm size
+ 
++
++  e2e:
++    name: Playwright race reproduction
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v7
++      - uses: pnpm/action-setup@v6
++      - uses: actions/setup-node@v7
++        with:
++          node-version: 24
++          cache: pnpm
++      - run: pnpm install --frozen-lockfile
++      - run: pnpm exec playwright install --with-deps chromium
++      - run: pnpm e2e
++      - name: Publish the race summary
++        if: always()
++        run: cat test-results/race-summary.md >> "$GITHUB_STEP_SUMMARY" || true
++      - uses: actions/upload-artifact@v4
++        if: failure()
++        with:
++          name: playwright-report
++          path: playwright-report
++          retention-days: 7
+diff --git a/test/e2e/fixtures/app/index.html b/test/e2e/fixtures/app/index.html
+new file mode 100644
+index 0000000..8794024
+--- /dev/null
++++ b/test/e2e/fixtures/app/index.html
+@@ -0,0 +1,54 @@
++<!doctype html>
++<html lang="en">
++  <head>
++    <meta charset="utf-8" />
++    <title>single-flight-auth fixture</title>
++  </head>
++  <body>
++    <pre id="log"></pre>
++    <script type="module">
++      import { createAuthClient, SessionLostError } from '/dist/index.js';
++
++      const params = new URLSearchParams(location.search);
++      const log = (line) => {
++        document.getElementById('log').textContent += `${line}\n`;
++      };
++
++      window.__events = [];
++      window.__auth = createAuthClient({
++        refresh: async ({ reason }) => {
++          log(`refresh (${reason})`);
++          const response = await fetch('/auth/refresh', { method: 'POST', credentials: 'include' });
++          if (!response.ok) throw response;
++          const { accessToken, expiresIn } = await response.json();
++          return { accessToken, expiresAt: Date.now() + expiresIn };
++        },
++        storage: params.get('storage') ?? 'localStorage',
++        lock: params.get('lock') ?? 'auto',
++        channel: params.get('channel') === 'off' ? false : 'single-flight-auth',
++        expirySkewMs: 0,
++        onSessionLost: () => {
++          window.__events.push('session-lost');
++          log('session lost');
++        },
++      });
++
++      window.__login = async () => {
++        const response = await fetch('/login', { method: 'POST', credentials: 'include' });
++        const { accessToken, expiresIn } = await response.json();
++        await window.__auth.setTokens({ accessToken, expiresAt: Date.now() + expiresIn });
++      };
++
++      window.__me = async () => {
++        try {
++          const response = await window.__auth.fetch('/api/me');
++          return response.status;
++        } catch (error) {
++          return error instanceof SessionLostError ? 'session-lost' : `error: ${error}`;
++        }
++      };
++
++      window.__ready = true;
++    </script>
++  </body>
++</html>
+diff --git a/test/e2e/mock-server.ts b/test/e2e/mock-server.ts
+new file mode 100644
+index 0000000..450b0a2
+--- /dev/null
++++ b/test/e2e/mock-server.ts
+@@ -0,0 +1,185 @@
++/**
++ * A minimal auth server with refresh-token rotation, used by the Playwright suite and runnable on
++ * its own for manual experiments:  node test/e2e/mock-server.ts --port 4173
++ *
++ *   POST /login          sets an httpOnly refresh cookie, returns a short-lived access token
++ *   POST /auth/refresh   rotates the refresh token; a token presented twice is rejected with 401
++ *                        unless the second use is within the configured grace period
++ *   GET  /api/me         200 with a valid access token, 401 otherwise
++ *   POST /__reset        { accessTtlMs, refreshLatencyMs, graceMs } — resets state and counters
++ *   GET  /__stats        counters for assertions
++ */
++
++import { randomUUID } from 'node:crypto';
++import { readFile } from 'node:fs/promises';
++import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
++import { join } from 'node:path';
++
++interface Config {
++  accessTtlMs: number;
++  refreshLatencyMs: number;
++  graceMs: number;
++}
++
++interface RefreshToken {
++  consumedAt: number | null;
++  successor: { refreshToken: string; accessToken: string; expiresIn: number } | null;
++}
++
++const DEFAULT_CONFIG: Config = { accessTtlMs: 400, refreshLatencyMs: 150, graceMs: 0 };
++
++let config: Config = { ...DEFAULT_CONFIG };
++const refreshTokens = new Map<string, RefreshToken>();
++const accessTokens = new Map<string, number>();
++const stats = {
++  refreshAttempts: 0,
++  refreshOk: 0,
++  refreshRejected: 0,
++  apiOk: 0,
++  apiUnauthorized: 0,
++};
++
++const port = Number(process.argv[process.argv.indexOf('--port') + 1] || 4173);
++const root = process.cwd();
++
++function reset(next: Partial<Config>) {
++  config = { ...DEFAULT_CONFIG, ...next };
++  refreshTokens.clear();
++  accessTokens.clear();
++  for (const key of Object.keys(stats) as (keyof typeof stats)[]) stats[key] = 0;
++}
++
++function issueAccessToken() {
++  const accessToken = `at-${randomUUID()}`;
++  accessTokens.set(accessToken, Date.now() + config.accessTtlMs);
++  return { accessToken, expiresIn: config.accessTtlMs };
++}
++
++function issueRefreshToken() {
++  const id = `rt-${randomUUID()}`;
++  refreshTokens.set(id, { consumedAt: null, successor: null });
++  return id;
++}
++
++function cookies(request: IncomingMessage): Record<string, string> {
++  const out: Record<string, string> = {};
++  for (const part of (request.headers.cookie ?? '').split(';')) {
++    const [name, ...rest] = part.trim().split('=');
++    if (name) out[name] = rest.join('=');
++  }
++  return out;
++}
++
++function json(
++  response: ServerResponse,
++  status: number,
++  body: unknown,
++  headers: Record<string, string> = {},
++) {
++  response.writeHead(status, { 'content-type': 'application/json', ...headers });
++  response.end(JSON.stringify(body));
++}
++
++function readBody(request: IncomingMessage): Promise<string> {
++  return new Promise((resolve) => {
++    let data = '';
++    request.on('data', (chunk) => {
++      data += chunk;
++    });
++    request.on('end', () => resolve(data));
++  });
++}
++
++const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
++
++async function handle(request: IncomingMessage, response: ServerResponse) {
++  const url = new URL(request.url ?? '/', `http://127.0.0.1:${port}`);
++  const method = request.method ?? 'GET';
++
++  if (url.pathname === '/__health') return json(response, 200, { ok: true });
++  if (url.pathname === '/__stats') return json(response, 200, { ...stats, config });
++  if (url.pathname === '/__reset' && method === 'POST') {
++    const body = await readBody(request);
++    reset(body ? (JSON.parse(body) as Partial<Config>) : {});
++    return json(response, 200, { ok: true, config });
++  }
++
++  if (url.pathname === '/login' && method === 'POST') {
++    const refreshToken = issueRefreshToken();
++    return json(response, 200, issueAccessToken(), {
++      'set-cookie': `rt=${refreshToken}; HttpOnly; Path=/; SameSite=Lax`,
++    });
++  }
++
++  if (url.pathname === '/auth/refresh' && method === 'POST') {
++    stats.refreshAttempts += 1;
++    const presented = cookies(request).rt;
++    const record = presented ? refreshTokens.get(presented) : undefined;
++    if (!record) {
++      stats.refreshRejected += 1;
++      return json(response, 401, { error: 'unknown refresh token' });
++    }
++    if (record.consumedAt !== null) {
++      // Rotation: a refresh token is single-use. Within the grace period the same successor is
++      // handed out again, which is what lets tabs that raced the winner survive.
++      const withinGrace = Date.now() - record.consumedAt <= config.graceMs;
++      if (!withinGrace || !record.successor) {
++        stats.refreshRejected += 1;
++        return json(response, 401, { error: 'refresh token already used' });
++      }
++      await sleep(config.refreshLatencyMs);
++      stats.refreshOk += 1;
++      const { accessToken, expiresIn } = record.successor;
++      return json(response, 200, { accessToken, expiresIn });
++    }
++    // Consume atomically before doing any slow work, like a database transaction would.
++    record.consumedAt = Date.now();
++    const successor = { refreshToken: issueRefreshToken(), ...issueAccessToken() };
++    record.successor = successor;
++    await sleep(config.refreshLatencyMs);
++    stats.refreshOk += 1;
++    return json(
++      response,
++      200,
++      { accessToken: successor.accessToken, expiresIn: successor.expiresIn },
++      { 'set-cookie': `rt=${successor.refreshToken}; HttpOnly; Path=/; SameSite=Lax` },
++    );
++  }
++
++  if (url.pathname === '/api/me') {
++    const token = (request.headers.authorization ?? '').replace(/^Bearer /, '');
++    const expiresAt = accessTokens.get(token);
++    if (expiresAt === undefined || expiresAt <= Date.now()) {
++      stats.apiUnauthorized += 1;
++      return json(response, 401, { error: 'invalid or expired access token' });
++    }
++    stats.apiOk += 1;
++    return json(response, 200, { ok: true });
++  }
++
++  if (url.pathname === '/' || url.pathname === '/index.html') {
++    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
++    return response.end(await readFile(join(root, 'test/e2e/fixtures/app/index.html')));
++  }
++  if (url.pathname.startsWith('/dist/')) {
++    try {
++      const file = await readFile(join(root, url.pathname));
++      response.writeHead(200, {
++        'content-type': url.pathname.endsWith('.map') ? 'application/json' : 'text/javascript',
++      });
++      return response.end(file);
++    } catch {
++      return json(response, 404, { error: 'build the library first: pnpm build' });
++    }
++  }
++
++  json(response, 404, { error: 'not found' });
++}
++
++createServer((request, response) => {
++  handle(request, response).catch((error: unknown) => {
++    json(response, 500, { error: String(error) });
++  });
++}).listen(port, '127.0.0.1', () => {
++  console.log(`mock auth server listening on http://127.0.0.1:${port}`);
++});
+diff --git a/test/e2e/race.spec.ts b/test/e2e/race.spec.ts
+new file mode 100644
+index 0000000..98d5a1a
+--- /dev/null
++++ b/test/e2e/race.spec.ts
+@@ -0,0 +1,182 @@
++import { mkdir, writeFile } from 'node:fs/promises';
++import {
++  type APIRequestContext,
++  type BrowserContext,
++  expect,
++  type Page,
++  test,
++} from '@playwright/test';
++
++declare global {
++  interface Window {
++    __ready: boolean;
++    __events: string[];
++    __login(): Promise<void>;
++    __me(): Promise<number | string>;
++  }
++}
++
++const TABS = 5;
++const SERVER = { accessTtlMs: 400, refreshLatencyMs: 150 };
++
++interface Stats {
++  refreshAttempts: number;
++  refreshOk: number;
++  refreshRejected: number;
++  apiOk: number;
++  apiUnauthorized: number;
++}
++
++interface Row {
++  scenario: string;
++  refreshCalls: number;
++  rejected: number;
++  loggedOut: number;
++  results: string;
++}
++
++const rows: Row[] = [];
++
++async function openTabs(context: BrowserContext, query: string): Promise<Page[]> {
++  const pages: Page[] = [];
++  for (let i = 0; i < TABS; i += 1) {
++    const page = await context.newPage();
++    await page.goto(`/?${query}`);
++    await page.waitForFunction(() => window.__ready);
++    pages.push(page);
++  }
++  return pages;
++}
++
++/** Logs in once, lets the access token expire, then hits the API from every tab at the same moment. */
++async function race(
++  context: BrowserContext,
++  request: APIRequestContext,
++  scenario: string,
++  query: string,
++  graceMs = 0,
++) {
++  await request.post('/__reset', { data: { ...SERVER, graceMs } });
++  const pages = await openTabs(context, query);
++  const [first] = pages;
++  if (!first) throw new Error('no tabs');
++
++  await first.evaluate(() => window.__login());
++  await first.waitForTimeout(SERVER.accessTtlMs + 100);
++
++  const results = await Promise.all(pages.map((page) => page.evaluate(() => window.__me())));
++  const stats = (await (await request.get('/__stats')).json()) as Stats;
++  const lostPerTab = await Promise.all(
++    pages.map((page) => page.evaluate(() => window.__events.length)),
++  );
++  const loggedOut = lostPerTab.reduce((sum, n) => sum + n, 0);
++
++  rows.push({
++    scenario,
++    refreshCalls: stats.refreshAttempts,
++    rejected: stats.refreshRejected,
++    loggedOut,
++    results: results.map(String).sort().join(', '),
++  });
++  return { results, stats, loggedOut };
++}
++
++test.describe('five tabs, one expired access token, refresh-token rotation on the server', () => {
++  test('without the lock, four of five tabs are logged out (the bug)', async ({
++    context,
++    request,
++  }) => {
++    const { results, stats, loggedOut } = await race(
++      context,
++      request,
++      'no lock, no channel',
++      'lock=none&channel=off&storage=localStorage',
++    );
++
++    expect(stats.refreshAttempts).toBe(TABS);
++    expect(stats.refreshOk).toBe(1);
++    expect(stats.refreshRejected).toBe(TABS - 1);
++    expect(results.filter((r) => r === 200)).toHaveLength(1);
++    expect(results.filter((r) => r === 'session-lost')).toHaveLength(TABS - 1);
++    expect(loggedOut).toBe(TABS - 1);
++  });
++
++  test('with Web Locks and localStorage, one refresh serves all five tabs', async ({
++    context,
++    request,
++  }) => {
++    const { results, stats, loggedOut } = await race(
++      context,
++      request,
++      'Web Locks + localStorage',
++      'lock=web-locks&storage=localStorage',
++    );
++
++    expect(stats.refreshAttempts).toBe(1);
++    expect(stats.refreshRejected).toBe(0);
++    expect(results).toEqual(Array(TABS).fill(200));
++    expect(loggedOut).toBe(0);
++  });
++
++  test('the localStorage lease fallback behaves the same', async ({ context, request }) => {
++    const { results, stats, loggedOut } = await race(
++      context,
++      request,
++      'lease fallback + localStorage',
++      'lock=lease&storage=localStorage',
++    );
++
++    expect(stats.refreshAttempts).toBe(1);
++    expect(stats.refreshRejected).toBe(0);
++    expect(results).toEqual(Array(TABS).fill(200));
++    expect(loggedOut).toBe(0);
++  });
++
++  test('with Web Locks and per-tab memory storage, refreshes serialise and nobody is logged out', async ({
++    context,
++    request,
++  }) => {
++    const { results, stats, loggedOut } = await race(
++      context,
++      request,
++      'Web Locks + memory storage + channel',
++      'lock=web-locks&storage=memory',
++    );
++
++    expect(stats.refreshAttempts).toBeGreaterThanOrEqual(1);
++    expect(stats.refreshAttempts).toBeLessThanOrEqual(TABS);
++    expect(stats.refreshRejected).toBe(0);
++    expect(results).toEqual(Array(TABS).fill(200));
++    expect(loggedOut).toBe(0);
++  });
++
++  test('a server-side grace period alone also prevents logouts, at the price of five refreshes', async ({
++    context,
++    request,
++  }) => {
++    const { results, stats, loggedOut } = await race(
++      context,
++      request,
++      'no lock, server grace period 2 s',
++      'lock=none&channel=off&storage=localStorage',
++      2_000,
++    );
++
++    expect(stats.refreshAttempts).toBe(TABS);
++    expect(stats.refreshRejected).toBe(0);
++    expect(results).toEqual(Array(TABS).fill(200));
++    expect(loggedOut).toBe(0);
++  });
++});
++
++test.afterAll(async () => {
++  const header = '| Scenario | Refresh calls | Rejected by server | Tabs logged out | Results |';
++  const divider = '| --- | ---: | ---: | ---: | --- |';
++  const lines = rows.map(
++    (r) => `| ${r.scenario} | ${r.refreshCalls} | ${r.rejected} | ${r.loggedOut} | ${r.results} |`,
++  );
++  const table = [header, divider, ...lines].join('\n');
++  console.log(`\n${table}\n`);
++  await mkdir('test-results', { recursive: true });
++  await writeFile('test-results/race-summary.md', `${table}\n`);
++});

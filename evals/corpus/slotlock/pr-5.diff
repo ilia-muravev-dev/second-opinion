@@ -1,0 +1,834 @@
+diff --git a/.env.example b/.env.example
+index a143491..28589f8 100644
+--- a/.env.example
++++ b/.env.example
+@@ -11,6 +11,8 @@ BOOKING_STRATEGY=advisory
+ HOLD_TTL_SECONDS=600
+ # the sweeper that expires holds whose delayed job was lost
+ HOLD_SWEEP_INTERVAL_MS=60000
++# how often the worker moves outbox rows onto the notifications queue
++OUTBOX_RELAY_INTERVAL_MS=2000
+ 
+ # Payments: set the Stripe test keys to use Stripe; leave them empty for the in-repo fake PSP.
+ STRIPE_SECRET_KEY=
+diff --git a/docs/adr/0004-outbox-and-an-idempotent-consumer.md b/docs/adr/0004-outbox-and-an-idempotent-consumer.md
+new file mode 100644
+index 0000000..2d46c99
+--- /dev/null
++++ b/docs/adr/0004-outbox-and-an-idempotent-consumer.md
+@@ -0,0 +1,40 @@
++# ADR 0004: A transactional outbox and an idempotent consumer, not "transactional" publishing
++
++Status: accepted · 2026-09-18
++
++## Context
++
++Every booking transition has a side effect outside the database: a confirmation e-mail, a refund
++for money that arrived after the seat was released, a message to a calendar. Publishing to the
++queue from inside the request has two failure modes, and both happen: the row commits and the
++publish fails (the customer never hears), or the publish succeeds and the commit fails (the
++customer hears about a booking that does not exist). Wrapping the publish in the database
++transaction does not help — the queue is not a participant in it.
++
++## Decision
++
++- **Outbox rows, in the transaction.** `OutboxService.enqueue(tx, type, payload)` writes an
++  `outbox_events` row with the same `tx` that changes the booking (`booking.held` with the
++  payment id, `booking.confirmed` / `booking.cancelled` with the webhook, `booking.expired` with
++  the expiry update, `payment.orphaned` and `payment.refund_requested` where money and seat part
++  ways). Either both are committed or neither.
++- **A relay in the worker.** Every `OUTBOX_RELAY_INTERVAL_MS` a BullMQ job scheduler ticks the
++  relay, which takes unpublished rows oldest first with `FOR UPDATE SKIP LOCKED` (several workers
++  may relay), adds them to the `notifications` queue with `jobId = event id`, and marks them
++  published in the same transaction. A crash between the add and the commit republishes the row
++  on the next tick; BullMQ ignores a job id it still remembers, and if it no longer does the
++  consumer catches it.
++- **An idempotent consumer.** `NotificationsProcessor` claims the job id in `processed_jobs`
++  inside a transaction, delivers, then commits. A redelivery finds the claim and returns
++  `duplicate`. A delivery that throws rolls the claim back and BullMQ retries.
++
++## Consequences
++
++- Delivery is at least once and processing is exactly once, with one window left open on
++  purpose: a crash after delivering and before the commit delivers twice. Closing it needs the
++  sink itself to be idempotent (a provider message id derived from the event id), which is where
++  that responsibility belongs.
++- Ordering is per relay batch, not global: the consumer runs several jobs at a time. Consumers
++  that need order (a calendar feed) key on the booking id and read the current state.
++- The outbox table grows; published rows are safe to delete after a retention period. Not done
++  here, on purpose — it is a cron job, not a design decision.
+diff --git a/src/bookings/bookings.module.ts b/src/bookings/bookings.module.ts
+index b797a6a..25afccb 100644
+--- a/src/bookings/bookings.module.ts
++++ b/src/bookings/bookings.module.ts
+@@ -1,5 +1,6 @@
+ import { Module } from '@nestjs/common';
+ import { IdempotencyModule } from '../idempotency/idempotency.module';
++import { OutboxModule } from '../outbox/outbox.module';
+ import { PaymentsModule } from '../payments/payments.module';
+ import { BookingsController } from './bookings.controller';
+ import { BookingsService, CLOCK, systemClock } from './bookings.service';
+@@ -7,7 +8,7 @@ import { HoldsModule } from './holds/holds.module';
+ import { StrategyModule } from './strategies/strategy.module';
+ 
+ @Module({
+-  imports: [StrategyModule, IdempotencyModule, PaymentsModule, HoldsModule],
++  imports: [StrategyModule, IdempotencyModule, PaymentsModule, HoldsModule, OutboxModule],
+   controllers: [BookingsController],
+   providers: [BookingsService, { provide: CLOCK, useValue: systemClock }],
+   exports: [BookingsService],
+diff --git a/src/bookings/bookings.service.ts b/src/bookings/bookings.service.ts
+index 4682a7d..1ffc546 100644
+--- a/src/bookings/bookings.service.ts
++++ b/src/bookings/bookings.service.ts
+@@ -10,6 +10,7 @@ import {
+ import { retryOnConflict } from '../common/retry';
+ import { CONFIG, type Config } from '../config';
+ import type { Booking } from '../generated/prisma/client';
++import { OutboxService } from '../outbox/outbox.service';
+ import { PAYMENT_PROVIDER, type PaymentProvider } from '../payments/payment.provider';
+ import { PrismaService } from '../prisma/prisma.service';
+ import type { BookingOut, CreateBooking, CreatedBooking } from './bookings.dto';
+@@ -32,6 +33,7 @@ export class BookingsService {
+     @Inject(CLOCK) private readonly clock: Clock,
+     @Inject(PAYMENT_PROVIDER) private readonly payments: PaymentProvider,
+     private readonly holds: HoldScheduler,
++    private readonly outbox: OutboxService,
+     private readonly logger: Logger,
+   ) {}
+ 
+@@ -73,9 +75,19 @@ export class BookingsService {
+       throw new PaymentProviderError(error);
+     }
+     const booking = await retryOnConflict(() =>
+-      this.prisma.booking.update({
+-        where: { id: held.id },
+-        data: { paymentId: intent.id, amountCents },
++      this.prisma.$transaction(async (tx) => {
++        const updated = await tx.booking.update({
++          where: { id: held.id },
++          data: { paymentId: intent.id, amountCents },
++        });
++        await this.outbox.enqueue(tx, 'booking.held', {
++          bookingId: held.id,
++          userId,
++          resourceId: resource.id,
++          amountCents,
++          holdExpiresAt: updated.holdExpiresAt?.toISOString() ?? null,
++        });
++        return updated;
+       }),
+     );
+     if (booking.holdExpiresAt) await this.holds.schedule(booking.id, booking.holdExpiresAt, now);
+@@ -111,6 +123,14 @@ export class BookingsService {
+           where: { id },
+           data: { status: 'CANCELLED', version: { increment: 1 } },
+         });
++        await this.outbox.enqueue(tx, 'booking.cancelled', { bookingId: id, userId, by: 'user' });
++        if (row.status === 'CONFIRMED' && row.paymentId) {
++          await this.outbox.enqueue(tx, 'payment.refund_requested', {
++            bookingId: id,
++            paymentId: row.paymentId,
++            reason: 'cancelled_after_payment',
++          });
++        }
+         return row;
+       }),
+     );
+diff --git a/src/bookings/holds/hold-expiry.service.ts b/src/bookings/holds/hold-expiry.service.ts
+index b53ca35..269ab0d 100644
+--- a/src/bookings/holds/hold-expiry.service.ts
++++ b/src/bookings/holds/hold-expiry.service.ts
+@@ -1,8 +1,10 @@
+ import { Inject, Injectable } from '@nestjs/common';
+ import { Logger } from 'nestjs-pino';
+ import { retryOnConflict } from '../../common/retry';
++import { OutboxService } from '../../outbox/outbox.service';
+ import { PAYMENT_PROVIDER, type PaymentProvider } from '../../payments/payment.provider';
+ import { PrismaService } from '../../prisma/prisma.service';
++import type { Tx } from '../strategies/reserve.strategy';
+ 
+ interface ExpiredRow {
+   id: string;
+@@ -19,15 +21,20 @@ export class HoldExpiryService {
+   constructor(
+     private readonly prisma: PrismaService,
+     @Inject(PAYMENT_PROVIDER) private readonly payments: PaymentProvider,
++    private readonly outbox: OutboxService,
+     private readonly logger: Logger,
+   ) {}
+ 
+   async expire(bookingId: string): Promise<'expired' | 'skipped'> {
+-    const rows = await retryOnConflict(
+-      () => this.prisma.$queryRaw<ExpiredRow[]>`
+-        UPDATE bookings SET status = 'EXPIRED', version = version + 1, "updatedAt" = now()
+-        WHERE id = ${bookingId} AND status = 'HELD' AND "holdExpiresAt" <= now()
+-        RETURNING id, "paymentId"`,
++    const rows = await retryOnConflict(() =>
++      this.prisma.$transaction(async (tx) => {
++        const expired = await tx.$queryRaw<ExpiredRow[]>`
++          UPDATE bookings SET status = 'EXPIRED', version = version + 1, "updatedAt" = now()
++          WHERE id = ${bookingId} AND status = 'HELD' AND "holdExpiresAt" <= now()
++          RETURNING id, "paymentId"`;
++        await this.announce(tx, expired);
++        return expired;
++      }),
+     );
+     await this.release(rows);
+     return rows.length > 0 ? 'expired' : 'skipped';
+@@ -37,13 +44,17 @@ export class HoldExpiryService {
+   async sweep(batch = 500): Promise<number> {
+     let total = 0;
+     for (;;) {
+-      const rows = await retryOnConflict(
+-        () => this.prisma.$queryRaw<ExpiredRow[]>`
+-          UPDATE bookings SET status = 'EXPIRED', version = version + 1, "updatedAt" = now()
+-          WHERE id IN (
+-            SELECT id FROM bookings WHERE status = 'HELD' AND "holdExpiresAt" <= now()
+-            ORDER BY "holdExpiresAt" LIMIT ${batch} FOR UPDATE SKIP LOCKED)
+-          RETURNING id, "paymentId"`,
++      const rows = await retryOnConflict(() =>
++        this.prisma.$transaction(async (tx) => {
++          const expired = await tx.$queryRaw<ExpiredRow[]>`
++            UPDATE bookings SET status = 'EXPIRED', version = version + 1, "updatedAt" = now()
++            WHERE id IN (
++              SELECT id FROM bookings WHERE status = 'HELD' AND "holdExpiresAt" <= now()
++              ORDER BY "holdExpiresAt" LIMIT ${batch} FOR UPDATE SKIP LOCKED)
++            RETURNING id, "paymentId"`;
++          await this.announce(tx, expired);
++          return expired;
++        }),
+       );
+       await this.release(rows);
+       total += rows.length;
+@@ -51,6 +62,16 @@ export class HoldExpiryService {
+     }
+   }
+ 
++  private announce(tx: Tx, rows: ExpiredRow[]): Promise<unknown> {
++    return this.outbox.enqueueMany(
++      tx,
++      rows.map((row) => ({
++        type: 'booking.expired' as const,
++        payload: { bookingId: row.id, paymentId: row.paymentId },
++      })),
++    );
++  }
++
+   /** Best effort: a cancel that fails (or races a success) is settled by the webhook — ORPHANED. */
+   private async release(rows: ExpiredRow[]): Promise<void> {
+     for (const row of rows) {
+diff --git a/src/bookings/holds/holds.module.ts b/src/bookings/holds/holds.module.ts
+index f0a6e7d..8c07c43 100644
+--- a/src/bookings/holds/holds.module.ts
++++ b/src/bookings/holds/holds.module.ts
+@@ -1,11 +1,12 @@
+ import { Module } from '@nestjs/common';
++import { OutboxModule } from '../../outbox/outbox.module';
+ import { PaymentsModule } from '../../payments/payments.module';
+ import { HoldScheduler } from './hold.scheduler';
+ import { HoldExpiryService } from './hold-expiry.service';
+ 
+ /** Scheduling and expiring holds — used by the API (schedule) and the worker (expire). */
+ @Module({
+-  imports: [PaymentsModule],
++  imports: [PaymentsModule, OutboxModule],
+   providers: [HoldScheduler, HoldExpiryService],
+   exports: [HoldScheduler, HoldExpiryService],
+ })
+diff --git a/src/config.ts b/src/config.ts
+index c13a594..cd57f90 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -25,6 +25,7 @@ const schema = z
+     BOOKING_STRATEGY: z.enum(STRATEGIES).default('advisory'),
+     HOLD_TTL_SECONDS: z.coerce.number().int().positive().default(600),
+     HOLD_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(60_000),
++    OUTBOX_RELAY_INTERVAL_MS: z.coerce.number().int().positive().default(2_000),
+     STRIPE_SECRET_KEY: z
+       .string()
+       .optional()
+diff --git a/src/outbox/notification.sink.ts b/src/outbox/notification.sink.ts
+new file mode 100644
+index 0000000..a1a8d1f
+--- /dev/null
++++ b/src/outbox/notification.sink.ts
+@@ -0,0 +1,30 @@
++import { Injectable } from '@nestjs/common';
++import { Logger } from 'nestjs-pino';
++
++export interface Notification {
++  id: string;
++  type: string;
++  payload: unknown;
++  deliveredAt: Date;
++}
++
++/**
++ * Where notifications go. This one logs them and keeps the last few hundred in memory for
++ * inspection; an e-mail or push implementation would replace it behind the same shape.
++ */
++@Injectable()
++export class NotificationSink {
++  readonly recent: Notification[] = [];
++
++  constructor(private readonly logger: Logger) {}
++
++  async deliver(notification: Omit<Notification, 'deliveredAt'>): Promise<void> {
++    const delivered = { ...notification, deliveredAt: new Date() };
++    this.recent.push(delivered);
++    if (this.recent.length > 500) this.recent.shift();
++    this.logger.log(
++      { id: notification.id, type: notification.type, payload: notification.payload },
++      'notification',
++    );
++  }
++}
+diff --git a/src/outbox/notifications.processor.ts b/src/outbox/notifications.processor.ts
+new file mode 100644
+index 0000000..f910ccd
+--- /dev/null
++++ b/src/outbox/notifications.processor.ts
+@@ -0,0 +1,44 @@
++import { Processor, WorkerHost } from '@nestjs/bullmq';
++import { Job } from 'bullmq';
++import { PG, pgCode } from '../common/errors';
++import { PrismaService } from '../prisma/prisma.service';
++import { NOTIFICATIONS_QUEUE } from '../queue/queue.module';
++import { NotificationSink } from './notification.sink';
++
++class AlreadyProcessed extends Error {}
++
++/**
++ * Exactly-once processing on top of at-least-once delivery: the job id is claimed in
++ * `processed_jobs` inside a transaction, the notification is delivered, and only then does the
++ * claim commit. A redelivery finds the claim and does nothing. If delivery fails, the claim rolls
++ * back and BullMQ retries; if the process dies between delivering and committing, the
++ * notification goes out twice — the one window this design accepts, and it is the sink's to close.
++ */
++@Processor(NOTIFICATIONS_QUEUE, { concurrency: 10 })
++export class NotificationsProcessor extends WorkerHost {
++  constructor(
++    private readonly prisma: PrismaService,
++    private readonly sink: NotificationSink,
++  ) {
++    super();
++  }
++
++  async process(job: Job): Promise<'delivered' | 'duplicate'> {
++    const key = String(job.id);
++    try {
++      await this.prisma.$transaction(async (tx) => {
++        try {
++          await tx.processedJob.create({ data: { key } });
++        } catch (error) {
++          if (pgCode(error) === PG.uniqueViolation) throw new AlreadyProcessed();
++          throw error;
++        }
++        await this.sink.deliver({ id: key, type: job.name, payload: job.data });
++      });
++      return 'delivered';
++    } catch (error) {
++      if (error instanceof AlreadyProcessed) return 'duplicate';
++      throw error;
++    }
++  }
++}
+diff --git a/src/outbox/outbox-worker.module.ts b/src/outbox/outbox-worker.module.ts
+new file mode 100644
+index 0000000..284a97c
+--- /dev/null
++++ b/src/outbox/outbox-worker.module.ts
+@@ -0,0 +1,44 @@
++import { InjectQueue, Processor, WorkerHost } from '@nestjs/bullmq';
++import { Inject, Module, OnModuleInit } from '@nestjs/common';
++import { Job, Queue } from 'bullmq';
++import { CONFIG, type Config } from '../config';
++import { OUTBOX_QUEUE } from '../queue/queue.module';
++import { NotificationSink } from './notification.sink';
++import { NotificationsProcessor } from './notifications.processor';
++import { OutboxRelay } from './outbox.relay';
++
++export const RELAY_JOB = 'relay';
++export const RELAY_SCHEDULER_ID = 'outbox-relay';
++
++/** The repeatable relay tick lives on its own queue so it never queues behind notifications. */
++@Processor(OUTBOX_QUEUE)
++class OutboxProcessor extends WorkerHost {
++  constructor(private readonly relay: OutboxRelay) {
++    super();
++  }
++
++  process(job: Job): Promise<number> {
++    if (job.name !== RELAY_JOB) throw new Error(`unknown job ${job.name} on ${OUTBOX_QUEUE}`);
++    return this.relay.relay();
++  }
++}
++
++/** The worker side of the outbox: relay tick, notifications consumer, the sink. */
++@Module({
++  providers: [OutboxRelay, OutboxProcessor, NotificationsProcessor, NotificationSink],
++  exports: [OutboxRelay, NotificationSink],
++})
++export class OutboxWorkerModule implements OnModuleInit {
++  constructor(
++    @Inject(CONFIG) private readonly config: Config,
++    @InjectQueue(OUTBOX_QUEUE) private readonly queue: Queue,
++  ) {}
++
++  async onModuleInit(): Promise<void> {
++    await this.queue.upsertJobScheduler(
++      RELAY_SCHEDULER_ID,
++      { every: this.config.OUTBOX_RELAY_INTERVAL_MS },
++      { name: RELAY_JOB, data: {} },
++    );
++  }
++}
+diff --git a/src/outbox/outbox.module.ts b/src/outbox/outbox.module.ts
+new file mode 100644
+index 0000000..780f3a1
+--- /dev/null
++++ b/src/outbox/outbox.module.ts
+@@ -0,0 +1,5 @@
++import { Module } from '@nestjs/common';
++import { OutboxService } from './outbox.service';
++
++@Module({ providers: [OutboxService], exports: [OutboxService] })
++export class OutboxModule {}
+diff --git a/src/outbox/outbox.relay.ts b/src/outbox/outbox.relay.ts
+new file mode 100644
+index 0000000..b621650
+--- /dev/null
++++ b/src/outbox/outbox.relay.ts
+@@ -0,0 +1,53 @@
++import { InjectQueue } from '@nestjs/bullmq';
++import { Injectable } from '@nestjs/common';
++import { Queue } from 'bullmq';
++import { Logger } from 'nestjs-pino';
++import { PrismaService } from '../prisma/prisma.service';
++import { NOTIFICATIONS_QUEUE } from '../queue/queue.module';
++
++interface OutboxRow {
++  id: string;
++  type: string;
++  payload: unknown;
++}
++
++/**
++ * Moves unpublished outbox rows onto the notifications queue, oldest first, in batches locked
++ * with SKIP LOCKED so several workers can relay at once. The queue job id is the event id: if the
++ * process dies between `queue.add` and the commit that marks the row published, the next relay
++ * offers the same job again and BullMQ ignores it while it remembers it — and if it no longer
++ * does, the consumer's processed-jobs table catches the repeat. At least once, never lost.
++ */
++@Injectable()
++export class OutboxRelay {
++  constructor(
++    private readonly prisma: PrismaService,
++    @InjectQueue(NOTIFICATIONS_QUEUE) private readonly queue: Queue,
++    private readonly logger: Logger,
++  ) {}
++
++  async relay(batch = 100): Promise<number> {
++    let total = 0;
++    for (;;) {
++      const published = await this.prisma.$transaction(async (tx) => {
++        const rows = await tx.$queryRaw<OutboxRow[]>`
++          SELECT id, type, payload FROM outbox_events
++          WHERE "publishedAt" IS NULL
++          ORDER BY "createdAt" LIMIT ${batch} FOR UPDATE SKIP LOCKED`;
++        if (rows.length === 0) return 0;
++        await this.queue.addBulk(
++          rows.map((row) => ({ name: row.type, data: row.payload, opts: { jobId: row.id } })),
++        );
++        await tx.outboxEvent.updateMany({
++          where: { id: { in: rows.map((r) => r.id) } },
++          data: { publishedAt: new Date() },
++        });
++        return rows.length;
++      });
++      total += published;
++      if (published < batch) break;
++    }
++    if (total > 0) this.logger.debug({ published: total }, 'outbox relayed');
++    return total;
++  }
++}
+diff --git a/src/outbox/outbox.service.ts b/src/outbox/outbox.service.ts
+new file mode 100644
+index 0000000..084bffb
+--- /dev/null
++++ b/src/outbox/outbox.service.ts
+@@ -0,0 +1,41 @@
++import { Injectable } from '@nestjs/common';
++import type { Tx } from '../bookings/strategies/reserve.strategy';
++import type { Prisma } from '../generated/prisma/client';
++
++export type OutboxEventType =
++  | 'booking.held'
++  | 'booking.confirmed'
++  | 'booking.cancelled'
++  | 'booking.expired'
++  | 'payment.orphaned'
++  | 'payment.refund_requested';
++
++export interface OutboxPayload {
++  bookingId: string;
++  [key: string]: string | number | boolean | null | undefined;
++}
++
++/**
++ * The transactional outbox (ADR 0004): an event is a row written in the same transaction as the
++ * state change it announces, so the two cannot disagree. The relay in the worker publishes rows
++ * to the queue; the consumer makes duplicate deliveries harmless.
++ */
++@Injectable()
++export class OutboxService {
++  enqueue(tx: Tx, type: OutboxEventType, payload: OutboxPayload): Promise<{ id: string }> {
++    return tx.outboxEvent.create({
++      data: { type, payload: payload as Prisma.InputJsonObject },
++      select: { id: true },
++    });
++  }
++
++  enqueueMany(
++    tx: Tx,
++    events: { type: OutboxEventType; payload: OutboxPayload }[],
++  ): Promise<{ count: number }> {
++    if (events.length === 0) return Promise.resolve({ count: 0 });
++    return tx.outboxEvent.createMany({
++      data: events.map((e) => ({ type: e.type, payload: e.payload as Prisma.InputJsonObject })),
++    });
++  }
++}
+diff --git a/src/payments/payment-events.service.ts b/src/payments/payment-events.service.ts
+index efe596e..183c200 100644
+--- a/src/payments/payment-events.service.ts
++++ b/src/payments/payment-events.service.ts
+@@ -4,6 +4,7 @@ import type { Tx } from '../bookings/strategies/reserve.strategy';
+ import { PG, pgCode } from '../common/errors';
+ import { retryOnConflict } from '../common/retry';
+ import type { BookingStatus, PaymentEventOutcome } from '../generated/prisma/enums';
++import { OutboxService } from '../outbox/outbox.service';
+ import { PrismaService } from '../prisma/prisma.service';
+ import type { ProviderEvent } from './payment.provider';
+ 
+@@ -23,7 +24,10 @@ export interface AppliedEvent {
+  */
+ @Injectable()
+ export class PaymentEventsService {
+-  constructor(private readonly prisma: PrismaService) {}
++  constructor(
++    private readonly prisma: PrismaService,
++    private readonly outbox: OutboxService,
++  ) {}
+ 
+   async apply(event: ProviderEvent): Promise<AppliedEvent> {
+     try {
+@@ -68,6 +72,14 @@ export class PaymentEventsService {
+       return { outcome: 'STALE', bookingId: booking.id, status: booking.status };
+     }
+     const decision = onPayment(booking.status, signal);
++    if (decision.outcome === 'ORPHANED') {
++      await this.outbox.enqueue(tx, 'payment.orphaned', {
++        bookingId: booking.id,
++        paymentId: event.paymentId,
++        eventId: event.id,
++        reason: `paid_while_${booking.status.toLowerCase()}`,
++      });
++    }
+     if (decision.outcome !== 'APPLIED') {
+       return { outcome: decision.outcome, bookingId: booking.id, status: booking.status };
+     }
+@@ -80,6 +92,11 @@ export class PaymentEventsService {
+         version: { increment: 1 },
+       },
+     });
++    await this.outbox.enqueue(
++      tx,
++      decision.next === 'CONFIRMED' ? 'booking.confirmed' : 'booking.cancelled',
++      { bookingId: booking.id, paymentId: event.paymentId, by: 'payment', eventId: event.id },
++    );
+     return { outcome: 'APPLIED', bookingId: booking.id, status: decision.next };
+   }
+ }
+diff --git a/src/payments/payments.module.ts b/src/payments/payments.module.ts
+index 8b3ad8f..6dc2374 100644
+--- a/src/payments/payments.module.ts
++++ b/src/payments/payments.module.ts
+@@ -2,6 +2,7 @@ import { Inject, Module, OnModuleInit } from '@nestjs/common';
+ import { Logger } from 'nestjs-pino';
+ import Stripe from 'stripe';
+ import { CONFIG, type Config } from '../config';
++import { OutboxModule } from '../outbox/outbox.module';
+ import { PrismaService } from '../prisma/prisma.service';
+ import { FakePaymentProvider } from './fake.provider';
+ import { FakePspController } from './fake-psp.controller';
+@@ -15,6 +16,7 @@ import { WebhooksController } from './webhooks.controller';
+  * path either way. The fake PSP's endpoint answers 404 under Stripe.
+  */
+ @Module({
++  imports: [OutboxModule],
+   controllers: [WebhooksController, FakePspController],
+   providers: [
+     PaymentEventsService,
+diff --git a/src/queue/queue.module.ts b/src/queue/queue.module.ts
+index 21691bd..526b1a2 100644
+--- a/src/queue/queue.module.ts
++++ b/src/queue/queue.module.ts
+@@ -4,8 +4,9 @@ import { CONFIG, type Config } from '../config';
+ 
+ export const HOLDS_QUEUE = 'holds';
+ export const NOTIFICATIONS_QUEUE = 'notifications';
++export const OUTBOX_QUEUE = 'outbox';
+ 
+-/** BullMQ on the configured Redis; both queues are registered once, here, for API and worker. */
++/** BullMQ on the configured Redis; the queues are registered once, here, for API and worker. */
+ @Global()
+ @Module({
+   imports: [
+@@ -16,7 +17,11 @@ export const NOTIFICATIONS_QUEUE = 'notifications';
+         defaultJobOptions: { removeOnComplete: 1000, removeOnFail: 5000 },
+       }),
+     }),
+-    BullModule.registerQueue({ name: HOLDS_QUEUE }, { name: NOTIFICATIONS_QUEUE }),
++    BullModule.registerQueue(
++      { name: HOLDS_QUEUE },
++      { name: NOTIFICATIONS_QUEUE },
++      { name: OUTBOX_QUEUE },
++    ),
+   ],
+   exports: [BullModule],
+ })
+diff --git a/src/worker.module.ts b/src/worker.module.ts
+index bafb138..39c4390 100644
+--- a/src/worker.module.ts
++++ b/src/worker.module.ts
+@@ -2,6 +2,7 @@ import { DynamicModule, Module } from '@nestjs/common';
+ import { HoldsWorkerModule } from './bookings/holds/holds-worker.module';
+ import { type Config } from './config';
+ import { CoreModule } from './core.module';
++import { OutboxWorkerModule } from './outbox/outbox-worker.module';
+ import { PaymentsModule } from './payments/payments.module';
+ 
+ /** The worker process: BullMQ processors and the periodic jobs. No HTTP. */
+@@ -10,7 +11,7 @@ export class WorkerModule {
+   static forRoot(config?: Config): DynamicModule {
+     return {
+       module: WorkerModule,
+-      imports: [CoreModule.forRoot(config), PaymentsModule, HoldsWorkerModule],
++      imports: [CoreModule.forRoot(config), PaymentsModule, HoldsWorkerModule, OutboxWorkerModule],
+     };
+   }
+ }
+diff --git a/test/integration/outbox.test.ts b/test/integration/outbox.test.ts
+new file mode 100644
+index 0000000..6f0d691
+--- /dev/null
++++ b/test/integration/outbox.test.ts
+@@ -0,0 +1,205 @@
++import { getQueueToken } from '@nestjs/bullmq';
++import type { INestApplicationContext } from '@nestjs/common';
++import type { NestFastifyApplication } from '@nestjs/platform-fastify';
++import type { Job, Queue } from 'bullmq';
++import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
++import { HoldExpiryService } from '../../src/bookings/holds/hold-expiry.service';
++import { NotificationSink } from '../../src/outbox/notification.sink';
++import { NotificationsProcessor } from '../../src/outbox/notifications.processor';
++import { OutboxRelay } from '../../src/outbox/outbox.relay';
++import type { FakePaymentProvider } from '../../src/payments/fake.provider';
++import { PAYMENT_PROVIDER } from '../../src/payments/payment.provider';
++import { PrismaService } from '../../src/prisma/prisma.service';
++import { NOTIFICATIONS_QUEUE, OUTBOX_QUEUE } from '../../src/queue/queue.module';
++import { createTestApp, createTestWorker, resetDatabase } from './harness';
++
++const SLOT = { startsAt: '2026-10-01T09:00:00.000Z', endsAt: '2026-10-01T10:00:00.000Z' };
++
++let app: NestFastifyApplication;
++let worker: INestApplicationContext;
++let prisma: PrismaService;
++let psp: FakePaymentProvider;
++let notifications: Queue;
++let sink: NotificationSink;
++let relay: OutboxRelay;
++
++beforeAll(async () => {
++  // a slow relay tick: the tests drive the relay by hand where timing matters
++  app = await createTestApp({
++    OUTBOX_RELAY_INTERVAL_MS: '600000',
++    HOLD_SWEEP_INTERVAL_MS: '600000',
++  });
++  worker = await createTestWorker({
++    OUTBOX_RELAY_INTERVAL_MS: '600000',
++    HOLD_SWEEP_INTERVAL_MS: '600000',
++  });
++  prisma = app.get(PrismaService);
++  psp = app.get<FakePaymentProvider>(PAYMENT_PROVIDER);
++  notifications = app.get<Queue>(getQueueToken(NOTIFICATIONS_QUEUE));
++  sink = worker.get(NotificationSink);
++  relay = worker.get(OutboxRelay);
++});
++afterAll(async () => {
++  await worker.close();
++  await app.close();
++});
++beforeEach(async () => {
++  await resetDatabase(app);
++  await notifications.drain(true);
++  await notifications.clean(0, 10_000, 'completed');
++  await app.get<Queue>(getQueueToken(OUTBOX_QUEUE)).drain(true);
++  sink.recent.length = 0;
++});
++
++async function hold(resourceId = 'room-1', userId = 'alice') {
++  const response = await app.inject({
++    method: 'POST',
++    url: '/bookings',
++    headers: { 'idempotency-key': `${userId}-${resourceId}-${Math.random()}`, 'x-user-id': userId },
++    payload: { resourceId, ...SLOT },
++  });
++  expect(response.statusCode).toBe(201);
++  return response.json<{ id: string; payment: { id: string } }>();
++}
++
++const outboxTypes = async (bookingId: string) =>
++  (await prisma.outboxEvent.findMany({ orderBy: { createdAt: 'asc' } }))
++    .filter((e) => (e.payload as { bookingId?: string }).bookingId === bookingId)
++    .map((e) => e.type);
++
++const pay = (paymentId: string, outcome = 'succeeded') =>
++  app.inject({
++    method: 'POST',
++    url: `/fake-psp/payments/${paymentId}/pay`,
++    payload: { outcome, order: 'shuffled', duplicate: true },
++  });
++
++describe('the outbox', () => {
++  it('records booking.held in the same transaction as the hold, unpublished', async () => {
++    const booking = await hold();
++    const [event] = await prisma.outboxEvent.findMany();
++    expect(event).toMatchObject({
++      type: 'booking.held',
++      publishedAt: null,
++      payload: { bookingId: booking.id, userId: 'alice', resourceId: 'room-1', amountCents: 2500 },
++    });
++  });
++
++  it('announces every transition: confirmed, cancelled, expired, orphaned money, refunds', async () => {
++    const confirmed = await hold('room-1');
++    await pay(confirmed.payment.id);
++    expect(await outboxTypes(confirmed.id)).toEqual(['booking.held', 'booking.confirmed']);
++
++    const cancelledByPsp = await hold('room-2');
++    await pay(cancelledByPsp.payment.id, 'canceled');
++    expect(await outboxTypes(cancelledByPsp.id)).toEqual(['booking.held', 'booking.cancelled']);
++
++    const cancelledByUser = await hold('room-3');
++    await pay(cancelledByUser.payment.id);
++    await app.inject({
++      method: 'DELETE',
++      url: `/bookings/${cancelledByUser.id}`,
++      headers: { 'x-user-id': 'alice' },
++    });
++    expect(await outboxTypes(cancelledByUser.id)).toEqual([
++      'booking.held',
++      'booking.confirmed',
++      'booking.cancelled',
++      'payment.refund_requested',
++    ]);
++
++    const expired = await hold('room-4');
++    await prisma.booking.update({
++      where: { id: expired.id },
++      data: { holdExpiresAt: new Date(Date.now() - 1000) },
++    });
++    expect(await worker.get(HoldExpiryService).expire(expired.id)).toBe('expired');
++    await pay(expired.payment.id); // the customer paid an instant too late
++    expect(await outboxTypes(expired.id)).toEqual([
++      'booking.held',
++      'booking.expired',
++      'payment.orphaned',
++    ]);
++  });
++});
++
++describe('the relay', () => {
++  it('publishes unpublished rows as jobs keyed by event id, oldest first, in batches', async () => {
++    await prisma.outboxEvent.createMany({
++      data: Array.from({ length: 250 }, (_, i) => ({
++        type: 'booking.held',
++        payload: { bookingId: `b${i}` },
++        createdAt: new Date(Date.now() - 250_000 + i * 1000),
++      })),
++    });
++    expect(await relay.relay(100)).toBe(250);
++    expect(await prisma.outboxEvent.count({ where: { publishedAt: null } })).toBe(0);
++    await vi.waitFor(async () => expect(sink.recent).toHaveLength(250), { timeout: 15_000 });
++    const events = await prisma.outboxEvent.findMany({ orderBy: { createdAt: 'asc' } });
++    // the consumer runs 10 jobs at a time, so delivery order is approximate: assert the set
++    expect([...sink.recent.map((n) => n.id)].sort()).toEqual(events.map((e) => e.id).sort());
++    expect(await relay.relay(100)).toBe(0);
++  });
++
++  it('offers a row again if its published mark was lost, and the queue ignores the repeat', async () => {
++    const booking = await hold();
++    expect(await relay.relay()).toBe(1);
++    await vi.waitFor(async () => expect(sink.recent).toHaveLength(1));
++    await prisma.outboxEvent.updateMany({ data: { publishedAt: null } }); // the crash between add and commit
++    expect(await relay.relay()).toBe(1);
++    await new Promise((r) => setTimeout(r, 300));
++    expect(sink.recent).toHaveLength(1);
++    expect(sink.recent[0]).toMatchObject({
++      type: 'booking.held',
++      payload: { bookingId: booking.id },
++    });
++  });
++});
++
++describe('the notifications consumer', () => {
++  it('delivers a job once and treats a redelivery as a duplicate', async () => {
++    const processor = worker.get(NotificationsProcessor);
++    const job = { id: 'evt-1', name: 'booking.held', data: { bookingId: 'b1' } } as unknown as Job;
++    expect(await processor.process(job)).toBe('delivered');
++    expect(await processor.process(job)).toBe('duplicate');
++    expect(await processor.process({ ...job, id: 'evt-2' } as unknown as Job)).toBe('delivered');
++    expect(sink.recent.map((n) => n.id)).toEqual(['evt-1', 'evt-2']);
++    expect(await prisma.processedJob.count()).toBe(2);
++  });
++
++  it('does not claim a job whose delivery failed, so a retry delivers it', async () => {
++    const processor = worker.get(NotificationsProcessor);
++    const original = sink.deliver.bind(sink);
++    sink.deliver = () => Promise.reject(new Error('mail server down'));
++    const job = { id: 'evt-3', name: 'booking.held', data: { bookingId: 'b1' } } as unknown as Job;
++    try {
++      await expect(processor.process(job)).rejects.toThrow('mail server down');
++    } finally {
++      sink.deliver = original;
++    }
++    expect(await prisma.processedJob.count()).toBe(0);
++    expect(await processor.process(job)).toBe('delivered');
++  });
++
++  it('end to end: a hold becomes a notification through relay and queue, exactly once under a duplicate delivery', async () => {
++    const booking = await hold();
++    await relay.relay();
++    await vi.waitFor(async () => expect(sink.recent).toHaveLength(1));
++    const [event] = await prisma.outboxEvent.findMany();
++    if (!event) throw new Error('no event');
++    // a second delivery of the same event, as a broker may do after a lost ack
++    await vi.waitFor(async () => {
++      const first = await notifications.getJob(event.id);
++      expect(await first?.getState()).toBe('completed'); // delivered, lock released
++      await first?.remove();
++    });
++    await notifications.add(event.type, event.payload, { jobId: event.id });
++    await vi.waitFor(async () => {
++      const job = await notifications.getJob(event.id);
++      expect(await job?.getState()).toBe('completed');
++      expect(await job?.returnvalue).toBe('duplicate');
++    });
++    expect(sink.recent).toHaveLength(1);
++    expect(sink.recent[0]?.payload).toMatchObject({ bookingId: booking.id });
++  });
++});

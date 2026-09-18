@@ -1,0 +1,734 @@
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..927cda6
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,11 @@
++node_modules
++dist
++coverage
++.env
++.env.*
++!.env.example
++.git
++docs
++test
++bench
++web
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..a8ff39c
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,25 @@
++# syntax=docker/dockerfile:1.7
++FROM node:24-alpine AS base
++RUN corepack enable && corepack prepare pnpm@12.4.2 --activate
++WORKDIR /app
++
++FROM base AS build
++COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
++RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store pnpm install --frozen-lockfile
++COPY tsconfig.json tsconfig.build.json prisma.config.ts ./
++COPY prisma ./prisma
++COPY src ./src
++# prisma.config.ts resolves both URLs even for generate; any values will do at build time
++RUN DATABASE_URL=postgresql://build:build@localhost:5432/build SHADOW_DATABASE_URL=postgresql://build:build@localhost:5432/build_shadow pnpm prisma:generate && pnpm build
++
++FROM build AS pruned
++RUN pnpm prune --prod
++
++FROM base AS runtime
++ENV NODE_ENV=production
++COPY --from=pruned /app/node_modules ./node_modules
++COPY --from=pruned /app/dist ./dist
++COPY --from=pruned /app/package.json ./
++USER node
++EXPOSE 3000
++CMD ["node", "dist/main.js"]
+diff --git a/bench/race.js b/bench/race.js
+index b829f8f..5ffe998 100644
+--- a/bench/race.js
++++ b/bench/race.js
+@@ -68,7 +68,7 @@ export default function () {
+ 
+ export function handleSummary(data) {
+   const m = data.metrics;
+-  const v = (name, key) => (m[name] && m[name].values ? m[name].values[key] : undefined);
++  const v = (name, key) => m[name]?.values?.[key];
+   const line = [
+     `requests=${v('http_reqs', 'count')}`,
+     `rps=${(v('http_reqs', 'rate') || 0).toFixed(1)}`,
+diff --git a/docker-compose.yml b/docker-compose.yml
+index a8498a3..5a0e2f5 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -26,5 +26,55 @@ services:
+       timeout: 3s
+       retries: 10
+ 
++  # `docker compose --profile app up --build --wait` — migrations, then the API and the worker.
++  migrate:
++    profiles: [app]
++    build:
++      context: .
++      target: build # keeps the Prisma CLI and tsx, which the runtime image does not carry
++    command: ["sh", "-c", "pnpm prisma migrate deploy && pnpm prisma:seed"]
++    environment: &app-env
++      DATABASE_URL: postgresql://slotlock:slotlock@db:5432/slotlock
++      SHADOW_DATABASE_URL: postgresql://slotlock:slotlock@db:5432/slotlock_shadow
++      REDIS_URL: redis://redis:6379/0
++      BOOKING_STRATEGY: ${BOOKING_STRATEGY:-advisory}
++      HOLD_TTL_SECONDS: ${HOLD_TTL_SECONDS:-600}
++      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
++      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-whsec_slotlock_dev}
++      LOG_LEVEL: ${LOG_LEVEL:-info}
++    depends_on:
++      db:
++        condition: service_healthy
++
++  api:
++    profiles: [app]
++    build: .
++    ports:
++      - "3000:3000"
++    environment:
++      <<: *app-env
++      PORT: "3000"
++    depends_on:
++      migrate:
++        condition: service_completed_successfully
++      redis:
++        condition: service_healthy
++    healthcheck:
++      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
++      interval: 5s
++      timeout: 3s
++      retries: 20
++
++  worker:
++    profiles: [app]
++    build: .
++    command: ["node", "dist/worker.js"]
++    environment: *app-env
++    depends_on:
++      migrate:
++        condition: service_completed_successfully
++      redis:
++        condition: service_healthy
++
+ volumes:
+   db-data:
+diff --git a/justfile b/justfile
+index 48ad9c4..65a16cb 100644
+--- a/justfile
++++ b/justfile
+@@ -9,7 +9,15 @@ up:
+ 
+ # Stop everything
+ down:
+-    docker compose down
++    docker compose --profile app down
++
++# The whole stack in Docker: migrate + seed, API on :3000, worker (HOLD_TTL_SECONDS=20 to watch holds expire)
++app:
++    docker compose --profile app up --build -d --wait
++
++# Walk through a hold, a retry, a race, shuffled webhooks, a cancel and an expiry against :3000
++demo:
++    pnpm demo
+ 
+ # Apply migrations to DATABASE_URL
+ migrate:
+diff --git a/package.json b/package.json
+index 9bb942b..315ba05 100644
+--- a/package.json
++++ b/package.json
+@@ -32,7 +32,8 @@
+     "prisma:drift": "prisma migrate diff --from-migrations prisma/migrations --to-schema prisma/schema.prisma --exit-code",
+     "check": "pnpm lint && pnpm typecheck && pnpm test",
+     "bench": "tsx bench/run.ts",
+-    "bench:verify": "tsx bench/verify.ts"
++    "bench:verify": "tsx bench/verify.ts",
++    "demo": "tsx scripts/demo.ts"
+   },
+   "dependencies": {
+     "@fastify/static": "^10.1.4",
+diff --git a/scripts/demo.ts b/scripts/demo.ts
+new file mode 100644
+index 0000000..bc39dd4
+--- /dev/null
++++ b/scripts/demo.ts
+@@ -0,0 +1,185 @@
++// `just demo` — the whole story against a running API (default http://localhost:3000):
++// a hold, an idempotent retry, a competing booking, a payment delivered as shuffled and
++// duplicated webhooks, a reused key with a different body, a cancellation, and — if the hold TTL
++// is short enough to wait for — an expiry by the worker.
++const BASE = process.env.BASE_URL ?? 'http://localhost:3000';
++// a random future day, so repeated demos against the same database do not collide
++const day = new Date(Date.now() + (1 + Math.floor(Math.random() * 300)) * 86_400_000);
++const at = (hour: number) =>
++  new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), hour)).toISOString();
++const SLOT = { startsAt: at(9), endsAt: at(10) };
++
++interface Reply {
++  status: number;
++  replayed: boolean;
++  body: Record<string, unknown>;
++}
++
++async function call(
++  method: string,
++  path: string,
++  options: { body?: unknown; user?: string; key?: string } = {},
++): Promise<Reply> {
++  const headers: Record<string, string> = {};
++  if (options.body !== undefined) headers['content-type'] = 'application/json';
++  if (options.user) headers['x-user-id'] = options.user;
++  if (options.key) headers['idempotency-key'] = options.key;
++  const response = await fetch(`${BASE}${path}`, {
++    method,
++    headers,
++    ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
++  });
++  const text = await response.text();
++  const body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
++  return {
++    status: response.status,
++    replayed: response.headers.get('idempotency-replayed') === 'true',
++    body,
++  };
++}
++
++function step(title: string): void {
++  console.log(`\n▶ ${title}`);
++}
++
++function show(reply: Reply, ...fields: string[]): void {
++  const picked = fields.length
++    ? Object.fromEntries(fields.map((f) => [f, reply.body[f]]))
++    : reply.body;
++  console.log(`  ${reply.status}${reply.replayed ? ' (replayed)' : ''} ${JSON.stringify(picked)}`);
++}
++
++async function main(): Promise<void> {
++  const health = await call('GET', '/health');
++  console.log(`slotlock at ${BASE} — strategy ${String(health.body.strategy)}`);
++  const run = Date.now().toString(36);
++  const alice = `alice-${run}`;
++  const bob = `bob-${run}`;
++
++  step(`Alice holds room-1 for ${SLOT.startsAt.slice(0, 10)} 09:00–10:00 (Idempotency-Key k1)`);
++  const held = await call('POST', '/bookings', {
++    body: { resourceId: 'room-1', ...SLOT },
++    user: alice,
++    key: `k1-${run}`,
++  });
++  show(held, 'id', 'status', 'amountCents', 'holdExpiresAt');
++  if (held.status !== 201)
++    throw new Error(
++      `expected 201, the slot may be taken from an earlier run: ${JSON.stringify(held.body)}`,
++    );
++  const bookingId = String(held.body.id);
++  const payment = held.body.payment as { id: string; provider: string };
++  console.log(`  payment intent ${payment.id} (${payment.provider})`);
++
++  step(
++    'Her client times out and retries with the same key: the stored answer comes back, no second hold',
++  );
++  show(
++    await call('POST', '/bookings', {
++      body: { resourceId: 'room-1', ...SLOT },
++      user: alice,
++      key: `k1-${run}`,
++    }),
++    'id',
++    'status',
++  );
++
++  step('Bob wants the same room and slot');
++  show(
++    await call('POST', '/bookings', {
++      body: { resourceId: 'room-1', ...SLOT },
++      user: bob,
++      key: `k2-${run}`,
++    }),
++    'code',
++    'message',
++  );
++
++  step("Alice reuses k1 for a different request: that's a 422, not a silent replay");
++  show(
++    await call('POST', '/bookings', {
++      body: { resourceId: 'room-2', ...SLOT },
++      user: alice,
++      key: `k1-${run}`,
++    }),
++    'code',
++  );
++
++  step(
++    'The customer pays; the PSP delivers created/processing/succeeded shuffled, and succeeded twice',
++  );
++  const paid = await call('POST', `/fake-psp/payments/${payment.id}/pay`, {
++    body: { order: 'shuffled', duplicate: true },
++  });
++  if (paid.status === 404) {
++    console.log(
++      '  (Stripe is the configured provider; pay the intent with a real test card instead)',
++    );
++  } else {
++    for (const d of paid.body.delivered as {
++      type: string;
++      createdAt: string;
++      outcome: string;
++      status?: string;
++    }[]) {
++      console.log(
++        `  ${d.createdAt}  ${d.type.padEnd(28)} → ${d.outcome}${d.status ? ` (${d.status})` : ''}`,
++      );
++    }
++  }
++  show(await call('GET', `/bookings/${bookingId}`), 'id', 'status', 'holdExpiresAt');
++
++  step('Bob books room-2 instead, then changes his mind');
++  const bobs = await call('POST', '/bookings', {
++    body: { resourceId: 'room-2', ...SLOT },
++    user: bob,
++    key: `k3-${run}`,
++  });
++  show(bobs, 'id', 'status');
++  show(await call('DELETE', `/bookings/${bobs.body.id}`, { user: bob }), 'id', 'status');
++  show(await call('DELETE', `/bookings/${bobs.body.id}`, { user: alice }), 'code');
++
++  step('Carol holds room-3 and never pays');
++  const carols = await call('POST', '/bookings', {
++    body: { resourceId: 'room-3', ...SLOT },
++    user: `carol-${run}`,
++    key: `k4-${run}`,
++  });
++  show(carols, 'id', 'status', 'holdExpiresAt');
++  const ttlMs = new Date(String(carols.body.holdExpiresAt)).getTime() - Date.now();
++  if (ttlMs > 90_000) {
++    console.log(
++      `  the hold lasts ${Math.round(ttlMs / 1000)} s — run the stack with HOLD_TTL_SECONDS=20 to watch it expire here`,
++    );
++  } else {
++    process.stdout.write(`  waiting ${Math.ceil(ttlMs / 1000)} s for the worker to expire it`);
++    const deadline = Date.now() + ttlMs + 30_000;
++    let status = 'HELD';
++    while (status === 'HELD' && Date.now() < deadline) {
++      await new Promise((r) => setTimeout(r, 2000));
++      process.stdout.write('.');
++      status = String((await call('GET', `/bookings/${carols.body.id}`)).body.status);
++    }
++    console.log();
++    show(await call('GET', `/bookings/${carols.body.id}`), 'id', 'status');
++    step('Room-3 is free again');
++    show(
++      await call('POST', '/bookings', {
++        body: { resourceId: 'room-3', ...SLOT },
++        user: bob,
++        key: `k5-${run}`,
++      }),
++      'id',
++      'status',
++    );
++  }
++
++  console.log(
++    '\nEvery step above also left an outbox row; the worker logs each as a notification, exactly once.',
++  );
++}
++
++main().catch((error) => {
++  console.error(error);
++  process.exit(1);
++});
+diff --git a/src/bookings/bookings.controller.ts b/src/bookings/bookings.controller.ts
+index 15e2088..773d8f4 100644
+--- a/src/bookings/bookings.controller.ts
++++ b/src/bookings/bookings.controller.ts
+@@ -11,21 +11,28 @@ import {
+   UseInterceptors,
+ } from '@nestjs/common';
+ import {
++  ApiBadRequestResponse,
++  ApiBody,
+   ApiConflictResponse,
+   ApiCreatedResponse,
++  ApiForbiddenResponse,
+   ApiHeader,
++  ApiNotFoundResponse,
+   ApiOkResponse,
+   ApiOperation,
+   ApiTags,
+   ApiUnprocessableEntityResponse,
+ } from '@nestjs/swagger';
++import { ERROR, jsonSchema } from '../common/openapi';
+ import { ZodValidationPipe } from '../common/zod-validation.pipe';
+ import { IdempotencyInterceptor } from '../idempotency/idempotency.interceptor';
+ import {
+   type BookingOut,
++  bookingOutSchema,
+   type CreateBooking,
+   type CreatedBooking,
+   createBookingSchema,
++  createdBookingSchema,
+ } from './bookings.dto';
+ import { BookingsService } from './bookings.service';
+ 
+@@ -37,19 +44,40 @@ export class BookingsController {
+   @Post()
+   @HttpCode(201)
+   @UseInterceptors(IdempotencyInterceptor)
+-  @ApiOperation({ summary: 'Hold a resource for a time slot (idempotent)' })
++  @ApiOperation({
++    summary: 'Hold a resource for a time slot (idempotent)',
++    description:
++      'Reserves the seat under the configured BOOKING_STRATEGY and creates a payment intent. ' +
++      'The hold lasts HOLD_TTL_SECONDS; a payment_intent.succeeded webhook confirms it. Retrying ' +
++      'with the same Idempotency-Key returns the stored answer with Idempotency-Replayed: true.',
++  })
+   @ApiHeader({
+     name: 'Idempotency-Key',
+     required: true,
+-    description: 'Unique per attempt; retries reuse it.',
++    description: 'Unique per attempt (1–128 chars); retries reuse it.',
+   })
+-  @ApiHeader({ name: 'X-User-Id', required: true })
++  @ApiHeader({
++    name: 'X-User-Id',
++    required: true,
++    description: 'The demo identifies users by header.',
++  })
++  @ApiBody({ schema: jsonSchema(createBookingSchema) })
+   @ApiCreatedResponse({
+     description: 'The booking is HELD until the hold expires or a payment confirms it.',
++    schema: jsonSchema(createdBookingSchema),
++  })
++  @ApiBadRequestResponse({
++    description: 'validation failed, idempotency_key_required, user_required',
++    schema: ERROR,
++  })
++  @ApiNotFoundResponse({ description: 'resource_not_found', schema: ERROR })
++  @ApiConflictResponse({
++    description: 'no_capacity, or request_in_flight for a concurrent retry.',
++    schema: ERROR,
+   })
+-  @ApiConflictResponse({ description: 'no_capacity, or request_in_flight for a concurrent retry.' })
+   @ApiUnprocessableEntityResponse({
+     description: 'idempotency_key_reused with a different request.',
++    schema: ERROR,
+   })
+   create(
+     @Headers('x-user-id') userId: string,
+@@ -59,7 +87,9 @@ export class BookingsController {
+   }
+ 
+   @Get(':id')
+-  @ApiOkResponse({ description: 'One booking.' })
++  @ApiOperation({ summary: 'One booking' })
++  @ApiOkResponse({ description: 'One booking.', schema: jsonSchema(bookingOutSchema) })
++  @ApiNotFoundResponse({ description: 'booking_not_found', schema: ERROR })
+   get(@Param('id') id: string): Promise<BookingOut> {
+     return this.bookings.get(id);
+   }
+@@ -67,9 +97,15 @@ export class BookingsController {
+   @Delete(':id')
+   @ApiOperation({ summary: 'Cancel a held or confirmed booking (owner only; idempotent)' })
+   @ApiHeader({ name: 'X-User-Id', required: true })
+-  @ApiOkResponse({ description: 'The booking, now CANCELLED.' })
++  @ApiOkResponse({
++    description: 'The booking, now CANCELLED.',
++    schema: jsonSchema(bookingOutSchema),
++  })
++  @ApiForbiddenResponse({ description: 'forbidden: not the owner', schema: ERROR })
++  @ApiNotFoundResponse({ description: 'booking_not_found', schema: ERROR })
+   @ApiConflictResponse({
+     description: 'invalid_transition: an EXPIRED booking cannot be cancelled.',
++    schema: ERROR,
+   })
+   cancel(@Param('id') id: string, @Headers('x-user-id') userId: string): Promise<BookingOut> {
+     if (!userId)
+diff --git a/src/bookings/bookings.dto.ts b/src/bookings/bookings.dto.ts
+index 3048f17..0e4bb4d 100644
+--- a/src/bookings/bookings.dto.ts
++++ b/src/bookings/bookings.dto.ts
+@@ -4,9 +4,9 @@ const MAX_DURATION_MS = 8 * 60 * 60 * 1000;
+ 
+ export const createBookingSchema = z
+   .object({
+-    resourceId: z.string().min(1).max(64),
+-    startsAt: z.coerce.date(),
+-    endsAt: z.coerce.date(),
++    resourceId: z.string().min(1).max(64).describe('A room or desk pool id, e.g. room-1'),
++    startsAt: z.coerce.date().describe('ISO 8601'),
++    endsAt: z.coerce.date().describe('ISO 8601; at most 8 hours after startsAt'),
+   })
+   .refine((b) => b.endsAt > b.startsAt, {
+     message: 'endsAt must be after startsAt',
+@@ -19,19 +19,25 @@ export const createBookingSchema = z
+ 
+ export type CreateBooking = z.infer<typeof createBookingSchema>;
+ 
+-export interface BookingOut {
+-  id: string;
+-  resourceId: string;
+-  userId: string;
+-  startsAt: string;
+-  endsAt: string;
+-  status: 'HELD' | 'CONFIRMED' | 'CANCELLED' | 'EXPIRED';
+-  holdExpiresAt: string | null;
+-  amountCents: number;
+-  paymentId: string | null;
+-}
++export const bookingOutSchema = z.object({
++  id: z.uuid(),
++  resourceId: z.string(),
++  userId: z.string(),
++  startsAt: z.iso.datetime(),
++  endsAt: z.iso.datetime(),
++  status: z.enum(['HELD', 'CONFIRMED', 'CANCELLED', 'EXPIRED']),
++  holdExpiresAt: z.iso.datetime().nullable().describe('When a HELD booking expires unpaid'),
++  amountCents: z.int(),
++  paymentId: z.string().nullable(),
++});
++export type BookingOut = z.infer<typeof bookingOutSchema>;
+ 
+ /** The 201 body: the booking plus what the client needs to pay for it. */
+-export interface CreatedBooking extends BookingOut {
+-  payment: { provider: 'stripe' | 'fake'; id: string; clientSecret: string | null };
+-}
++export const createdBookingSchema = bookingOutSchema.extend({
++  payment: z.object({
++    provider: z.enum(['stripe', 'fake']),
++    id: z.string().describe('PaymentIntent id'),
++    clientSecret: z.string().nullable().describe('For Stripe.js on the client'),
++  }),
++});
++export type CreatedBooking = z.infer<typeof createdBookingSchema>;
+diff --git a/src/common/openapi.ts b/src/common/openapi.ts
+index 744f49b..5c4ac70 100644
+--- a/src/common/openapi.ts
++++ b/src/common/openapi.ts
+@@ -1,6 +1,25 @@
+ import { z } from 'zod';
+ 
+-/** Zod 4 emits JSON Schema; Swagger accepts it as a schema object for bodies and responses. */
++/**
++ * Zod 4 emits JSON Schema; Swagger accepts it as a schema object for bodies and responses.
++ * `z.coerce.date()` has no JSON representation, so dates are documented as ISO 8601 strings.
++ */
+ export function jsonSchema(schema: z.ZodType): Record<string, unknown> {
+-  return z.toJSONSchema(schema, { target: 'openapi-3.0' }) as Record<string, unknown>;
++  return z.toJSONSchema(schema, {
++    target: 'openapi-3.0',
++    unrepresentable: 'any',
++    override: (ctx) => {
++      if (ctx.zodSchema._zod.def.type === 'date') {
++        ctx.jsonSchema.type = 'string';
++        ctx.jsonSchema.format = 'date-time';
++      }
++    },
++  }) as Record<string, unknown>;
+ }
++
++export const errorSchema = z.object({
++  code: z.string().describe('Stable machine-readable reason, e.g. no_capacity'),
++  message: z.string(),
++});
++
++export const ERROR = jsonSchema(errorSchema);
+diff --git a/src/main.ts b/src/main.ts
+index 0de54ce..9641b9c 100644
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -20,8 +20,17 @@ export async function createApp(config?: Config): Promise<NestFastifyApplication
+     app,
+     new DocumentBuilder()
+       .setTitle('slotlock')
+-      .setDescription('A reservation API that cannot double-book.')
++      .setDescription(
++        'A reservation API that cannot double-book. Rooms are exclusive, desk pools have a ' +
++          'capacity; a booking is HELD while the customer pays, CONFIRMED by the payment ' +
++          'webhook, or EXPIRED by the worker. Every POST /bookings needs an Idempotency-Key.',
++      )
+       .setVersion('0.1.0')
++      .addTag('resources', 'Rooms, desk pools and their availability')
++      .addTag('bookings', 'Holds, confirmations, cancellations')
++      .addTag('payments', 'Webhooks from the payment provider')
++      .addTag('fake-psp', 'The in-repo payment provider, for demos and tests')
++      .addTag('meta', 'Health and the active strategy')
+       .build(),
+   );
+   SwaggerModule.setup('docs', app, document, { jsonDocumentUrl: 'openapi.json' });
+diff --git a/src/payments/fake-psp.controller.ts b/src/payments/fake-psp.controller.ts
+index 5083490..9cd0f13 100644
+--- a/src/payments/fake-psp.controller.ts
++++ b/src/payments/fake-psp.controller.ts
+@@ -1,6 +1,7 @@
+ import { Body, Controller, HttpCode, Inject, NotFoundException, Param, Post } from '@nestjs/common';
+-import { ApiOperation, ApiTags } from '@nestjs/swagger';
++import { ApiBody, ApiOkResponse, ApiOperation, ApiTags } from '@nestjs/swagger';
+ import { z } from 'zod';
++import { jsonSchema } from '../common/openapi';
+ import { ZodValidationPipe } from '../common/zod-validation.pipe';
+ import { type FakeOutcome, FakePaymentProvider, type SignedEvent } from './fake.provider';
+ import { PAYMENT_PROVIDER, type PaymentProvider } from './payment.provider';
+@@ -37,7 +38,15 @@ export class FakePspController {
+ 
+   @Post('payments/:paymentId/pay')
+   @HttpCode(200)
+-  @ApiOperation({ summary: 'Simulate the customer paying (or the intent being canceled)' })
++  @ApiOperation({
++    summary: 'Simulate the customer paying (or the intent being canceled)',
++    description:
++      'Generates the events Stripe would send (created, processing, then the outcome) and delivers ' +
++      'them through the webhook endpoint in the requested order, with an optional duplicate. Only ' +
++      'with the fake provider; 404 under Stripe.',
++  })
++  @ApiBody({ schema: jsonSchema(paySchema), required: false })
++  @ApiOkResponse({ description: 'What each delivery did, in delivery order.' })
+   async pay(
+     @Param('paymentId') paymentId: string,
+     @Body(new ZodValidationPipe(paySchema)) body: Pay,
+diff --git a/test/integration/openapi.test.ts b/test/integration/openapi.test.ts
+new file mode 100644
+index 0000000..9c786e6
+--- /dev/null
++++ b/test/integration/openapi.test.ts
+@@ -0,0 +1,60 @@
++import type { NestFastifyApplication } from '@nestjs/platform-fastify';
++import { afterAll, beforeAll, describe, expect, it } from 'vitest';
++import { createTestApp } from './harness';
++
++let app: NestFastifyApplication;
++
++beforeAll(async () => {
++  app = await createTestApp();
++});
++afterAll(async () => {
++  await app.close();
++});
++
++describe('the OpenAPI document', () => {
++  it('describes bodies, responses and errors with real schemas', async () => {
++    const response = await app.inject({ method: 'GET', url: '/openapi.json' });
++    expect(response.statusCode).toBe(200);
++    const doc = response.json<{
++      tags: { name: string }[];
++      paths: Record<
++        string,
++        Record<
++          string,
++          {
++            requestBody?: unknown;
++            responses: Record<
++              string,
++              { content?: Record<string, { schema: { properties?: Record<string, unknown> } }> }
++            >;
++          }
++        >
++      >;
++    }>();
++    expect(doc.tags.map((t) => t.name)).toEqual([
++      'resources',
++      'bookings',
++      'payments',
++      'fake-psp',
++      'meta',
++    ]);
++    const post = doc.paths['/bookings']?.post;
++    if (!post) throw new Error('POST /bookings missing');
++    expect(post.requestBody).toBeTruthy();
++    expect(
++      Object.keys(post.responses['201']?.content?.['application/json']?.schema.properties ?? {}),
++    ).toContain('payment');
++    expect(
++      Object.keys(post.responses['409']?.content?.['application/json']?.schema.properties ?? {}),
++    ).toEqual(['code', 'message']);
++    expect(doc.paths['/bookings/{id}']?.delete?.responses['403']).toBeTruthy();
++    expect(doc.paths['/webhooks/payments']?.post).toBeTruthy();
++    expect(doc.paths['/fake-psp/payments/{paymentId}/pay']?.post?.requestBody).toBeTruthy();
++  });
++
++  it('serves Swagger UI', async () => {
++    const response = await app.inject({ method: 'GET', url: '/docs' });
++    expect(response.statusCode).toBe(200);
++    expect(response.body).toContain('swagger-ui');
++  });
++});
+diff --git a/test/integration/outbox.test.ts b/test/integration/outbox.test.ts
+index 6f0d691..2ea350f 100644
+--- a/test/integration/outbox.test.ts
++++ b/test/integration/outbox.test.ts
+@@ -7,8 +7,6 @@ import { HoldExpiryService } from '../../src/bookings/holds/hold-expiry.service'
+ import { NotificationSink } from '../../src/outbox/notification.sink';
+ import { NotificationsProcessor } from '../../src/outbox/notifications.processor';
+ import { OutboxRelay } from '../../src/outbox/outbox.relay';
+-import type { FakePaymentProvider } from '../../src/payments/fake.provider';
+-import { PAYMENT_PROVIDER } from '../../src/payments/payment.provider';
+ import { PrismaService } from '../../src/prisma/prisma.service';
+ import { NOTIFICATIONS_QUEUE, OUTBOX_QUEUE } from '../../src/queue/queue.module';
+ import { createTestApp, createTestWorker, resetDatabase } from './harness';
+@@ -18,7 +16,6 @@ const SLOT = { startsAt: '2026-10-01T09:00:00.000Z', endsAt: '2026-10-01T10:00:0
+ let app: NestFastifyApplication;
+ let worker: INestApplicationContext;
+ let prisma: PrismaService;
+-let psp: FakePaymentProvider;
+ let notifications: Queue;
+ let sink: NotificationSink;
+ let relay: OutboxRelay;
+@@ -34,7 +31,6 @@ beforeAll(async () => {
+     HOLD_SWEEP_INTERVAL_MS: '600000',
+   });
+   prisma = app.get(PrismaService);
+-  psp = app.get<FakePaymentProvider>(PAYMENT_PROVIDER);
+   notifications = app.get<Queue>(getQueueToken(NOTIFICATIONS_QUEUE));
+   sink = worker.get(NotificationSink);
+   relay = worker.get(OutboxRelay);
+diff --git a/test/unit/openapi.test.ts b/test/unit/openapi.test.ts
+new file mode 100644
+index 0000000..3c69c7e
+--- /dev/null
++++ b/test/unit/openapi.test.ts
+@@ -0,0 +1,27 @@
++import { describe, expect, it } from 'vitest';
++import { z } from 'zod';
++import { createBookingSchema, createdBookingSchema } from '../../src/bookings/bookings.dto';
++import { ERROR, jsonSchema } from '../../src/common/openapi';
++
++describe('jsonSchema', () => {
++  it('documents coerced dates as ISO 8601 strings', () => {
++    const schema = jsonSchema(createBookingSchema) as {
++      properties: Record<string, { type: string; format?: string }>;
++    };
++    expect(schema.properties.startsAt).toMatchObject({ type: 'string', format: 'date-time' });
++    expect(schema.properties.resourceId).toMatchObject({ type: 'string' });
++  });
++
++  it('renders the response and error shapes', () => {
++    const created = jsonSchema(createdBookingSchema) as {
++      properties: Record<string, unknown>;
++      required: string[];
++    };
++    expect(Object.keys(created.properties)).toEqual(
++      expect.arrayContaining(['id', 'status', 'payment', 'holdExpiresAt']),
++    );
++    expect(created.required).toContain('payment');
++    expect(ERROR).toMatchObject({ type: 'object', required: ['code', 'message'] });
++    expect(jsonSchema(z.object({ n: z.int().nullable() }))).toMatchObject({ type: 'object' });
++  });
++});
+diff --git a/tsconfig.json b/tsconfig.json
+index cc42d57..bf2f850 100644
+--- a/tsconfig.json
++++ b/tsconfig.json
+@@ -20,5 +20,5 @@
+     "rootDir": ".",
+     "noEmit": true
+   },
+-  "include": ["src", "test", "bench", "prisma", "*.config.ts", "*.config.mts"]
++  "include": ["src", "test", "bench", "scripts", "prisma", "*.config.ts", "*.config.mts"]
+ }

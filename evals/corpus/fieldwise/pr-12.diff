@@ -1,0 +1,300 @@
+diff --git a/web/package.json b/web/package.json
+index 2994a69..e62ee97 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -23,8 +23,8 @@
+     "next": "16.3.5",
+     "next-themes": "^0.4.6",
+     "openapi-fetch": "^0.17.0",
+-    "react": "19.2.8",
+-    "react-dom": "19.2.8",
++    "react": "19.3.0",
++    "react-dom": "19.3.0",
+     "shadcn": "^4.21.0",
+     "sonner": "^2.0.8",
+     "tailwind-merge": "^3.7.0",
+diff --git a/web/pnpm-lock.yaml b/web/pnpm-lock.yaml
+index 1ccc36b..8457b18 100644
+--- a/web/pnpm-lock.yaml
++++ b/web/pnpm-lock.yaml
+@@ -168,10 +168,10 @@ importers:
+     dependencies:
+       '@base-ui/react':
+         specifier: ^1.8.0
+-        version: 1.8.0(@types/react@19.3.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
++        version: 1.8.0(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+       '@tanstack/react-query':
+         specifier: ^5.103.1
+-        version: 5.103.1(react@19.2.8)
++        version: 5.103.1(react@19.3.0)
+       class-variance-authority:
+         specifier: ^0.7.1
+         version: 0.7.1
+@@ -183,28 +183,28 @@ importers:
+         version: 0.3.0
+       lucide-react:
+         specifier: ^1.47.0
+-        version: 1.47.0(react@19.2.8)
++        version: 1.47.0(react@19.3.0)
+       next:
+         specifier: 16.3.5
+-        version: 16.3.5(@babel/core@7.29.7(supports-color@10.2.2))(@types/node@24.13.5)(babel-plugin-react-compiler@1.0.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
++        version: 16.3.5(@babel/core@7.29.7(supports-color@10.2.2))(@types/node@24.13.5)(babel-plugin-react-compiler@1.0.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+       next-themes:
+         specifier: ^0.4.6
+-        version: 0.4.6(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
++        version: 0.4.6(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+       openapi-fetch:
+         specifier: ^0.17.0
+         version: 0.17.0
+       react:
+-        specifier: 19.2.8
+-        version: 19.2.8
++        specifier: 19.3.0
++        version: 19.3.0
+       react-dom:
+-        specifier: 19.2.8
+-        version: 19.2.8(react@19.2.8)
++        specifier: 19.3.0
++        version: 19.3.0(react@19.3.0)
+       shadcn:
+         specifier: ^4.21.0
+         version: 4.21.0(supports-color@10.2.2)(typescript@5.9.3)
+       sonner:
+         specifier: ^2.0.8
+-        version: 2.0.8(@types/react@19.3.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
++        version: 2.0.8(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+       tailwind-merge:
+         specifier: ^3.7.0
+         version: 3.7.0
+@@ -223,7 +223,7 @@ importers:
+         version: 10.4.2
+       '@testing-library/react':
+         specifier: ^16.3.3
+-        version: 16.3.3(@testing-library/dom@10.4.2)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
++        version: 16.3.3(@testing-library/dom@10.4.2)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+       '@types/node':
+         specifier: ^24.13.5
+         version: 24.13.5
+@@ -2228,16 +2228,16 @@ packages:
+     resolution: {integrity: sha512-K5zQjDllxWkf7Z5xJdV0/B0WTNqx6vxG70zJE4N0kBs4LovmEYWJzQGxC9bS9RAKu3bgM40lrd5zoLJ12MQ5BA==}
+     engines: {node: '>= 0.10'}
+ 
+-  react-dom@19.2.8:
+-    resolution: {integrity: sha512-rVprimfGBG3DR+Tq0IQG2DT5PxKth1WIGDmj5yPmlzr4YBe7uyE+Du4oVqTDXZSHGGGXRtTJEGSSePyQCMBglQ==}
++  react-dom@19.3.0:
++    resolution: {integrity: sha512-JDk8dgif51OjFoDE70+OT9ICyYr+69HlmihNwp1+Nsfbna3t5sIiCa9ZJktDmQ4/1b/rn26hIAR2uYXDMr5r0Q==}
+     peerDependencies:
+-      react: ^19.2.8
++      react: ^19.3.0
+ 
+   react-is@17.0.2:
+     resolution: {integrity: sha512-w2GsyukL62IJnlaff/nRegPQR94C/XXamvMWmSHRJ4y7Ts/4ocGRmTHvOs8PSE6pB3dWOrD/nueuU5sduBsQ4w==}
+ 
+-  react@19.2.8:
+-    resolution: {integrity: sha512-PWaYA1L/q9u2u7xYQi+Y3L3Yfnie7XyLeaJICV1MGD6LprsBxcAqGjYyr0eY3p+QdsA+x/Irkt4Qif8D63+Sbw==}
++  react@19.3.0:
++    resolution: {integrity: sha512-E8LUcbtBWt20bbl2YoHfx4ZDBdxVTfOKtCZn9cDSJ4l6/nuoApcpIBcj47t2wZoVX8g2ZHuMHbiShgCR1T5Sog==}
+     engines: {node: '>=0.10.0'}
+ 
+   recast@0.23.21:
+@@ -2282,8 +2282,8 @@ packages:
+   safer-buffer@2.1.2:
+     resolution: {integrity: sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==}
+ 
+-  scheduler@0.27.0:
+-    resolution: {integrity: sha512-eNv+WrVbKu1f3vbYJT/xtiF5syA5HPIMtf9IgY/nKg0sWqzAUEvqY/xm7OcZc/qafLx/iO9FgOmeSAp4v5ti/Q==}
++  scheduler@0.28.0:
++    resolution: {integrity: sha512-juorfCmIkIw8tT+p5BXSm6PJjQF/ycEYmKyzURCIt/RaZIhL+PulbQ9Yu2z1HdOJDdqDTlxA1+xKBmHXJsczAw==}
+ 
+   semver@6.3.1:
+     resolution: {integrity: sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA==}
+@@ -2893,26 +2893,26 @@ snapshots:
+       '@babel/helper-string-parser': 7.29.7
+       '@babel/helper-validator-identifier': 7.29.7
+ 
+-  '@base-ui/react@1.8.0(@types/react@19.3.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
++  '@base-ui/react@1.8.0(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
+     dependencies:
+       '@babel/runtime': 7.29.7
+-      '@base-ui/utils': 0.4.0(@types/react@19.3.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
+-      '@floating-ui/react-dom': 2.1.9(react-dom@19.2.8(react@19.2.8))(react@19.2.8)
++      '@base-ui/utils': 0.4.0(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
++      '@floating-ui/react-dom': 2.1.9(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+       '@floating-ui/utils': 0.2.12
+-      react: 19.2.8
+-      react-dom: 19.2.8(react@19.2.8)
+-      use-sync-external-store: 1.7.0(react@19.2.8)
++      react: 19.3.0
++      react-dom: 19.3.0(react@19.3.0)
++      use-sync-external-store: 1.7.0(react@19.3.0)
+     optionalDependencies:
+       '@types/react': 19.3.0
+ 
+-  '@base-ui/utils@0.4.0(@types/react@19.3.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
++  '@base-ui/utils@0.4.0(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
+     dependencies:
+       '@babel/runtime': 7.29.7
+       '@floating-ui/utils': 0.2.12
+-      react: 19.2.8
+-      react-dom: 19.2.8(react@19.2.8)
++      react: 19.3.0
++      react-dom: 19.3.0(react@19.3.0)
+       reselect: 5.3.0
+-      use-sync-external-store: 1.7.0(react@19.2.8)
++      use-sync-external-store: 1.7.0(react@19.3.0)
+     optionalDependencies:
+       '@types/react': 19.3.0
+ 
+@@ -2986,11 +2986,11 @@ snapshots:
+       '@floating-ui/core': 1.8.0
+       '@floating-ui/utils': 0.2.12
+ 
+-  '@floating-ui/react-dom@2.1.9(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
++  '@floating-ui/react-dom@2.1.9(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
+     dependencies:
+       '@floating-ui/dom': 1.8.0
+-      react: 19.2.8
+-      react-dom: 19.2.8(react@19.2.8)
++      react: 19.3.0
++      react-dom: 19.3.0(react@19.3.0)
+ 
+   '@floating-ui/utils@0.2.12': {}
+ 
+@@ -3335,10 +3335,10 @@ snapshots:
+ 
+   '@tanstack/query-core@5.103.1': {}
+ 
+-  '@tanstack/react-query@5.103.1(react@19.2.8)':
++  '@tanstack/react-query@5.103.1(react@19.3.0)':
+     dependencies:
+       '@tanstack/query-core': 5.103.1
+-      react: 19.2.8
++      react: 19.3.0
+ 
+   '@testing-library/dom@10.4.2':
+     dependencies:
+@@ -3351,12 +3351,12 @@ snapshots:
+       picocolors: 1.1.1
+       pretty-format: 27.5.1
+ 
+-  '@testing-library/react@16.3.3(@testing-library/dom@10.4.2)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8)':
++  '@testing-library/react@16.3.3(@testing-library/dom@10.4.2)(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)':
+     dependencies:
+       '@babel/runtime': 7.29.7
+       '@testing-library/dom': 10.4.2
+-      react: 19.2.8
+-      react-dom: 19.2.8(react@19.2.8)
++      react: 19.3.0
++      react-dom: 19.3.0(react@19.3.0)
+     optionalDependencies:
+       '@types/react': 19.3.0
+       '@types/react-dom': 19.3.0(@types/react@19.3.0)
+@@ -4142,9 +4142,9 @@ snapshots:
+     dependencies:
+       yallist: 3.1.1
+ 
+-  lucide-react@1.47.0(react@19.2.8):
++  lucide-react@1.47.0(react@19.3.0):
+     dependencies:
+-      react: 19.2.8
++      react: 19.3.0
+ 
+   lz-string@1.5.0: {}
+ 
+@@ -4201,21 +4201,21 @@ snapshots:
+     dependencies:
+       content-type: 2.1.0
+ 
+-  next-themes@0.4.6(react-dom@19.2.8(react@19.2.8))(react@19.2.8):
++  next-themes@0.4.6(react-dom@19.3.0(react@19.3.0))(react@19.3.0):
+     dependencies:
+-      react: 19.2.8
+-      react-dom: 19.2.8(react@19.2.8)
++      react: 19.3.0
++      react-dom: 19.3.0(react@19.3.0)
+ 
+-  next@16.3.5(@babel/core@7.29.7(supports-color@10.2.2))(@types/node@24.13.5)(babel-plugin-react-compiler@1.0.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8):
++  next@16.3.5(@babel/core@7.29.7(supports-color@10.2.2))(@types/node@24.13.5)(babel-plugin-react-compiler@1.0.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0):
+     dependencies:
+       '@next/env': 16.3.5
+       '@swc/helpers': 0.5.23
+       baseline-browser-mapping: 2.11.24
+       caniuse-lite: 1.0.30001810
+       postcss: 8.5.23
+-      react: 19.2.8
+-      react-dom: 19.2.8(react@19.2.8)
+-      styled-jsx: 5.1.6(@babel/core@7.29.7(supports-color@10.2.2))(react@19.2.8)
++      react: 19.3.0
++      react-dom: 19.3.0(react@19.3.0)
++      styled-jsx: 5.1.6(@babel/core@7.29.7(supports-color@10.2.2))(react@19.3.0)
+     optionalDependencies:
+       '@next/swc-darwin-arm64': 16.3.5
+       '@next/swc-darwin-x64': 16.3.5
+@@ -4422,14 +4422,14 @@ snapshots:
+       iconv-lite: 0.7.3
+       unpipe: 1.0.0
+ 
+-  react-dom@19.2.8(react@19.2.8):
++  react-dom@19.3.0(react@19.3.0):
+     dependencies:
+-      react: 19.2.8
+-      scheduler: 0.27.0
++      react: 19.3.0
++      scheduler: 0.28.0
+ 
+   react-is@17.0.2: {}
+ 
+-  react@19.2.8: {}
++  react@19.3.0: {}
+ 
+   recast@0.23.21:
+     dependencies:
+@@ -4491,7 +4491,7 @@ snapshots:
+ 
+   safer-buffer@2.1.2: {}
+ 
+-  scheduler@0.27.0: {}
++  scheduler@0.28.0: {}
+ 
+   semver@6.3.1: {}
+ 
+@@ -4648,10 +4648,10 @@ snapshots:
+       ip-address: 10.7.2
+       smart-buffer: 4.2.0
+ 
+-  sonner@2.0.8(@types/react@19.3.0)(react-dom@19.2.8(react@19.2.8))(react@19.2.8):
++  sonner@2.0.8(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0):
+     dependencies:
+-      react: 19.2.8
+-      react-dom: 19.2.8(react@19.2.8)
++      react: 19.3.0
++      react-dom: 19.3.0(react@19.3.0)
+     optionalDependencies:
+       '@types/react': 19.3.0
+ 
+@@ -4693,10 +4693,10 @@ snapshots:
+ 
+   strip-final-newline@4.0.0: {}
+ 
+-  styled-jsx@5.1.6(@babel/core@7.29.7(supports-color@10.2.2))(react@19.2.8):
++  styled-jsx@5.1.6(@babel/core@7.29.7(supports-color@10.2.2))(react@19.3.0):
+     dependencies:
+       client-only: 0.0.1
+-      react: 19.2.8
++      react: 19.3.0
+     optionalDependencies:
+       '@babel/core': 7.29.7(supports-color@10.2.2)
+ 
+@@ -4772,9 +4772,9 @@ snapshots:
+ 
+   uri-js-replace@1.0.1: {}
+ 
+-  use-sync-external-store@1.7.0(react@19.2.8):
++  use-sync-external-store@1.7.0(react@19.3.0):
+     dependencies:
+-      react: 19.2.8
++      react: 19.3.0
+ 
+   util-deprecate@1.0.2: {}
+ 

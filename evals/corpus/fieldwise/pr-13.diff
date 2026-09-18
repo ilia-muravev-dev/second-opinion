@@ -1,0 +1,10042 @@
+diff --git a/.github/dependabot.yml b/.github/dependabot.yml
+index 9dd7332..abdac77 100644
+--- a/.github/dependabot.yml
++++ b/.github/dependabot.yml
+@@ -7,6 +7,10 @@ updates:
+     groups:
+       python-dependencies:
+         patterns: ['*']
++    ignore:
++      # Majors are deliberate upgrades, exercised against the real providers.
++      - dependency-name: '*'
++        update-types: ['version-update:semver-major']
+   - package-ecosystem: github-actions
+     directory: /
+     schedule:
+@@ -19,6 +23,9 @@ updates:
+     directory: /backend
+     schedule:
+       interval: monthly
++    ignore:
++      - dependency-name: python
++        update-types: ['version-update:semver-major', 'version-update:semver-minor']
+   - package-ecosystem: npm
+     directory: /web
+     schedule:
+@@ -35,3 +42,6 @@ updates:
+     directory: /web
+     schedule:
+       interval: monthly
++    ignore:
++      - dependency-name: node
++        update-types: ['version-update:semver-major']
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 1c6ee07..104e21b 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -30,6 +30,38 @@ jobs:
+       - name: The committed API contract is current
+         run: uv run fieldwise openapi /tmp/openapi.json && diff -q /tmp/openapi.json ../openapi.json
+ 
++  eval-gate:
++    name: Eval gate — replayed responses re-scored against the baseline
++    runs-on: ubuntu-latest
++    defaults:
++      run:
++        working-directory: backend
++    services:
++      db:
++        image: pgvector/pgvector:pg17
++        env:
++          POSTGRES_USER: fieldwise
++          POSTGRES_PASSWORD: fieldwise
++          POSTGRES_DB: fieldwise
++        ports:
++          - 5432:5432
++        options: >-
++          --health-cmd "pg_isready -U fieldwise -d fieldwise"
++          --health-interval 5s --health-timeout 3s --health-retries 10
++    env:
++      DATABASE_URL: postgresql+psycopg://fieldwise:fieldwise@localhost:5432/fieldwise
++      STORAGE_URL: file:///tmp/fieldwise-storage
++    steps:
++      - uses: actions/checkout@v7
++      - uses: astral-sh/setup-uv@v7
++        with:
++          enable-cache: true
++          cache-dependency-glob: backend/uv.lock
++      - run: uv sync --frozen
++      - run: uv run fieldwise db upgrade && uv run fieldwise schemas sync
++      - name: Replay the recorded responses and compare with evals/baseline.json
++        run: uv run fieldwise gate run --prompt v2 --provider openai --model nex-agi/nex-n2.5-pro:free
++
+   web:
+     name: Web — biome, types, vitest, build, generated client current
+     runs-on: ubuntu-latest
+diff --git a/backend/evals/baseline.json b/backend/evals/baseline.json
+new file mode 100644
+index 0000000..ced1c27
+--- /dev/null
++++ b/backend/evals/baseline.json
+@@ -0,0 +1,25 @@
++{
++  "doc_exact_rate": 0.5,
++  "lists": {
++    "line_items": 0.6666666666666666
++  },
++  "model": "nex-agi/nex-n2.5-pro:free",
++  "overall_accuracy": 0.910828025477707,
++  "per_field": {
++    "card_paid": 1.0,
++    "cash_paid": 1.0,
++    "change": 0.9444444444444444,
++    "discount": 0.9444444444444444,
++    "item_count": 1.0,
++    "line_items[].line_total": 0.8421052631578947,
++    "line_items[].name": 0.8157894736842105,
++    "line_items[].quantity": 0.8947368421052632,
++    "line_items[].unit_price": 0.8421052631578947,
++    "service_charge": 1.0,
++    "subtotal": 0.8888888888888888,
++    "tax": 1.0,
++    "total": 0.9444444444444444
++  },
++  "prompt": "v2",
++  "value_accuracy": 0.9505494505494505
++}
+diff --git a/backend/evals/cassettes/1b171572308676e6af4ea8fb3f533433.json b/backend/evals/cassettes/1085f195e5678492966c592c64763707.json
+similarity index 93%
+rename from backend/evals/cassettes/1b171572308676e6af4ea8fb3f533433.json
+rename to backend/evals/cassettes/1085f195e5678492966c592c64763707.json
+index 6b15c6a..9a50927 100644
+--- a/backend/evals/cassettes/1b171572308676e6af4ea8fb3f533433.json
++++ b/backend/evals/cassettes/1085f195e5678492966c592c64763707.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "1c091eb7436b3e5a813eb6492c0350ef4eb14e3fdad78d42da35df669c757292",
++    "document": "cord-v2/test/0006",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/4d5624d963772ec5cf976ba554fa12e8.json b/backend/evals/cassettes/13393968ba94700332fe5246fbd55845.json
+similarity index 92%
+rename from backend/evals/cassettes/4d5624d963772ec5cf976ba554fa12e8.json
+rename to backend/evals/cassettes/13393968ba94700332fe5246fbd55845.json
+index 2a7a352..8690939 100644
+--- a/backend/evals/cassettes/4d5624d963772ec5cf976ba554fa12e8.json
++++ b/backend/evals/cassettes/13393968ba94700332fe5246fbd55845.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "b5f8a3a9a5431b8e38a8e5a16011d6a5a457f7ae4c4ef31da77e589c0b1ad882",
++    "document": "cord-v2/test/0012",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/8935e4437fb9bc98c27ff639587f3c07.json b/backend/evals/cassettes/1e3cfd2364f8e06af555dbe9d1f0e636.json
+similarity index 91%
+rename from backend/evals/cassettes/8935e4437fb9bc98c27ff639587f3c07.json
+rename to backend/evals/cassettes/1e3cfd2364f8e06af555dbe9d1f0e636.json
+index a8aded6..d109b19 100644
+--- a/backend/evals/cassettes/8935e4437fb9bc98c27ff639587f3c07.json
++++ b/backend/evals/cassettes/1e3cfd2364f8e06af555dbe9d1f0e636.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "d92479ab212713e7a65e56aacc5e68c0713597476608cbc394d997971043010b",
++    "document": "cord-v2/test/0011",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/ff79fede366a57266926b0de5f4ca35a.json b/backend/evals/cassettes/2591d2cb02c2957d36fcce907d84188f.json
+similarity index 91%
+rename from backend/evals/cassettes/ff79fede366a57266926b0de5f4ca35a.json
+rename to backend/evals/cassettes/2591d2cb02c2957d36fcce907d84188f.json
+index d34a62a..2a94ee9 100644
+--- a/backend/evals/cassettes/ff79fede366a57266926b0de5f4ca35a.json
++++ b/backend/evals/cassettes/2591d2cb02c2957d36fcce907d84188f.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "8612d04b70f430f3aef07fbbd5200e382dcc4152b344cc2eff9f735f05a257c8",
++    "document": "cord-v2/test/0000",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/f7e904824f279cdb729a37c9b1d0e6d2.json b/backend/evals/cassettes/31b367cbbb95de1c0988de0a96e0985d.json
+similarity index 91%
+rename from backend/evals/cassettes/f7e904824f279cdb729a37c9b1d0e6d2.json
+rename to backend/evals/cassettes/31b367cbbb95de1c0988de0a96e0985d.json
+index 182dc58..a57ca90 100644
+--- a/backend/evals/cassettes/f7e904824f279cdb729a37c9b1d0e6d2.json
++++ b/backend/evals/cassettes/31b367cbbb95de1c0988de0a96e0985d.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "8612d04b70f430f3aef07fbbd5200e382dcc4152b344cc2eff9f735f05a257c8",
++    "document": "cord-v2/test/0000",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/8beee3c7dab404c6b66cebaaa06cf424.json b/backend/evals/cassettes/44f695dbf3d9e4d38a9688353ce24cc2.json
+similarity index 91%
+rename from backend/evals/cassettes/8beee3c7dab404c6b66cebaaa06cf424.json
+rename to backend/evals/cassettes/44f695dbf3d9e4d38a9688353ce24cc2.json
+index 4c13aca..2abb977 100644
+--- a/backend/evals/cassettes/8beee3c7dab404c6b66cebaaa06cf424.json
++++ b/backend/evals/cassettes/44f695dbf3d9e4d38a9688353ce24cc2.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "88c35bbd2e2a634e89f2c5bfd30f7b530b1082c1f4e6e7cb3cb913f0b46c3868",
++    "document": "cord-v2/test/0018",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/68cf9f5b509246160557ed519d25ab94.json b/backend/evals/cassettes/4bf832f7889af4274ea32137ceb192c2.json
+similarity index 91%
+rename from backend/evals/cassettes/68cf9f5b509246160557ed519d25ab94.json
+rename to backend/evals/cassettes/4bf832f7889af4274ea32137ceb192c2.json
+index ea02112..b188236 100644
+--- a/backend/evals/cassettes/68cf9f5b509246160557ed519d25ab94.json
++++ b/backend/evals/cassettes/4bf832f7889af4274ea32137ceb192c2.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "2a5d18c199bdbb75010a54430429cf694b35bdca8bf560d1d0db1fbb090dedb8",
++    "document": "cord-v2/test/0010",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/26f8345fd4a676be0c2a615a5277bdae.json b/backend/evals/cassettes/4f8e360762904571931a4c861efa240d.json
+similarity index 91%
+rename from backend/evals/cassettes/26f8345fd4a676be0c2a615a5277bdae.json
+rename to backend/evals/cassettes/4f8e360762904571931a4c861efa240d.json
+index 5721913..b3a8022 100644
+--- a/backend/evals/cassettes/26f8345fd4a676be0c2a615a5277bdae.json
++++ b/backend/evals/cassettes/4f8e360762904571931a4c861efa240d.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "8f73f0c4803ea8815040a50e3389d4f3fa15e8c28cb6d50ea9854f6f6c22bd63",
++    "document": "cord-v2/test/0003",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/05a3c6ae88953ad3236dea079eb97bd6.json b/backend/evals/cassettes/615b85ef5dd936285438deb762d48c2d.json
+similarity index 93%
+rename from backend/evals/cassettes/05a3c6ae88953ad3236dea079eb97bd6.json
+rename to backend/evals/cassettes/615b85ef5dd936285438deb762d48c2d.json
+index d55e989..46f1293 100644
+--- a/backend/evals/cassettes/05a3c6ae88953ad3236dea079eb97bd6.json
++++ b/backend/evals/cassettes/615b85ef5dd936285438deb762d48c2d.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "4322ab5ec4f0b1365e08af0c31288e65e8cbd2c8eb5241adfb329244acbbb30b",
++    "document": "cord-v2/test/0017",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/65251eb6a394f5428348252a91fff024.json b/backend/evals/cassettes/6ae76d06d914312d4b30343015ca9edc.json
+similarity index 91%
+rename from backend/evals/cassettes/65251eb6a394f5428348252a91fff024.json
+rename to backend/evals/cassettes/6ae76d06d914312d4b30343015ca9edc.json
+index 57397dc..6ec07ba 100644
+--- a/backend/evals/cassettes/65251eb6a394f5428348252a91fff024.json
++++ b/backend/evals/cassettes/6ae76d06d914312d4b30343015ca9edc.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "0b63b666b54ea615d1d05733ee2c6fc24f20e1a6c77b333872fa80fff28b2c48",
++    "document": "cord-v2/test/0005",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/37f063e463e9c00b67c840214772a87d.json b/backend/evals/cassettes/6ec1f4408672779adc8d4fc497a7eca9.json
+similarity index 93%
+rename from backend/evals/cassettes/37f063e463e9c00b67c840214772a87d.json
+rename to backend/evals/cassettes/6ec1f4408672779adc8d4fc497a7eca9.json
+index fe6b60a..d7c6518 100644
+--- a/backend/evals/cassettes/37f063e463e9c00b67c840214772a87d.json
++++ b/backend/evals/cassettes/6ec1f4408672779adc8d4fc497a7eca9.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "5852cbe48df03646524e717e987eb3d0ac329a52fd192070b5fda1222a053789",
++    "document": "cord-v2/test/0001",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/c922655fb1df19317cf148682e074a7b.json b/backend/evals/cassettes/719f3bed9cd626219534e6aab8978edd.json
+similarity index 92%
+rename from backend/evals/cassettes/c922655fb1df19317cf148682e074a7b.json
+rename to backend/evals/cassettes/719f3bed9cd626219534e6aab8978edd.json
+index 75e056d..e470267 100644
+--- a/backend/evals/cassettes/c922655fb1df19317cf148682e074a7b.json
++++ b/backend/evals/cassettes/719f3bed9cd626219534e6aab8978edd.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "b076921ed83bdf900cab539f219cac8dddfaa4a99c13f7d66d7303d9f8c4c8c7",
++    "document": "cord-v2/test/0019",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/114e249f98104a3a338bf4d2b5adc4cf.json b/backend/evals/cassettes/725725b4da7bfb2cac47f40e1b33e482.json
+similarity index 92%
+rename from backend/evals/cassettes/114e249f98104a3a338bf4d2b5adc4cf.json
+rename to backend/evals/cassettes/725725b4da7bfb2cac47f40e1b33e482.json
+index 997ef87..83dc85b 100644
+--- a/backend/evals/cassettes/114e249f98104a3a338bf4d2b5adc4cf.json
++++ b/backend/evals/cassettes/725725b4da7bfb2cac47f40e1b33e482.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "f1cd67a7d67d04ba8d5b685553b1b5addbf2039d5954ab08c92139c0ad88a796",
++    "document": "cord-v2/test/0015",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/af45c11fbe20103c881aa02675b6e150.json b/backend/evals/cassettes/764703a2b39a13ab985e71c40bff730f.json
+similarity index 94%
+rename from backend/evals/cassettes/af45c11fbe20103c881aa02675b6e150.json
+rename to backend/evals/cassettes/764703a2b39a13ab985e71c40bff730f.json
+index b015c7a..62bdd8c 100644
+--- a/backend/evals/cassettes/af45c11fbe20103c881aa02675b6e150.json
++++ b/backend/evals/cassettes/764703a2b39a13ab985e71c40bff730f.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "eef326565b3945217a69afd84c893afdffd03a2f487943661c2423e6d6ec0d7d",
++    "document": "cord-v2/test/0016",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/96a7175e1858def7fc3f74e1592134a8.json b/backend/evals/cassettes/828a5671f5717ba914dfb6fe20d699aa.json
+similarity index 92%
+rename from backend/evals/cassettes/96a7175e1858def7fc3f74e1592134a8.json
+rename to backend/evals/cassettes/828a5671f5717ba914dfb6fe20d699aa.json
+index 01524a1..603b907 100644
+--- a/backend/evals/cassettes/96a7175e1858def7fc3f74e1592134a8.json
++++ b/backend/evals/cassettes/828a5671f5717ba914dfb6fe20d699aa.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "f1cd67a7d67d04ba8d5b685553b1b5addbf2039d5954ab08c92139c0ad88a796",
++    "document": "cord-v2/test/0015",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/eb42e19abd339d88b9db66993fc79bc7.json b/backend/evals/cassettes/8886b445795f002253a4b10286b832e4.json
+similarity index 91%
+rename from backend/evals/cassettes/eb42e19abd339d88b9db66993fc79bc7.json
+rename to backend/evals/cassettes/8886b445795f002253a4b10286b832e4.json
+index 47d054f..d5d480f 100644
+--- a/backend/evals/cassettes/eb42e19abd339d88b9db66993fc79bc7.json
++++ b/backend/evals/cassettes/8886b445795f002253a4b10286b832e4.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "d92479ab212713e7a65e56aacc5e68c0713597476608cbc394d997971043010b",
++    "document": "cord-v2/test/0011",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/8b88eaa7dbbeea4e92ba854e2056b505.json b/backend/evals/cassettes/9dc901b96a0093ae1bd39b8266dfd758.json
+similarity index 93%
+rename from backend/evals/cassettes/8b88eaa7dbbeea4e92ba854e2056b505.json
+rename to backend/evals/cassettes/9dc901b96a0093ae1bd39b8266dfd758.json
+index ab71945..272080e 100644
+--- a/backend/evals/cassettes/8b88eaa7dbbeea4e92ba854e2056b505.json
++++ b/backend/evals/cassettes/9dc901b96a0093ae1bd39b8266dfd758.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "1c091eb7436b3e5a813eb6492c0350ef4eb14e3fdad78d42da35df669c757292",
++    "document": "cord-v2/test/0006",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/f6eaa46510f747f1db93cd9cbe41e3e3.json b/backend/evals/cassettes/a1ea66c3590265caa4dcd911bccca9a5.json
+similarity index 91%
+rename from backend/evals/cassettes/f6eaa46510f747f1db93cd9cbe41e3e3.json
+rename to backend/evals/cassettes/a1ea66c3590265caa4dcd911bccca9a5.json
+index 9a8a12a..52a893d 100644
+--- a/backend/evals/cassettes/f6eaa46510f747f1db93cd9cbe41e3e3.json
++++ b/backend/evals/cassettes/a1ea66c3590265caa4dcd911bccca9a5.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "8f73f0c4803ea8815040a50e3389d4f3fa15e8c28cb6d50ea9854f6f6c22bd63",
++    "document": "cord-v2/test/0003",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/c27208d79e41490b9f7e7fd2c2f1885a.json b/backend/evals/cassettes/a3e32ef1adc37452c3d0679be14c16dd.json
+similarity index 92%
+rename from backend/evals/cassettes/c27208d79e41490b9f7e7fd2c2f1885a.json
+rename to backend/evals/cassettes/a3e32ef1adc37452c3d0679be14c16dd.json
+index ebcdc23..d63e4ad 100644
+--- a/backend/evals/cassettes/c27208d79e41490b9f7e7fd2c2f1885a.json
++++ b/backend/evals/cassettes/a3e32ef1adc37452c3d0679be14c16dd.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "810d3545f4105b19757c4b8b35934a477cde8cd1875302d9092315d2f960ef93",
++    "document": "cord-v2/test/0007",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/48274841fb3a6512a3d63eefd1c5ed57.json b/backend/evals/cassettes/aa0d6019bea12dd96cb8420ba94da46c.json
+similarity index 91%
+rename from backend/evals/cassettes/48274841fb3a6512a3d63eefd1c5ed57.json
+rename to backend/evals/cassettes/aa0d6019bea12dd96cb8420ba94da46c.json
+index 39c1c45..a99538f 100644
+--- a/backend/evals/cassettes/48274841fb3a6512a3d63eefd1c5ed57.json
++++ b/backend/evals/cassettes/aa0d6019bea12dd96cb8420ba94da46c.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "58716693a6c0733358e66e64d7064a5a845424280bb55f9b5fa137b1af8c92fe",
++    "document": "cord-v2/test/0008",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/163689d9ec5b8eb362c3532197c8f4ac.json b/backend/evals/cassettes/aa4f91b1bc30a33859f312ffdb7889f9.json
+similarity index 93%
+rename from backend/evals/cassettes/163689d9ec5b8eb362c3532197c8f4ac.json
+rename to backend/evals/cassettes/aa4f91b1bc30a33859f312ffdb7889f9.json
+index 062f7c5..6cfc3d9 100644
+--- a/backend/evals/cassettes/163689d9ec5b8eb362c3532197c8f4ac.json
++++ b/backend/evals/cassettes/aa4f91b1bc30a33859f312ffdb7889f9.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "5852cbe48df03646524e717e987eb3d0ac329a52fd192070b5fda1222a053789",
++    "document": "cord-v2/test/0001",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/83cfb767a717e510eb6e6a733e11a055.json b/backend/evals/cassettes/ad0b63d7f46e772dbff49f9ecca4f404.json
+similarity index 95%
+rename from backend/evals/cassettes/83cfb767a717e510eb6e6a733e11a055.json
+rename to backend/evals/cassettes/ad0b63d7f46e772dbff49f9ecca4f404.json
+index b39b89f..8450a53 100644
+--- a/backend/evals/cassettes/83cfb767a717e510eb6e6a733e11a055.json
++++ b/backend/evals/cassettes/ad0b63d7f46e772dbff49f9ecca4f404.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "9dcf1f9f86c909b762767cb07d1cc0db30773d556154ce42e0210f65270ee39d",
++    "document": "cord-v2/test/0014",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/26cff0921871308b6be3f7ede2fc7e1c.json b/backend/evals/cassettes/bd4d971b0e75c4b1fe0b49c3b188d4d2.json
+similarity index 95%
+rename from backend/evals/cassettes/26cff0921871308b6be3f7ede2fc7e1c.json
+rename to backend/evals/cassettes/bd4d971b0e75c4b1fe0b49c3b188d4d2.json
+index 47039ec..7e656c3 100644
+--- a/backend/evals/cassettes/26cff0921871308b6be3f7ede2fc7e1c.json
++++ b/backend/evals/cassettes/bd4d971b0e75c4b1fe0b49c3b188d4d2.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "9dcf1f9f86c909b762767cb07d1cc0db30773d556154ce42e0210f65270ee39d",
++    "document": "cord-v2/test/0014",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/ce39bf1538a598e830ec0d578a92c4c0.json b/backend/evals/cassettes/be23399e73a3c5bcd9e9d79f4a0e0ca0.json
+similarity index 90%
+rename from backend/evals/cassettes/ce39bf1538a598e830ec0d578a92c4c0.json
+rename to backend/evals/cassettes/be23399e73a3c5bcd9e9d79f4a0e0ca0.json
+index 1f79922..cb454c8 100644
+--- a/backend/evals/cassettes/ce39bf1538a598e830ec0d578a92c4c0.json
++++ b/backend/evals/cassettes/be23399e73a3c5bcd9e9d79f4a0e0ca0.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "0411c4d9beb9be65165fdb70c2b60f8bbf9035cc9661be2b8d4c73bbfcff7972",
++    "document": "cord-v2/test/0009",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/21c5299020eb43ec76660bb1ba7feefc.json b/backend/evals/cassettes/c30612f3ab6d2f2c8f896f909980eee2.json
+similarity index 94%
+rename from backend/evals/cassettes/21c5299020eb43ec76660bb1ba7feefc.json
+rename to backend/evals/cassettes/c30612f3ab6d2f2c8f896f909980eee2.json
+index 2e2ef29..e97f517 100644
+--- a/backend/evals/cassettes/21c5299020eb43ec76660bb1ba7feefc.json
++++ b/backend/evals/cassettes/c30612f3ab6d2f2c8f896f909980eee2.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "eef326565b3945217a69afd84c893afdffd03a2f487943661c2423e6d6ec0d7d",
++    "document": "cord-v2/test/0016",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/63389e8591f3075be57375627c823c0e.json b/backend/evals/cassettes/c6e9776a5813cfbded0e344efab3198d.json
+similarity index 93%
+rename from backend/evals/cassettes/63389e8591f3075be57375627c823c0e.json
+rename to backend/evals/cassettes/c6e9776a5813cfbded0e344efab3198d.json
+index 5ccfcfd..3972e82 100644
+--- a/backend/evals/cassettes/63389e8591f3075be57375627c823c0e.json
++++ b/backend/evals/cassettes/c6e9776a5813cfbded0e344efab3198d.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "8f3eee7068c96e86cdb2e4b5c53085cb5e1439462edd55c373548cb1962801ad",
++    "document": "cord-v2/test/0004",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/a3264cb8506eaea65c78965932655b04.json b/backend/evals/cassettes/da07559b7dd16b82aa15f93a808dd304.json
+similarity index 92%
+rename from backend/evals/cassettes/a3264cb8506eaea65c78965932655b04.json
+rename to backend/evals/cassettes/da07559b7dd16b82aa15f93a808dd304.json
+index d1e7972..88d7867 100644
+--- a/backend/evals/cassettes/a3264cb8506eaea65c78965932655b04.json
++++ b/backend/evals/cassettes/da07559b7dd16b82aa15f93a808dd304.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "b5f8a3a9a5431b8e38a8e5a16011d6a5a457f7ae4c4ef31da77e589c0b1ad882",
++    "document": "cord-v2/test/0012",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/6eba3e738c15d7b63d0b5b5f353288b1.json b/backend/evals/cassettes/da4411f6c87cb5b5df62acf644c42624.json
+similarity index 92%
+rename from backend/evals/cassettes/6eba3e738c15d7b63d0b5b5f353288b1.json
+rename to backend/evals/cassettes/da4411f6c87cb5b5df62acf644c42624.json
+index 8a9f6d3..0de9148 100644
+--- a/backend/evals/cassettes/6eba3e738c15d7b63d0b5b5f353288b1.json
++++ b/backend/evals/cassettes/da4411f6c87cb5b5df62acf644c42624.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "8f3eee7068c96e86cdb2e4b5c53085cb5e1439462edd55c373548cb1962801ad",
++    "document": "cord-v2/test/0004",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/151dbe870f7c6ced8ff58f6b32291162.json b/backend/evals/cassettes/dd1a42b4490761f14b0db3888faaa9e4.json
+similarity index 93%
+rename from backend/evals/cassettes/151dbe870f7c6ced8ff58f6b32291162.json
+rename to backend/evals/cassettes/dd1a42b4490761f14b0db3888faaa9e4.json
+index 0a0ec85..f45aa7e 100644
+--- a/backend/evals/cassettes/151dbe870f7c6ced8ff58f6b32291162.json
++++ b/backend/evals/cassettes/dd1a42b4490761f14b0db3888faaa9e4.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "58716693a6c0733358e66e64d7064a5a845424280bb55f9b5fa137b1af8c92fe",
++    "document": "cord-v2/test/0008",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/faec4a139089b4fe751d7f0b3d9eecf8.json b/backend/evals/cassettes/e47d593776cef7c8a0275d4d947017d6.json
+similarity index 92%
+rename from backend/evals/cassettes/faec4a139089b4fe751d7f0b3d9eecf8.json
+rename to backend/evals/cassettes/e47d593776cef7c8a0275d4d947017d6.json
+index b33223b..8b21756 100644
+--- a/backend/evals/cassettes/faec4a139089b4fe751d7f0b3d9eecf8.json
++++ b/backend/evals/cassettes/e47d593776cef7c8a0275d4d947017d6.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "ca4bf89562b3f55c2c91968ca221a629e48386744a5322596d9c7345648ada13",
++    "document": "cord-v2/test/0013",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/0983e23aa861403da7d8fd78ba2b82de.json b/backend/evals/cassettes/e7c13b7f58b1c283168c8391af652cb1.json
+similarity index 92%
+rename from backend/evals/cassettes/0983e23aa861403da7d8fd78ba2b82de.json
+rename to backend/evals/cassettes/e7c13b7f58b1c283168c8391af652cb1.json
+index 8719fa1..a782466 100644
+--- a/backend/evals/cassettes/0983e23aa861403da7d8fd78ba2b82de.json
++++ b/backend/evals/cassettes/e7c13b7f58b1c283168c8391af652cb1.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "ca4bf89562b3f55c2c91968ca221a629e48386744a5322596d9c7345648ada13",
++    "document": "cord-v2/test/0013",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/ace98f7914c6cf3d623e02d339d28ee8.json b/backend/evals/cassettes/e92f65ef1bdaf70253a21bd073c58b0b.json
+similarity index 91%
+rename from backend/evals/cassettes/ace98f7914c6cf3d623e02d339d28ee8.json
+rename to backend/evals/cassettes/e92f65ef1bdaf70253a21bd073c58b0b.json
+index b7cc0a8..1a9aca2 100644
+--- a/backend/evals/cassettes/ace98f7914c6cf3d623e02d339d28ee8.json
++++ b/backend/evals/cassettes/e92f65ef1bdaf70253a21bd073c58b0b.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "0411c4d9beb9be65165fdb70c2b60f8bbf9035cc9661be2b8d4c73bbfcff7972",
++    "document": "cord-v2/test/0009",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/70fecbfea4c56e0f2bcca6e0c0d36c39.json b/backend/evals/cassettes/ea59725f8be319ecd321ae049a99bc0e.json
+similarity index 91%
+rename from backend/evals/cassettes/70fecbfea4c56e0f2bcca6e0c0d36c39.json
+rename to backend/evals/cassettes/ea59725f8be319ecd321ae049a99bc0e.json
+index b268e27..2d2f39c 100644
+--- a/backend/evals/cassettes/70fecbfea4c56e0f2bcca6e0c0d36c39.json
++++ b/backend/evals/cassettes/ea59725f8be319ecd321ae049a99bc0e.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "2a5d18c199bdbb75010a54430429cf694b35bdca8bf560d1d0db1fbb090dedb8",
++    "document": "cord-v2/test/0010",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/000642f7355958cbf9521a8593834330.json b/backend/evals/cassettes/fb1e8a594891d4152f1c7c3c6e1df564.json
+similarity index 91%
+rename from backend/evals/cassettes/000642f7355958cbf9521a8593834330.json
+rename to backend/evals/cassettes/fb1e8a594891d4152f1c7c3c6e1df564.json
+index 2d32267..fb62766 100644
+--- a/backend/evals/cassettes/000642f7355958cbf9521a8593834330.json
++++ b/backend/evals/cassettes/fb1e8a594891d4152f1c7c3c6e1df564.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "88c35bbd2e2a634e89f2c5bfd30f7b530b1082c1f4e6e7cb3cb913f0b46c3868",
++    "document": "cord-v2/test/0018",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/cassettes/d31a6055723c5280a52e63f23c5a9584.json b/backend/evals/cassettes/fcefd8cc21b58b8a614161b4b43da44c.json
+similarity index 91%
+rename from backend/evals/cassettes/d31a6055723c5280a52e63f23c5a9584.json
+rename to backend/evals/cassettes/fcefd8cc21b58b8a614161b4b43da44c.json
+index bac82b9..8f1c9ea 100644
+--- a/backend/evals/cassettes/d31a6055723c5280a52e63f23c5a9584.json
++++ b/backend/evals/cassettes/fcefd8cc21b58b8a614161b4b43da44c.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "0b63b666b54ea615d1d05733ee2c6fc24f20e1a6c77b333872fa80fff28b2c48",
++    "document": "cord-v2/test/0005",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/23cdf9316934697cf16f55a33927bd71.json b/backend/evals/cassettes/fe7e0d080169ab5cd8580e1db81b48b9.json
+similarity index 92%
+rename from backend/evals/cassettes/23cdf9316934697cf16f55a33927bd71.json
+rename to backend/evals/cassettes/fe7e0d080169ab5cd8580e1db81b48b9.json
+index b145ba3..97a4119 100644
+--- a/backend/evals/cassettes/23cdf9316934697cf16f55a33927bd71.json
++++ b/backend/evals/cassettes/fe7e0d080169ab5cd8580e1db81b48b9.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "b076921ed83bdf900cab539f219cac8dddfaa4a99c13f7d66d7303d9f8c4c8c7",
++    "document": "cord-v2/test/0019",
+     "fewshot": "",
+     "ocr_text": "False",
+     "prompt": "v1",
+diff --git a/backend/evals/cassettes/328e2fc4a6b45f72238e1f4aad78694a.json b/backend/evals/cassettes/fe89d9a686029eaccd3edd47574b01d9.json
+similarity index 92%
+rename from backend/evals/cassettes/328e2fc4a6b45f72238e1f4aad78694a.json
+rename to backend/evals/cassettes/fe89d9a686029eaccd3edd47574b01d9.json
+index 958c2cc..04b269e 100644
+--- a/backend/evals/cassettes/328e2fc4a6b45f72238e1f4aad78694a.json
++++ b/backend/evals/cassettes/fe89d9a686029eaccd3edd47574b01d9.json
+@@ -1,6 +1,6 @@
+ {
+   "key": {
+-    "document": "810d3545f4105b19757c4b8b35934a477cde8cd1875302d9092315d2f960ef93",
++    "document": "cord-v2/test/0007",
+     "fewshot": "",
+     "ocr_text": "True",
+     "prompt": "v2",
+diff --git a/backend/evals/gate/images/cord-v2_test_0000.jpg b/backend/evals/gate/images/cord-v2_test_0000.jpg
+new file mode 100644
+index 0000000..dca9d2a
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0000.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0001.jpg b/backend/evals/gate/images/cord-v2_test_0001.jpg
+new file mode 100644
+index 0000000..6e53d1e
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0001.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0002.jpg b/backend/evals/gate/images/cord-v2_test_0002.jpg
+new file mode 100644
+index 0000000..d98cfc3
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0002.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0003.jpg b/backend/evals/gate/images/cord-v2_test_0003.jpg
+new file mode 100644
+index 0000000..a3472ad
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0003.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0004.jpg b/backend/evals/gate/images/cord-v2_test_0004.jpg
+new file mode 100644
+index 0000000..830ea79
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0004.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0005.jpg b/backend/evals/gate/images/cord-v2_test_0005.jpg
+new file mode 100644
+index 0000000..092e7bb
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0005.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0006.jpg b/backend/evals/gate/images/cord-v2_test_0006.jpg
+new file mode 100644
+index 0000000..13a24e9
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0006.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0007.jpg b/backend/evals/gate/images/cord-v2_test_0007.jpg
+new file mode 100644
+index 0000000..ca2df39
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0007.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0008.jpg b/backend/evals/gate/images/cord-v2_test_0008.jpg
+new file mode 100644
+index 0000000..af0aaae
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0008.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0009.jpg b/backend/evals/gate/images/cord-v2_test_0009.jpg
+new file mode 100644
+index 0000000..5882227
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0009.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0010.jpg b/backend/evals/gate/images/cord-v2_test_0010.jpg
+new file mode 100644
+index 0000000..568a7bc
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0010.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0011.jpg b/backend/evals/gate/images/cord-v2_test_0011.jpg
+new file mode 100644
+index 0000000..6f32fba
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0011.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0012.jpg b/backend/evals/gate/images/cord-v2_test_0012.jpg
+new file mode 100644
+index 0000000..2c88c08
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0012.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0013.jpg b/backend/evals/gate/images/cord-v2_test_0013.jpg
+new file mode 100644
+index 0000000..ebdb260
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0013.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0014.jpg b/backend/evals/gate/images/cord-v2_test_0014.jpg
+new file mode 100644
+index 0000000..e30516f
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0014.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0015.jpg b/backend/evals/gate/images/cord-v2_test_0015.jpg
+new file mode 100644
+index 0000000..f15a80f
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0015.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0016.jpg b/backend/evals/gate/images/cord-v2_test_0016.jpg
+new file mode 100644
+index 0000000..0a10218
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0016.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0017.jpg b/backend/evals/gate/images/cord-v2_test_0017.jpg
+new file mode 100644
+index 0000000..853c4d0
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0017.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0018.jpg b/backend/evals/gate/images/cord-v2_test_0018.jpg
+new file mode 100644
+index 0000000..c42c153
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0018.jpg differ
+diff --git a/backend/evals/gate/images/cord-v2_test_0019.jpg b/backend/evals/gate/images/cord-v2_test_0019.jpg
+new file mode 100644
+index 0000000..0ae4863
+Binary files /dev/null and b/backend/evals/gate/images/cord-v2_test_0019.jpg differ
+diff --git a/backend/evals/gate/manifest.json b/backend/evals/gate/manifest.json
+new file mode 100644
+index 0000000..85b1198
+--- /dev/null
++++ b/backend/evals/gate/manifest.json
+@@ -0,0 +1,8782 @@
++{
++ "schema": "receipt",
++ "documents": [
++  {
++   "external_id": "cord-v2/test/0000",
++   "split": "test",
++   "image": "images/cord-v2_test_0000.jpg",
++   "golden": {
++    "tax": 5455.0,
++    "total": 60000.0,
++    "change": null,
++    "discount": -60000.0,
++    "subtotal": 60000.0,
++    "card_paid": 60000.0,
++    "cash_paid": null,
++    "item_count": 2,
++    "line_items": [
++     {
++      "name": "-TICKET CP",
++      "quantity": 2,
++      "line_total": 60000.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "901016  -TICKET CP\n2  60.000  60,000\nTOTAL DISC $  -60.000\nTAX  5.455\nSubtotal  60.000\nTOTAL (QtY 2.00 60.000\n- EDC CIMB NIAGA No: Xx7730  60.000\nCUSTONER INEO",
++   "ocr_words": [
++    {
++     "box": [
++      42,
++      390,
++      93,
++      411
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "901016",
++     "words": [
++      {
++       "box": [
++        46,
++        390,
++        93,
++        411
++       ],
++       "conf": 0.9999,
++       "text": "901016"
++      }
++     ]
++    },
++    {
++     "box": [
++      146,
++      384,
++      223,
++      408
++     ],
++     "conf": 0.9924,
++     "page": 1,
++     "text": "-TICKET CP",
++     "words": [
++      {
++       "box": [
++        147,
++        384,
++        201,
++        407
++       ],
++       "conf": 0.9986,
++       "text": "-TICKET"
++      },
++      {
++       "box": [
++        205,
++        384,
++        220,
++        407
++       ],
++       "conf": 0.9997,
++       "text": "CP"
++      }
++     ]
++    },
++    {
++     "box": [
++      86,
++      415,
++      100,
++      434
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "2",
++     "words": [
++      {
++       "box": [
++        86,
++        415,
++        100,
++        434
++       ],
++       "conf": 0.9998,
++       "text": "2"
++      }
++     ]
++    },
++    {
++     "box": [
++      174,
++      409,
++      222,
++      431
++     ],
++     "conf": 0.9204,
++     "page": 1,
++     "text": "60.000",
++     "words": [
++      {
++       "box": [
++        175,
++        409,
++        222,
++        431
++       ],
++       "conf": 0.9772,
++       "text": "60.000"
++      }
++     ]
++    },
++    {
++     "box": [
++      302,
++      407,
++      352,
++      431
++     ],
++     "conf": 0.8587,
++     "page": 1,
++     "text": "60,000",
++     "words": [
++      {
++       "box": [
++        304,
++        407,
++        352,
++        431
++       ],
++       "conf": 0.4648,
++       "text": "60,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      144,
++      455,
++      240,
++      481
++     ],
++     "conf": 0.9695,
++     "page": 1,
++     "text": "TOTAL DISC $",
++     "words": [
++      {
++       "box": [
++        149,
++        456,
++        185,
++        481
++       ],
++       "conf": 0.9989,
++       "text": "TOTAL"
++      },
++      {
++       "box": [
++        192,
++        455,
++        221,
++        480
++       ],
++       "conf": 0.9996,
++       "text": "DISC"
++      },
++      {
++       "box": [
++        229,
++        455,
++        237,
++        480
++       ],
++       "conf": 0.9999,
++       "text": "$"
++      }
++     ]
++    },
++    {
++     "box": [
++      298,
++      457,
++      353,
++      480
++     ],
++     "conf": 0.9493,
++     "page": 1,
++     "text": "-60.000",
++     "words": [
++      {
++       "box": [
++        299,
++        457,
++        353,
++        480
++       ],
++       "conf": 0.9989,
++       "text": "-60.000"
++      }
++     ]
++    },
++    {
++     "box": [
++      212,
++      481,
++      239,
++      503
++     ],
++     "conf": 0.9992,
++     "page": 1,
++     "text": "TAX",
++     "words": [
++      {
++       "box": [
++        212,
++        481,
++        239,
++        503
++       ],
++       "conf": 0.999,
++       "text": "TAX"
++      }
++     ]
++    },
++    {
++     "box": [
++      311,
++      482,
++      354,
++      504
++     ],
++     "conf": 0.9989,
++     "page": 1,
++     "text": "5.455",
++     "words": [
++      {
++       "box": [
++        316,
++        482,
++        353,
++        504
++       ],
++       "conf": 1.0,
++       "text": "5.455"
++      }
++     ]
++    },
++    {
++     "box": [
++      174,
++      505,
++      238,
++      530
++     ],
++     "conf": 0.9985,
++     "page": 1,
++     "text": "Subtotal",
++     "words": [
++      {
++       "box": [
++        176,
++        505,
++        238,
++        529
++       ],
++       "conf": 0.9988,
++       "text": "Subtotal"
++      }
++     ]
++    },
++    {
++     "box": [
++      306,
++      507,
++      356,
++      530
++     ],
++     "conf": 0.9402,
++     "page": 1,
++     "text": "60.000",
++     "words": [
++      {
++       "box": [
++        307,
++        507,
++        356,
++        530
++       ],
++       "conf": 0.7331,
++       "text": "60.000"
++      }
++     ]
++    },
++    {
++     "box": [
++      43,
++      528,
++      370,
++      558
++     ],
++     "conf": 0.9415,
++     "page": 1,
++     "text": "TOTAL (QtY 2.00 60.000",
++     "words": [
++      {
++       "box": [
++        50,
++        531,
++        120,
++        558
++       ],
++       "conf": 0.9989,
++       "text": "TOTAL"
++      },
++      {
++       "box": [
++        135,
++        530,
++        193,
++        557
++       ],
++       "conf": 0.9887,
++       "text": "(QtY"
++      },
++      {
++       "box": [
++        208,
++        529,
++        267,
++        556
++       ],
++       "conf": 0.9731,
++       "text": "2.00"
++      },
++      {
++       "box": [
++        283,
++        528,
++        370,
++        556
++       ],
++       "conf": 0.9979,
++       "text": "60.000"
++      }
++     ]
++    },
++    {
++     "box": [
++      48,
++      580,
++      249,
++      608
++     ],
++     "conf": 0.9494,
++     "page": 1,
++     "text": "- EDC CIMB NIAGA No: Xx7730",
++     "words": [
++      {
++       "box": [
++        50,
++        583,
++        57,
++        607
++       ],
++       "conf": 0.9953,
++       "text": "-"
++      },
++      {
++       "box": [
++        62,
++        583,
++        87,
++        607
++       ],
++       "conf": 0.8736,
++       "text": "EDC"
++      },
++      {
++       "box": [
++        91,
++        582,
++        124,
++        606
++       ],
++       "conf": 0.9997,
++       "text": "CIMB"
++      },
++      {
++       "box": [
++        128,
++        581,
++        168,
++        606
++       ],
++       "conf": 0.9886,
++       "text": "NIAGA"
++      },
++      {
++       "box": [
++        172,
++        581,
++        195,
++        604
++       ],
++       "conf": 0.9996,
++       "text": "No:"
++      },
++      {
++       "box": [
++        204,
++        580,
++        247,
++        604
++       ],
++       "conf": 0.9807,
++       "text": "Xx7730"
++      }
++     ]
++    },
++    {
++     "box": [
++      314,
++      580,
++      366,
++      605
++     ],
++     "conf": 0.9743,
++     "page": 1,
++     "text": "60.000",
++     "words": [
++      {
++       "box": [
++        319,
++        580,
++        366,
++        605
++       ],
++       "conf": 0.9999,
++       "text": "60.000"
++      }
++     ]
++    },
++    {
++     "box": [
++      44,
++      634,
++      147,
++      647
++     ],
++     "conf": 0.8649,
++     "page": 1,
++     "text": "CUSTONER INEO",
++     "words": [
++      {
++       "box": [
++        50,
++        634,
++        107,
++        647
++       ],
++       "conf": 0.9773,
++       "text": "CUSTONER"
++      },
++      {
++       "box": [
++        116,
++        634,
++        144,
++        647
++       ],
++       "conf": 0.9968,
++       "text": "INEO"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0001",
++   "split": "test",
++   "image": "images/cord-v2_test_0001.jpg",
++   "golden": {
++    "tax": null,
++    "total": 91000.0,
++    "change": null,
++    "discount": null,
++    "subtotal": null,
++    "card_paid": null,
++    "cash_paid": 91000.0,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "J.STB PROMO",
++      "quantity": 1,
++      "line_total": 17500.0,
++      "unit_price": null
++     },
++     {
++      "name": "Y.B.BAT",
++      "quantity": 1,
++      "line_total": 46000.0,
++      "unit_price": null
++     },
++     {
++      "name": "Y.BASO PROM",
++      "quantity": 1,
++      "line_total": 27500.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "J.STB PROMO  17500\nY.B.BAT  46000\nY.BASO PROM  27500\nTOTAL  91000\nCASH  91000",
++   "ocr_words": [
++    {
++     "box": [
++      98,
++      520,
++      355,
++      559
++     ],
++     "conf": 0.9668,
++     "page": 1,
++     "text": "J.STB PROMO",
++     "words": [
++      {
++       "box": [
++        102,
++        520,
++        223,
++        559
++       ],
++       "conf": 0.9999,
++       "text": "J.STB"
++      },
++      {
++       "box": [
++        245,
++        520,
++        353,
++        559
++       ],
++       "conf": 0.9995,
++       "text": "PROMO"
++      }
++     ]
++    },
++    {
++     "box": [
++      529,
++      520,
++      646,
++      562
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "17500",
++     "words": [
++      {
++       "box": [
++        534,
++        520,
++        646,
++        562
++       ],
++       "conf": 1.0,
++       "text": "17500"
++      }
++     ]
++    },
++    {
++     "box": [
++      94,
++      559,
++      267,
++      601
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "Y.B.BAT",
++     "words": [
++      {
++       "box": [
++        105,
++        559,
++        264,
++        600
++       ],
++       "conf": 0.9999,
++       "text": "Y.B.BAT"
++      }
++     ]
++    },
++    {
++     "box": [
++      526,
++      559,
++      647,
++      602
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "46000",
++     "words": [
++      {
++       "box": [
++        530,
++        559,
++        647,
++        602
++       ],
++       "conf": 1.0,
++       "text": "46000"
++      }
++     ]
++    },
++    {
++     "box": [
++      93,
++      596,
++      357,
++      645
++     ],
++     "conf": 0.9597,
++     "page": 1,
++     "text": "Y.BASO PROM",
++     "words": [
++      {
++       "box": [
++        100,
++        597,
++        245,
++        644
++       ],
++       "conf": 1.0,
++       "text": "Y.BASO"
++      },
++      {
++       "box": [
++        266,
++        596,
++        357,
++        642
++       ],
++       "conf": 0.9977,
++       "text": "PROM"
++      }
++     ]
++    },
++    {
++     "box": [
++      526,
++      602,
++      645,
++      640
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "27500",
++     "words": [
++      {
++       "box": [
++        538,
++        602,
++        641,
++        640
++       ],
++       "conf": 1.0,
++       "text": "27500"
++      }
++     ]
++    },
++    {
++     "box": [
++      94,
++      638,
++      323,
++      688
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "TOTAL",
++     "words": [
++      {
++       "box": [
++        102,
++        639,
++        141,
++        687
++       ],
++       "conf": 0.9999,
++       "text": "T"
++      },
++      {
++       "box": [
++        149,
++        638,
++        189,
++        687
++       ],
++       "conf": 0.9998,
++       "text": "O"
++      },
++      {
++       "box": [
++        197,
++        638,
++        237,
++        686
++       ],
++       "conf": 0.9999,
++       "text": "T"
++      },
++      {
++       "box": [
++        245,
++        638,
++        323,
++        686
++       ],
++       "conf": 0.9996,
++       "text": "AL"
++      }
++     ]
++    },
++    {
++     "box": [
++      416,
++      639,
++      640,
++      681
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "91000",
++     "words": [
++      {
++       "box": [
++        417,
++        639,
++        462,
++        681
++       ],
++       "conf": 1.0,
++       "text": "9"
++      },
++      {
++       "box": [
++        466,
++        639,
++        510,
++        681
++       ],
++       "conf": 0.9998,
++       "text": "1"
++      },
++      {
++       "box": [
++        510,
++        639,
++        552,
++        681
++       ],
++       "conf": 0.9999,
++       "text": "0"
++      },
++      {
++       "box": [
++        552,
++        639,
++        595,
++        681
++       ],
++       "conf": 1.0,
++       "text": "0"
++      },
++      {
++       "box": [
++        595,
++        639,
++        638,
++        681
++       ],
++       "conf": 1.0,
++       "text": "0"
++      }
++     ]
++    },
++    {
++     "box": [
++      94,
++      683,
++      283,
++      732
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "CASH",
++     "words": [
++      {
++       "box": [
++        101,
++        685,
++        140,
++        731
++       ],
++       "conf": 0.9997,
++       "text": "C"
++      },
++      {
++       "box": [
++        146,
++        684,
++        185,
++        730
++       ],
++       "conf": 0.9995,
++       "text": "A"
++      },
++      {
++       "box": [
++        199,
++        683,
++        276,
++        730
++       ],
++       "conf": 1.0,
++       "text": "SH"
++      }
++     ]
++    },
++    {
++     "box": [
++      416,
++      680,
++      640,
++      722
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "91000",
++     "words": [
++      {
++       "box": [
++        417,
++        680,
++        462,
++        722
++       ],
++       "conf": 1.0,
++       "text": "9"
++      },
++      {
++       "box": [
++        466,
++        680,
++        509,
++        722
++       ],
++       "conf": 0.9998,
++       "text": "1"
++      },
++      {
++       "box": [
++        509,
++        680,
++        550,
++        722
++       ],
++       "conf": 1.0,
++       "text": "0"
++      },
++      {
++       "box": [
++        550,
++        680,
++        593,
++        722
++       ],
++       "conf": 0.9999,
++       "text": "0"
++      },
++      {
++       "box": [
++        596,
++        680,
++        640,
++        722
++       ],
++       "conf": 1.0,
++       "text": "0"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0002",
++   "split": "test",
++   "image": "images/cord-v2_test_0002.jpg",
++   "golden": {
++    "tax": null,
++    "total": 28000.0,
++    "change": 72000.0,
++    "discount": null,
++    "subtotal": 28000.0,
++    "card_paid": null,
++    "cash_paid": 100000.0,
++    "item_count": 1,
++    "line_items": [
++     {
++      "name": "JASMINE MT ( L )",
++      "quantity": 1,
++      "line_total": 24000.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "IOSMINE MT (L)  24,000\nUCONUT JELLY (L)  4,000\nSUB TOTAL  28,000\nTOTAL SALES  28.000\nTOTAL ITEMS\nCASH  100.000\nCHANGE  72,000\nQueue No: 102",
++   "ocr_words": [
++    {
++     "box": [
++      167,
++      498,
++      323,
++      521
++     ],
++     "conf": 0.8748,
++     "page": 1,
++     "text": "IOSMINE MT (L)",
++     "words": [
++      {
++       "box": [
++        171,
++        498,
++        232,
++        521
++       ],
++       "conf": 0.3221,
++       "text": "IOSMINE"
++      },
++      {
++       "box": [
++        241,
++        498,
++        260,
++        521
++       ],
++       "conf": 0.4925,
++       "text": "MT"
++      },
++      {
++       "box": [
++        276,
++        498,
++        323,
++        521
++       ],
++       "conf": 0.9996,
++       "text": "(L)"
++      }
++     ]
++    },
++    {
++     "box": [
++      515,
++      498,
++      577,
++      525
++     ],
++     "conf": 0.9725,
++     "page": 1,
++     "text": "24,000",
++     "words": [
++      {
++       "box": [
++        522,
++        498,
++        576,
++        525
++       ],
++       "conf": 1.0,
++       "text": "24,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      167,
++      525,
++      341,
++      549
++     ],
++     "conf": 0.9337,
++     "page": 1,
++     "text": "UCONUT JELLY (L)",
++     "words": [
++      {
++       "box": [
++        171,
++        525,
++        231,
++        549
++       ],
++       "conf": 0.965,
++       "text": "UCONUT"
++      },
++      {
++       "box": [
++        240,
++        525,
++        288,
++        549
++       ],
++       "conf": 0.997,
++       "text": "JELLY"
++      },
++      {
++       "box": [
++        296,
++        525,
++        340,
++        549
++       ],
++       "conf": 0.9953,
++       "text": "(L)"
++      }
++     ]
++    },
++    {
++     "box": [
++      525,
++      527,
++      577,
++      553
++     ],
++     "conf": 0.9715,
++     "page": 1,
++     "text": "4,000",
++     "words": [
++      {
++       "box": [
++        532,
++        527,
++        576,
++        553
++       ],
++       "conf": 1.0,
++       "text": "4,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      77,
++      582,
++      168,
++      613
++     ],
++     "conf": 0.9228,
++     "page": 1,
++     "text": "SUB TOTAL",
++     "words": [
++      {
++       "box": [
++        84,
++        583,
++        114,
++        613
++       ],
++       "conf": 0.9999,
++       "text": "SUB"
++      },
++      {
++       "box": [
++        124,
++        582,
++        168,
++        613
++       ],
++       "conf": 0.9996,
++       "text": "TOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      522,
++      586,
++      583,
++      613
++     ],
++     "conf": 0.9635,
++     "page": 1,
++     "text": "28,000",
++     "words": [
++      {
++       "box": [
++        525,
++        586,
++        580,
++        613
++       ],
++       "conf": 1.0,
++       "text": "28,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      77,
++      647,
++      193,
++      677
++     ],
++     "conf": 0.9887,
++     "page": 1,
++     "text": "TOTAL SALES",
++     "words": [
++      {
++       "box": [
++        79,
++        647,
++        130,
++        677
++       ],
++       "conf": 1.0,
++       "text": "TOTAL"
++      },
++      {
++       "box": [
++        140,
++        647,
++        190,
++        677
++       ],
++       "conf": 0.9998,
++       "text": "SALES"
++      }
++     ]
++    },
++    {
++     "box": [
++      527,
++      646,
++      590,
++      674
++     ],
++     "conf": 0.9757,
++     "page": 1,
++     "text": "28.000",
++     "words": [
++      {
++       "box": [
++        534,
++        646,
++        590,
++        674
++       ],
++       "conf": 1.0,
++       "text": "28.000"
++      }
++     ]
++    },
++    {
++     "box": [
++      76,
++      681,
++      192,
++      710
++     ],
++     "conf": 0.8153,
++     "page": 1,
++     "text": "TOTAL ITEMS",
++     "words": [
++      {
++       "box": [
++        83,
++        681,
++        131,
++        710
++       ],
++       "conf": 0.9997,
++       "text": "TOTAL"
++      },
++      {
++       "box": [
++        140,
++        681,
++        192,
++        710
++       ],
++       "conf": 0.9997,
++       "text": "ITEMS"
++      }
++     ]
++    },
++    {
++     "box": [
++      73,
++      715,
++      123,
++      745
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "CASH",
++     "words": [
++      {
++       "box": [
++        75,
++        715,
++        121,
++        745
++       ],
++       "conf": 0.9999,
++       "text": "CASH"
++      }
++     ]
++    },
++    {
++     "box": [
++      525,
++      709,
++      594,
++      737
++     ],
++     "conf": 0.9363,
++     "page": 1,
++     "text": "100.000",
++     "words": [
++      {
++       "box": [
++        528,
++        709,
++        593,
++        737
++       ],
++       "conf": 1.0,
++       "text": "100.000"
++      }
++     ]
++    },
++    {
++     "box": [
++      534,
++      740,
++      598,
++      770
++     ],
++     "conf": 0.9347,
++     "page": 1,
++     "text": "72,000",
++     "words": [
++      {
++       "box": [
++        536,
++        740,
++        596,
++        770
++       ],
++       "conf": 0.9999,
++       "text": "72,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      74,
++      748,
++      139,
++      776
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "CHANGE",
++     "words": [
++      {
++       "box": [
++        81,
++        748,
++        137,
++        776
++       ],
++       "conf": 1.0,
++       "text": "CHANGE"
++      }
++     ]
++    },
++    {
++     "box": [
++      292,
++      778,
++      425,
++      814
++     ],
++     "conf": 0.9666,
++     "page": 1,
++     "text": "Queue No: 102",
++     "words": [
++      {
++       "box": [
++        294,
++        779,
++        345,
++        814
++       ],
++       "conf": 0.8751,
++       "text": "Queue"
++      },
++      {
++       "box": [
++        358,
++        778,
++        385,
++        814
++       ],
++       "conf": 0.999,
++       "text": "No:"
++      },
++      {
++       "box": [
++        393,
++        778,
++        425,
++        813
++       ],
++       "conf": 0.9119,
++       "text": "102"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0003",
++   "split": "test",
++   "image": "images/cord-v2_test_0003.jpg",
++   "golden": {
++    "tax": null,
++    "total": 11000.0,
++    "change": null,
++    "discount": null,
++    "subtotal": 11000.0,
++    "card_paid": null,
++    "cash_paid": 11000.0,
++    "item_count": 1,
++    "line_items": [
++     {
++      "name": "DONAT GULA",
++      "quantity": 1,
++      "line_total": 11000.0,
++      "unit_price": 11000.0
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "sy&Caka\n1X  @11000  11,000\nDONAT GULA  1.00xITEMs\nSUBTOTAL  11,000  11,000\nCASH  TOTAL  11,000",
++   "ocr_words": [
++    {
++     "box": [
++      259,
++      201,
++      363,
++      224
++     ],
++     "conf": 0.6408,
++     "page": 1,
++     "text": "sy&Caka",
++     "words": [
++      {
++       "box": [
++        262,
++        204,
++        282,
++        223
++       ],
++       "conf": 0.6558,
++       "text": "sy"
++      },
++      {
++       "box": [
++        292,
++        203,
++        304,
++        222
++       ],
++       "conf": 0.7966,
++       "text": "&"
++      },
++      {
++       "box": [
++        314,
++        201,
++        363,
++        221
++       ],
++       "conf": 0.8236,
++       "text": "Caka"
++      }
++     ]
++    },
++    {
++     "box": [
++      296,
++      494,
++      384,
++      535
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "@11000",
++     "words": [
++      {
++       "box": [
++        304,
++        494,
++        380,
++        535
++       ],
++       "conf": 0.9994,
++       "text": "@11000"
++      }
++     ]
++    },
++    {
++     "box": [
++      110,
++      510,
++      144,
++      545
++     ],
++     "conf": 0.9745,
++     "page": 1,
++     "text": "1X",
++     "words": [
++      {
++       "box": [
++        119,
++        510,
++        142,
++        545
++       ],
++       "conf": 0.9998,
++       "text": "1X"
++      }
++     ]
++    },
++    {
++     "box": [
++      438,
++      515,
++      528,
++      559
++     ],
++     "conf": 0.9802,
++     "page": 1,
++     "text": "11,000",
++     "words": [
++      {
++       "box": [
++        440,
++        515,
++        528,
++        559
++       ],
++       "conf": 0.8819,
++       "text": "11,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      110,
++      532,
++      246,
++      574
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "DONAT GULA",
++     "words": [
++      {
++       "box": [
++        117,
++        535,
++        179,
++        573
++       ],
++       "conf": 0.9999,
++       "text": "DONAT"
++      },
++      {
++       "box": [
++        188,
++        532,
++        245,
++        569
++       ],
++       "conf": 0.9999,
++       "text": "GULA"
++      }
++     ]
++    },
++    {
++     "box": [
++      251,
++      556,
++      387,
++      599
++     ],
++     "conf": 0.9974,
++     "page": 1,
++     "text": "1.00xITEMs",
++     "words": [
++      {
++       "box": [
++        258,
++        556,
++        386,
++        599
++       ],
++       "conf": 1.0,
++       "text": "1.00xITEMs"
++      }
++     ]
++    },
++    {
++     "box": [
++      443,
++      579,
++      534,
++      622
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "11,000",
++     "words": [
++      {
++       "box": [
++        445,
++        579,
++        534,
++        621
++       ],
++       "conf": 1.0,
++       "text": "11,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      115,
++      596,
++      223,
++      633
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "SUBTOTAL",
++     "words": [
++      {
++       "box": [
++        123,
++        596,
++        218,
++        633
++       ],
++       "conf": 0.9999,
++       "text": "SUBTOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      444,
++      610,
++      536,
++      654
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "11,000",
++     "words": [
++      {
++       "box": [
++        454,
++        610,
++        535,
++        653
++       ],
++       "conf": 1.0,
++       "text": "11,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      119,
++      627,
++      248,
++      664
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "TOTAL",
++     "words": [
++      {
++       "box": [
++        127,
++        627,
++        243,
++        663
++       ],
++       "conf": 1.0,
++       "text": "TOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      448,
++      643,
++      538,
++      684
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "11,000",
++     "words": [
++      {
++       "box": [
++        457,
++        643,
++        535,
++        684
++       ],
++       "conf": 1.0,
++       "text": "11,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      118,
++      657,
++      228,
++      695
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "CASH",
++     "words": [
++      {
++       "box": [
++        126,
++        657,
++        221,
++        695
++       ],
++       "conf": 1.0,
++       "text": "CASH"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0004",
++   "split": "test",
++   "image": "images/cord-v2_test_0004.jpg",
++   "golden": {
++    "tax": null,
++    "total": 174600.0,
++    "change": 25400.0,
++    "discount": 19400.0,
++    "subtotal": 194000.0,
++    "card_paid": null,
++    "cash_paid": 200000.0,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "ICE BLACKCOFFE",
++      "quantity": 2,
++      "line_total": 82000.0,
++      "unit_price": null
++     },
++     {
++      "name": "AVOCADO COFFEE",
++      "quantity": 1,
++      "line_total": 61000.0,
++      "unit_price": null
++     },
++     {
++      "name": "CHIKEN KATSU FF",
++      "quantity": 1,
++      "line_total": 51000.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "5Ci1\natuakaill\now\nw\nGalo\nJias\nPiger\nttle\nnow  AVOCADD COFFEE  ICE BLACKCOFFE  82,000\nelbe  CHIKEN KATSUFF  1  51,000  61,000\nBibi  es===\nby  SUS_TSTAL  194,000\nOI002S1T  19,400\nlep.  TOTAL  174,600\nCASH  200,000\nCHANGE  28,400",
++   "ocr_words": [
++    {
++     "box": [
++      0,
++      0,
++      81,
++      47
++     ],
++     "conf": 0.5583,
++     "page": 1,
++     "text": "5Ci1",
++     "words": [
++      {
++       "box": [
++        19,
++        0,
++        81,
++        47
++       ],
++       "conf": 0.4667,
++       "text": "5Ci1"
++      }
++     ]
++    },
++    {
++     "box": [
++      0,
++      32,
++      198,
++      94
++     ],
++     "conf": 0.7323,
++     "page": 1,
++     "text": "atuakaill",
++     "words": [
++      {
++       "box": [
++        12,
++        32,
++        191,
++        93
++       ],
++       "conf": 0.6995,
++       "text": "atuakaill"
++      }
++     ]
++    },
++    {
++     "box": [
++      0,
++      100,
++      69,
++      154
++     ],
++     "conf": 0.6569,
++     "page": 1,
++     "text": "ow",
++     "words": [
++      {
++       "box": [
++        4,
++        100,
++        41,
++        154
++       ],
++       "conf": 0.4109,
++       "text": "ow"
++      }
++     ]
++    },
++    {
++     "box": [
++      0,
++      144,
++      63,
++      206
++     ],
++     "conf": 0.5214,
++     "page": 1,
++     "text": "w",
++     "words": [
++      {
++       "box": [
++        2,
++        144,
++        63,
++        206
++       ],
++       "conf": 0.5214,
++       "text": "w"
++      }
++     ]
++    },
++    {
++     "box": [
++      0,
++      193,
++      62,
++      261
++     ],
++     "conf": 0.782,
++     "page": 1,
++     "text": "Galo",
++     "words": [
++      {
++       "box": [
++        0,
++        192,
++        65,
++        261
++       ],
++       "conf": 0.7526,
++       "text": "Galo"
++      }
++     ]
++    },
++    {
++     "box": [
++      0,
++      261,
++      65,
++      315
++     ],
++     "conf": 0.7682,
++     "page": 1,
++     "text": "Jias",
++     "words": [
++      {
++       "box": [
++        0,
++        261,
++        56,
++        315
++       ],
++       "conf": 0.9523,
++       "text": "Jias"
++      }
++     ]
++    },
++    {
++     "box": [
++      0,
++      305,
++      76,
++      374
++     ],
++     "conf": 0.7722,
++     "page": 1,
++     "text": "Piger",
++     "words": [
++      {
++       "box": [
++        0,
++        305,
++        76,
++        374
++       ],
++       "conf": 0.9873,
++       "text": "Piger"
++      }
++     ]
++    },
++    {
++     "box": [
++      0,
++      360,
++      83,
++      427
++     ],
++     "conf": 0.9573,
++     "page": 1,
++     "text": "ttle",
++     "words": [
++      {
++       "box": [
++        19,
++        360,
++        81,
++        427
++       ],
++       "conf": 0.9609,
++       "text": "ttle"
++      }
++     ]
++    },
++    {
++     "box": [
++      5,
++      417,
++      89,
++      481
++     ],
++     "conf": 0.8329,
++     "page": 1,
++     "text": "now",
++     "words": [
++      {
++       "box": [
++        22,
++        418,
++        69,
++        480
++       ],
++       "conf": 0.9213,
++       "text": "now"
++      }
++     ]
++    },
++    {
++     "box": [
++      79,
++      417,
++      254,
++      456
++     ],
++     "conf": 0.9881,
++     "page": 1,
++     "text": "ICE BLACKCOFFE",
++     "words": [
++      {
++       "box": [
++        86,
++        417,
++        120,
++        451
++       ],
++       "conf": 0.9929,
++       "text": "ICE"
++      },
++      {
++       "box": [
++        135,
++        418,
++        249,
++        455
++       ],
++       "conf": 0.9269,
++       "text": "BLACKCOFFE"
++      }
++     ]
++    },
++    {
++     "box": [
++      475,
++      427,
++      565,
++      467
++     ],
++     "conf": 0.9962,
++     "page": 1,
++     "text": "82,000",
++     "words": [
++      {
++       "box": [
++        484,
++        427,
++        559,
++        466
++       ],
++       "conf": 0.9785,
++       "text": "82,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      77,
++      447,
++      256,
++      486
++     ],
++     "conf": 0.9665,
++     "page": 1,
++     "text": "AVOCADD COFFEE",
++     "words": [
++      {
++       "box": [
++        84,
++        447,
++        171,
++        482
++       ],
++       "conf": 0.9961,
++       "text": "AVOCADD"
++      },
++      {
++       "box": [
++        184,
++        451,
++        255,
++        485
++       ],
++       "conf": 0.9882,
++       "text": "COFFEE"
++      }
++     ]
++    },
++    {
++     "box": [
++      0,
++      463,
++      88,
++      530
++     ],
++     "conf": 0.8792,
++     "page": 1,
++     "text": "elbe",
++     "words": [
++      {
++       "box": [
++        16,
++        464,
++        85,
++        529
++       ],
++       "conf": 0.9412,
++       "text": "elbe"
++      }
++     ]
++    },
++    {
++     "box": [
++      475,
++      460,
++      562,
++      496
++     ],
++     "conf": 0.9896,
++     "page": 1,
++     "text": "61,000",
++     "words": [
++      {
++       "box": [
++        482,
++        460,
++        562,
++        496
++       ],
++       "conf": 0.9995,
++       "text": "61,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      73,
++      476,
++      264,
++      518
++     ],
++     "conf": 0.999,
++     "page": 1,
++     "text": "CHIKEN KATSUFF",
++     "words": [
++      {
++       "box": [
++        81,
++        476,
++        157,
++        515
++       ],
++       "conf": 0.9999,
++       "text": "CHIKEN"
++      },
++      {
++       "box": [
++        167,
++        478,
++        262,
++        517
++       ],
++       "conf": 0.9969,
++       "text": "KATSUFF"
++      }
++     ]
++    },
++    {
++     "box": [
++      356,
++      490,
++      370,
++      517
++     ],
++     "conf": 0.5137,
++     "page": 1,
++     "text": "1",
++     "words": [
++      {
++       "box": [
++        356,
++        490,
++        370,
++        514
++       ],
++       "conf": 0.5137,
++       "text": "1"
++      }
++     ]
++    },
++    {
++     "box": [
++      472,
++      488,
++      559,
++      527
++     ],
++     "conf": 0.9733,
++     "page": 1,
++     "text": "51,000",
++     "words": [
++      {
++       "box": [
++        480,
++        488,
++        559,
++        527
++       ],
++       "conf": 0.9477,
++       "text": "51,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      0,
++      514,
++      80,
++      591
++     ],
++     "conf": 0.8677,
++     "page": 1,
++     "text": "Bibi",
++     "words": [
++      {
++       "box": [
++        7,
++        514,
++        80,
++        591
++       ],
++       "conf": 0.9998,
++       "text": "Bibi"
++      }
++     ]
++    },
++    {
++     "box": [
++      465,
++      558,
++      572,
++      586
++     ],
++     "conf": 0.5636,
++     "page": 1,
++     "text": "es===",
++     "words": [
++      {
++       "box": [
++        469,
++        558,
++        518,
++        586
++       ],
++       "conf": 0.2961,
++       "text": "es=="
++      },
++      {
++       "box": [
++        532,
++        559,
++        545,
++        586
++       ],
++       "conf": 0.2818,
++       "text": "="
++      }
++     ]
++    },
++    {
++     "box": [
++      0,
++      571,
++      74,
++      643
++     ],
++     "conf": 0.8873,
++     "page": 1,
++     "text": "by",
++     "words": [
++      {
++       "box": [
++        16,
++        571,
++        64,
++        641
++       ],
++       "conf": 0.995,
++       "text": "by"
++      }
++     ]
++    },
++    {
++     "box": [
++      190,
++      580,
++      311,
++      617
++     ],
++     "conf": 0.887,
++     "page": 1,
++     "text": "SUS_TSTAL",
++     "words": [
++      {
++       "box": [
++        198,
++        580,
++        309,
++        616
++       ],
++       "conf": 0.9526,
++       "text": "SUS_TSTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      477,
++      587,
++      573,
++      626
++     ],
++     "conf": 0.9976,
++     "page": 1,
++     "text": "194,000",
++     "words": [
++      {
++       "box": [
++        486,
++        587,
++        573,
++        626
++       ],
++       "conf": 0.9992,
++       "text": "194,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      188,
++      616,
++      296,
++      648
++     ],
++     "conf": 0.5356,
++     "page": 1,
++     "text": "OI002S1T",
++     "words": [
++      {
++       "box": [
++        195,
++        616,
++        294,
++        648
++       ],
++       "conf": 0.5998,
++       "text": "OI002S1T"
++      }
++     ]
++    },
++    {
++     "box": [
++      475,
++      621,
++      566,
++      660
++     ],
++     "conf": 0.998,
++     "page": 1,
++     "text": "19,400",
++     "words": [
++      {
++       "box": [
++        484,
++        621,
++        559,
++        660
++       ],
++       "conf": 0.9999,
++       "text": "19,400"
++      }
++     ]
++    },
++    {
++     "box": [
++      0,
++      631,
++      63,
++      692
++     ],
++     "conf": 0.6948,
++     "page": 1,
++     "text": "lep.",
++     "words": [
++      {
++       "box": [
++        6,
++        631,
++        63,
++        692
++       ],
++       "conf": 0.7987,
++       "text": "lep."
++      }
++     ]
++    },
++    {
++     "box": [
++      186,
++      645,
++      311,
++      686
++     ],
++     "conf": 0.9934,
++     "page": 1,
++     "text": "TOTAL",
++     "words": [
++      {
++       "box": [
++        190,
++        645,
++        306,
++        685
++       ],
++       "conf": 0.9752,
++       "text": "TOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      475,
++      654,
++      576,
++      697
++     ],
++     "conf": 0.9967,
++     "page": 1,
++     "text": "174,600",
++     "words": [
++      {
++       "box": [
++        478,
++        654,
++        576,
++        697
++       ],
++       "conf": 1.0,
++       "text": "174,600"
++      }
++     ]
++    },
++    {
++     "box": [
++      187,
++      680,
++      285,
++      720
++     ],
++     "conf": 0.9708,
++     "page": 1,
++     "text": "CASH",
++     "words": [
++      {
++       "box": [
++        190,
++        680,
++        285,
++        721
++       ],
++       "conf": 0.9059,
++       "text": "CASH"
++      }
++     ]
++    },
++    {
++     "box": [
++      474,
++      690,
++      577,
++      730
++     ],
++     "conf": 0.9734,
++     "page": 1,
++     "text": "200,000",
++     "words": [
++      {
++       "box": [
++        482,
++        690,
++        573,
++        730
++       ],
++       "conf": 1.0,
++       "text": "200,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      186,
++      716,
++      272,
++      749
++     ],
++     "conf": 0.9978,
++     "page": 1,
++     "text": "CHANGE",
++     "words": [
++      {
++       "box": [
++        194,
++        716,
++        266,
++        749
++       ],
++       "conf": 0.9996,
++       "text": "CHANGE"
++      }
++     ]
++    },
++    {
++     "box": [
++      475,
++      727,
++      567,
++      765
++     ],
++     "conf": 0.9922,
++     "page": 1,
++     "text": "28,400",
++     "words": [
++      {
++       "box": [
++        484,
++        727,
++        561,
++        765
++       ],
++       "conf": 0.9999,
++       "text": "28,400"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0005",
++   "split": "test",
++   "image": "images/cord-v2_test_0005.jpg",
++   "golden": {
++    "tax": 2818.0,
++    "total": 31000.0,
++    "change": null,
++    "discount": null,
++    "subtotal": 28182.0,
++    "card_paid": null,
++    "cash_paid": 31000.0,
++    "item_count": 1,
++    "line_items": [
++     {
++      "name": "TRAD KY TOAST CARTE",
++      "quantity": 1,
++      "line_total": 28182.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "TRAD KY TOAST CARTE  28.182\nITEMS 1.00\nSUBTTL  28.182\nPB-1 10%  2.818\nTOTAL  31.000\nCASH  31.000",
++   "ocr_words": [
++    {
++     "box": [
++      167,
++      450,
++      326,
++      473
++     ],
++     "conf": 0.9966,
++     "page": 1,
++     "text": "TRAD KY TOAST CARTE",
++     "words": [
++      {
++       "box": [
++        171,
++        450,
++        203,
++        471
++       ],
++       "conf": 1.0,
++       "text": "TRAD"
++      },
++      {
++       "box": [
++        212,
++        450,
++        227,
++        472
++       ],
++       "conf": 1.0,
++       "text": "KY"
++      },
++      {
++       "box": [
++        236,
++        451,
++        279,
++        472
++       ],
++       "conf": 1.0,
++       "text": "TOAST"
++      },
++      {
++       "box": [
++        284,
++        452,
++        324,
++        473
++       ],
++       "conf": 1.0,
++       "text": "CARTE"
++      }
++     ]
++    },
++    {
++     "box": [
++      395,
++      452,
++      450,
++      474
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "28.182",
++     "words": [
++      {
++       "box": [
++        399,
++        452,
++        448,
++        473
++       ],
++       "conf": 1.0,
++       "text": "28.182"
++      }
++     ]
++    },
++    {
++     "box": [
++      240,
++      470,
++      327,
++      491
++     ],
++     "conf": 0.9938,
++     "page": 1,
++     "text": "ITEMS 1.00",
++     "words": [
++      {
++       "box": [
++        244,
++        470,
++        284,
++        490
++       ],
++       "conf": 0.9999,
++       "text": "ITEMS"
++      },
++      {
++       "box": [
++        294,
++        470,
++        326,
++        490
++       ],
++       "conf": 1.0,
++       "text": "1.00"
++      }
++     ]
++    },
++    {
++     "box": [
++      166,
++      488,
++      268,
++      509
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "SUBTTL",
++     "words": [
++      {
++       "box": [
++        170,
++        488,
++        267,
++        508
++       ],
++       "conf": 1.0,
++       "text": "SUBTTL"
++      }
++     ]
++    },
++    {
++     "box": [
++      394,
++      490,
++      450,
++      512
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "28.182",
++     "words": [
++      {
++       "box": [
++        398,
++        490,
++        449,
++        511
++       ],
++       "conf": 1.0,
++       "text": "28.182"
++      }
++     ]
++    },
++    {
++     "box": [
++      166,
++      506,
++      238,
++      528
++     ],
++     "conf": 0.999,
++     "page": 1,
++     "text": "PB-1 10%",
++     "words": [
++      {
++       "box": [
++        170,
++        506,
++        204,
++        528
++       ],
++       "conf": 1.0,
++       "text": "PB-1"
++      },
++      {
++       "box": [
++        210,
++        506,
++        238,
++        529
++       ],
++       "conf": 1.0,
++       "text": "10%"
++      }
++     ]
++    },
++    {
++     "box": [
++      402,
++      509,
++      451,
++      530
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "2.818",
++     "words": [
++      {
++       "box": [
++        406,
++        509,
++        450,
++        530
++       ],
++       "conf": 1.0,
++       "text": "2.818"
++      }
++     ]
++    },
++    {
++     "box": [
++      167,
++      524,
++      252,
++      548
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "TOTAL",
++     "words": [
++      {
++       "box": [
++        171,
++        524,
++        250,
++        547
++       ],
++       "conf": 1.0,
++       "text": "TOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      346,
++      528,
++      450,
++      548
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "31.000",
++     "words": [
++      {
++       "box": [
++        350,
++        528,
++        447,
++        548
++       ],
++       "conf": 1.0,
++       "text": "31.000"
++      }
++     ]
++    },
++    {
++     "box": [
++      167,
++      546,
++      237,
++      565
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "CASH",
++     "words": [
++      {
++       "box": [
++        170,
++        546,
++        234,
++        565
++       ],
++       "conf": 1.0,
++       "text": "CASH"
++      }
++     ]
++    },
++    {
++     "box": [
++      344,
++      546,
++      449,
++      567
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "31.000",
++     "words": [
++      {
++       "box": [
++        348,
++        546,
++        450,
++        567
++       ],
++       "conf": 1.0,
++       "text": "31.000"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0006",
++   "split": "test",
++   "image": "images/cord-v2_test_0006.jpg",
++   "golden": {
++    "tax": null,
++    "total": 46000.0,
++    "change": 4000.0,
++    "discount": null,
++    "subtotal": null,
++    "card_paid": null,
++    "cash_paid": 50000.0,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "EGG TART",
++      "quantity": 1,
++      "line_total": 13000.0,
++      "unit_price": null
++     },
++     {
++      "name": "CHOCO CUS ARD PASTRY",
++      "quantity": 2,
++      "line_total": 24000.0,
++      "unit_price": null
++     },
++     {
++      "name": "REDBEAN BREAD",
++      "quantity": 1,
++      "line_total": 9000.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "1 EGG TART  13,000\n2 CHOCO CUS ARD PASTRY  24,000\nREDBEAN BREAD  9,000\nTOTAL  46,000\nCASH  50,000\nCHANCE  4,000",
++   "ocr_words": [
++    {
++     "box": [
++      120,
++      434,
++      257,
++      470
++     ],
++     "conf": 0.9984,
++     "page": 1,
++     "text": "1 EGG TART",
++     "words": [
++      {
++       "box": [
++        127,
++        434,
++        140,
++        469
++       ],
++       "conf": 0.9988,
++       "text": "1"
++      },
++      {
++       "box": [
++        157,
++        434,
++        192,
++        469
++       ],
++       "conf": 0.9874,
++       "text": "EGG"
++      },
++      {
++       "box": [
++        203,
++        434,
++        256,
++        468
++       ],
++       "conf": 0.9985,
++       "text": "TART"
++      }
++     ]
++    },
++    {
++     "box": [
++      497,
++      436,
++      584,
++      475
++     ],
++     "conf": 0.9993,
++     "page": 1,
++     "text": "13,000",
++     "words": [
++      {
++       "box": [
++        498,
++        436,
++        580,
++        475
++       ],
++       "conf": 1.0,
++       "text": "13,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      119,
++      463,
++      404,
++      502
++     ],
++     "conf": 0.9666,
++     "page": 1,
++     "text": "2 CHOCO CUS ARD PASTRY",
++     "words": [
++      {
++       "box": [
++        127,
++        465,
++        139,
++        502
++       ],
++       "conf": 0.9999,
++       "text": "2"
++      },
++      {
++       "box": [
++        157,
++        465,
++        217,
++        502
++       ],
++       "conf": 0.9783,
++       "text": "CHOCO"
++      },
++      {
++       "box": [
++        229,
++        464,
++        265,
++        501
++       ],
++       "conf": 0.9992,
++       "text": "CUS"
++      },
++      {
++       "box": [
++        278,
++        464,
++        314,
++        501
++       ],
++       "conf": 1.0,
++       "text": "ARD"
++      },
++      {
++       "box": [
++        326,
++        463,
++        400,
++        500
++       ],
++       "conf": 0.9998,
++       "text": "PASTRY"
++      }
++     ]
++    },
++    {
++     "box": [
++      495,
++      467,
++      586,
++      503
++     ],
++     "conf": 0.9954,
++     "page": 1,
++     "text": "24,000",
++     "words": [
++      {
++       "box": [
++        503,
++        467,
++        583,
++        503
++       ],
++       "conf": 1.0,
++       "text": "24,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      149,
++      495,
++      318,
++      532
++     ],
++     "conf": 0.9945,
++     "page": 1,
++     "text": "REDBEAN BREAD",
++     "words": [
++      {
++       "box": [
++        157,
++        495,
++        245,
++        531
++       ],
++       "conf": 0.9996,
++       "text": "REDBEAN"
++      },
++      {
++       "box": [
++        254,
++        495,
++        317,
++        529
++       ],
++       "conf": 0.9997,
++       "text": "BREAD"
++      }
++     ]
++    },
++    {
++     "box": [
++      507,
++      499,
++      583,
++      533
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "9,000",
++     "words": [
++      {
++       "box": [
++        515,
++        499,
++        578,
++        533
++       ],
++       "conf": 1.0,
++       "text": "9,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      145,
++      552,
++      279,
++      619
++     ],
++     "conf": 0.9997,
++     "page": 1,
++     "text": "TOTAL",
++     "words": [
++      {
++       "box": [
++        161,
++        552,
++        270,
++        618
++       ],
++       "conf": 0.9999,
++       "text": "TOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      417,
++      553,
++      583,
++      617
++     ],
++     "conf": 0.9997,
++     "page": 1,
++     "text": "46,000",
++     "words": [
++      {
++       "box": [
++        430,
++        553,
++        583,
++        617
++       ],
++       "conf": 1.0,
++       "text": "46,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      146,
++      606,
++      209,
++      647
++     ],
++     "conf": 0.9985,
++     "page": 1,
++     "text": "CASH",
++     "words": [
++      {
++       "box": [
++        148,
++        606,
++        201,
++        647
++       ],
++       "conf": 0.9975,
++       "text": "CASH"
++      }
++     ]
++    },
++    {
++     "box": [
++      495,
++      605,
++      581,
++      640
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "50,000",
++     "words": [
++      {
++       "box": [
++        502,
++        605,
++        580,
++        640
++       ],
++       "conf": 1.0,
++       "text": "50,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      142,
++      632,
++      309,
++      702
++     ],
++     "conf": 0.9595,
++     "page": 1,
++     "text": "CHANCE",
++     "words": [
++      {
++       "box": [
++        144,
++        632,
++        309,
++        701
++       ],
++       "conf": 0.9999,
++       "text": "CHANCE"
++      }
++     ]
++    },
++    {
++     "box": [
++      439,
++      633,
++      583,
++      700
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "4,000",
++     "words": [
++      {
++       "box": [
++        454,
++        633,
++        580,
++        700
++       ],
++       "conf": 1.0,
++       "text": "4,000"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0007",
++   "split": "test",
++   "image": "images/cord-v2_test_0007.jpg",
++   "golden": {
++    "tax": 10091.0,
++    "total": 111000.0,
++    "change": null,
++    "discount": null,
++    "subtotal": 100909.0,
++    "card_paid": null,
++    "cash_paid": 111000.0,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "Kupon 15",
++      "quantity": 1,
++      "line_total": 100000.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "Kupon 15  100,000\nO CCKN BOX  909\nSubtetal  100,909\nPB1(107)  10,091\nTotal  111,000\nCash  Rp.111,000",
++   "ocr_words": [
++    {
++     "box": [
++      67,
++      523,
++      158,
++      553
++     ],
++     "conf": 0.9979,
++     "page": 1,
++     "text": "Kupon 15",
++     "words": [
++      {
++       "box": [
++        74,
++        523,
++        124,
++        553
++       ],
++       "conf": 0.9997,
++       "text": "Kupon"
++      },
++      {
++       "box": [
++        134,
++        523,
++        154,
++        553
++       ],
++       "conf": 0.9997,
++       "text": "15"
++      }
++     ]
++    },
++    {
++     "box": [
++      415,
++      530,
++      500,
++      567
++     ],
++     "conf": 0.9901,
++     "page": 1,
++     "text": "100,000",
++     "words": [
++      {
++       "box": [
++        422,
++        530,
++        496,
++        567
++       ],
++       "conf": 0.9994,
++       "text": "100,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      67,
++      550,
++      226,
++      585
++     ],
++     "conf": 0.5716,
++     "page": 1,
++     "text": "O CCKN BOX",
++     "words": [
++      {
++       "box": [
++        76,
++        550,
++        91,
++        580
++       ],
++       "conf": 0.524,
++       "text": "O"
++      },
++      {
++       "box": [
++        105,
++        551,
++        145,
++        582
++       ],
++       "conf": 0.8573,
++       "text": "CC"
++      },
++      {
++       "box": [
++        160,
++        552,
++        180,
++        584
++       ],
++       "conf": 0.5859,
++       "text": "KN"
++      },
++      {
++       "box": [
++        185,
++        553,
++        226,
++        586
++       ],
++       "conf": 0.518,
++       "text": "BOX"
++      }
++     ]
++    },
++    {
++     "box": [
++      459,
++      563,
++      500,
++      591
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "909",
++     "words": [
++      {
++       "box": [
++        464,
++        563,
++        499,
++        591
++       ],
++       "conf": 0.9998,
++       "text": "909"
++      }
++     ]
++    },
++    {
++     "box": [
++      61,
++      606,
++      153,
++      640
++     ],
++     "conf": 0.9482,
++     "page": 1,
++     "text": "Subtetal",
++     "words": [
++      {
++       "box": [
++        68,
++        606,
++        150,
++        639
++       ],
++       "conf": 0.9994,
++       "text": "Subtetal"
++      }
++     ]
++    },
++    {
++     "box": [
++      417,
++      620,
++      497,
++      651
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "100,909",
++     "words": [
++      {
++       "box": [
++        419,
++        620,
++        497,
++        651
++       ],
++       "conf": 1.0,
++       "text": "100,909"
++      }
++     ]
++    },
++    {
++     "box": [
++      60,
++      636,
++      162,
++      669
++     ],
++     "conf": 0.9315,
++     "page": 1,
++     "text": "PB1(107)",
++     "words": [
++      {
++       "box": [
++        64,
++        636,
++        162,
++        669
++       ],
++       "conf": 0.995,
++       "text": "PB1(107)"
++      }
++     ]
++    },
++    {
++     "box": [
++      427,
++      649,
++      499,
++      683
++     ],
++     "conf": 0.9794,
++     "page": 1,
++     "text": "10,091",
++     "words": [
++      {
++       "box": [
++        429,
++        649,
++        497,
++        683
++       ],
++       "conf": 0.9999,
++       "text": "10,091"
++      }
++     ]
++    },
++    {
++     "box": [
++      55,
++      691,
++      120,
++      729
++     ],
++     "conf": 0.9997,
++     "page": 1,
++     "text": "Total",
++     "words": [
++      {
++       "box": [
++        64,
++        691,
++        116,
++        728
++       ],
++       "conf": 0.9999,
++       "text": "Total"
++      }
++     ]
++    },
++    {
++     "box": [
++      413,
++      703,
++      495,
++      738
++     ],
++     "conf": 0.9994,
++     "page": 1,
++     "text": "111,000",
++     "words": [
++      {
++       "box": [
++        415,
++        703,
++        493,
++        737
++       ],
++       "conf": 0.9998,
++       "text": "111,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      53,
++      754,
++      109,
++      788
++     ],
++     "conf": 0.9913,
++     "page": 1,
++     "text": "Cash",
++     "words": [
++      {
++       "box": [
++        60,
++        754,
++        104,
++        787
++       ],
++       "conf": 0.9695,
++       "text": "Cash"
++      }
++     ]
++    },
++    {
++     "box": [
++      382,
++      758,
++      494,
++      794
++     ],
++     "conf": 0.9962,
++     "page": 1,
++     "text": "Rp.111,000",
++     "words": [
++      {
++       "box": [
++        390,
++        758,
++        492,
++        793
++       ],
++       "conf": 0.9987,
++       "text": "Rp.111,000"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0008",
++   "split": "test",
++   "image": "images/cord-v2_test_0008.jpg",
++   "golden": {
++    "tax": 4545.0,
++    "total": 50000.0,
++    "change": null,
++    "discount": null,
++    "subtotal": 45455.0,
++    "card_paid": 50000.0,
++    "cash_paid": null,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "[REG] BLACK SAKURA",
++      "quantity": 1,
++      "line_total": 45455.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "1 [REG] BLACK SAKURA  45,455\n1 COOKIE DOH SAUCES  0\n1 NATA DE COCO  0\nSub Total  45,455\nPB1(10%)  4,545\nRounding  0\nTotal  50,000\nCard Payment  50,000\n★水  ★水★",
++   "ocr_words": [
++    {
++     "box": [
++      37,
++      456,
++      376,
++      492
++     ],
++     "conf": 0.9781,
++     "page": 1,
++     "text": "1 [REG] BLACK SAKURA",
++     "words": [
++      {
++       "box": [
++        42,
++        456,
++        61,
++        492
++       ],
++       "conf": 0.999,
++       "text": "1"
++      },
++      {
++       "box": [
++        61,
++        456,
++        151,
++        492
++       ],
++       "conf": 0.8163,
++       "text": "[REG]"
++      },
++      {
++       "box": [
++        157,
++        456,
++        248,
++        492
++       ],
++       "conf": 0.9997,
++       "text": "BLACK"
++      },
++      {
++       "box": [
++        260,
++        456,
++        368,
++        492
++       ],
++       "conf": 1.0,
++       "text": "SAKURA"
++      }
++     ]
++    },
++    {
++     "box": [
++      549,
++      449,
++      653,
++      489
++     ],
++     "conf": 0.9969,
++     "page": 1,
++     "text": "45,455",
++     "words": [
++      {
++       "box": [
++        556,
++        449,
++        650,
++        488
++       ],
++       "conf": 1.0,
++       "text": "45,455"
++      }
++     ]
++    },
++    {
++     "box": [
++      36,
++      492,
++      377,
++      522
++     ],
++     "conf": 0.9931,
++     "page": 1,
++     "text": "1 COOKIE DOH SAUCES",
++     "words": [
++      {
++       "box": [
++        39,
++        492,
++        58,
++        522
++       ],
++       "conf": 0.9991,
++       "text": "1"
++      },
++      {
++       "box": [
++        69,
++        492,
++        178,
++        522
++       ],
++       "conf": 0.9561,
++       "text": "COOKIE"
++      },
++      {
++       "box": [
++        189,
++        492,
++        248,
++        522
++       ],
++       "conf": 0.9998,
++       "text": "DOH"
++      },
++      {
++       "box": [
++        259,
++        492,
++        373,
++        522
++       ],
++       "conf": 0.9997,
++       "text": "SAUCES"
++      }
++     ]
++    },
++    {
++     "box": [
++      628,
++      486,
++      653,
++      519
++     ],
++     "conf": 0.9908,
++     "page": 1,
++     "text": "0",
++     "words": [
++      {
++       "box": [
++        629,
++        486,
++        653,
++        519
++       ],
++       "conf": 0.9908,
++       "text": "0"
++      }
++     ]
++    },
++    {
++     "box": [
++      629,
++      515,
++      656,
++      552
++     ],
++     "conf": 0.9901,
++     "page": 1,
++     "text": "0",
++     "words": [
++      {
++       "box": [
++        630,
++        515,
++        656,
++        552
++       ],
++       "conf": 0.9901,
++       "text": "0"
++      }
++     ]
++    },
++    {
++     "box": [
++      35,
++      523,
++      289,
++      557
++     ],
++     "conf": 0.9403,
++     "page": 1,
++     "text": "1 NATA DE COCO",
++     "words": [
++      {
++       "box": [
++        39,
++        523,
++        59,
++        557
++       ],
++       "conf": 0.9991,
++       "text": "1"
++      },
++      {
++       "box": [
++        67,
++        523,
++        144,
++        557
++       ],
++       "conf": 0.5182,
++       "text": "NATA"
++      },
++      {
++       "box": [
++        152,
++        523,
++        195,
++        557
++       ],
++       "conf": 0.9999,
++       "text": "DE"
++      },
++      {
++       "box": [
++        203,
++        523,
++        285,
++        557
++       ],
++       "conf": 0.9999,
++       "text": "COCO"
++      }
++     ]
++    },
++    {
++     "box": [
++      22,
++      591,
++      162,
++      626
++     ],
++     "conf": 0.993,
++     "page": 1,
++     "text": "Sub Total",
++     "words": [
++      {
++       "box": [
++        29,
++        591,
++        79,
++        626
++       ],
++       "conf": 0.9995,
++       "text": "Sub"
++      },
++      {
++       "box": [
++        92,
++        591,
++        162,
++        626
++       ],
++       "conf": 1.0,
++       "text": "Total"
++      }
++     ]
++    },
++    {
++     "box": [
++      556,
++      586,
++      661,
++      624
++     ],
++     "conf": 0.9963,
++     "page": 1,
++     "text": "45,455",
++     "words": [
++      {
++       "box": [
++        563,
++        586,
++        654,
++        624
++       ],
++       "conf": 1.0,
++       "text": "45,455"
++      }
++     ]
++    },
++    {
++     "box": [
++      19,
++      625,
++      174,
++      665
++     ],
++     "conf": 0.9851,
++     "page": 1,
++     "text": "PB1(10%)",
++     "words": [
++      {
++       "box": [
++        25,
++        625,
++        174,
++        665
++       ],
++       "conf": 0.9999,
++       "text": "PB1(10%)"
++      }
++     ]
++    },
++    {
++     "box": [
++      573,
++      621,
++      664,
++      660
++     ],
++     "conf": 0.965,
++     "page": 1,
++     "text": "4,545",
++     "words": [
++      {
++       "box": [
++        582,
++        621,
++        654,
++        660
++       ],
++       "conf": 1.0,
++       "text": "4,545"
++      }
++     ]
++    },
++    {
++     "box": [
++      17,
++      662,
++      159,
++      701
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "Rounding",
++     "words": [
++      {
++       "box": [
++        25,
++        662,
++        159,
++        701
++       ],
++       "conf": 1.0,
++       "text": "Rounding"
++      }
++     ]
++    },
++    {
++     "box": [
++      635,
++      656,
++      666,
++      694
++     ],
++     "conf": 0.9763,
++     "page": 1,
++     "text": "0",
++     "words": [
++      {
++       "box": [
++        635,
++        656,
++        666,
++        694
++       ],
++       "conf": 0.9763,
++       "text": "0"
++      }
++     ]
++    },
++    {
++     "box": [
++      16,
++      698,
++      111,
++      740
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "Total",
++     "words": [
++      {
++       "box": [
++        25,
++        698,
++        111,
++        740
++       ],
++       "conf": 1.0,
++       "text": "Total"
++      }
++     ]
++    },
++    {
++     "box": [
++      546,
++      690,
++      666,
++      738
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "50,000",
++     "words": [
++      {
++       "box": [
++        557,
++        690,
++        659,
++        737
++       ],
++       "conf": 1.0,
++       "text": "50,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      567,
++      840,
++      666,
++      883
++     ],
++     "conf": 0.9982,
++     "page": 1,
++     "text": "50,000",
++     "words": [
++      {
++       "box": [
++        576,
++        840,
++        666,
++        883
++       ],
++       "conf": 1.0,
++       "text": "50,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      12,
++      848,
++      218,
++      888
++     ],
++     "conf": 0.9955,
++     "page": 1,
++     "text": "Card Payment",
++     "words": [
++      {
++       "box": [
++        19,
++        850,
++        85,
++        888
++       ],
++       "conf": 0.9998,
++       "text": "Card"
++      },
++      {
++       "box": [
++        93,
++        848,
++        218,
++        887
++       ],
++       "conf": 1.0,
++       "text": "Payment"
++      }
++     ]
++    },
++    {
++     "box": [
++      98,
++      927,
++      139,
++      944
++     ],
++     "conf": 0.5002,
++     "page": 1,
++     "text": "★水",
++     "words": [
++      {
++       "box": [
++        98,
++        927,
++        113,
++        944
++       ],
++       "conf": 0.7832,
++       "text": "★"
++      },
++      {
++       "box": [
++        113,
++        927,
++        129,
++        944
++       ],
++       "conf": 0.2172,
++       "text": "水"
++      }
++     ]
++    },
++    {
++     "box": [
++      574,
++      920,
++      615,
++      939
++     ],
++     "conf": 0.6911,
++     "page": 1,
++     "text": "★水★",
++     "words": [
++      {
++       "box": [
++        575,
++        920,
++        588,
++        939
++       ],
++       "conf": 0.9365,
++       "text": "★"
++      },
++      {
++       "box": [
++        588,
++        920,
++        600,
++        939
++       ],
++       "conf": 0.3837,
++       "text": "水"
++      },
++      {
++       "box": [
++        600,
++        920,
++        614,
++        939
++       ],
++       "conf": 0.7531,
++       "text": "★"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0009",
++   "split": "test",
++   "image": "images/cord-v2_test_0009.jpg",
++   "golden": {
++    "tax": null,
++    "total": null,
++    "change": 14000.0,
++    "discount": null,
++    "subtotal": 36000.0,
++    "card_paid": null,
++    "cash_paid": 50000.0,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "Bumbu Kaldu Ayam 1",
++      "quantity": 1,
++      "line_total": 36000.0,
++      "unit_price": 36000.0
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "Bumbu Kaldu Ayam 1  36000  36000\nSub Total  36000\nDiscount (0 %)\nTunai  50000\nKembalian  14000",
++   "ocr_words": [
++    {
++     "box": [
++      29,
++      319,
++      241,
++      352
++     ],
++     "conf": 0.9991,
++     "page": 1,
++     "text": "Bumbu Kaldu Ayam 1",
++     "words": [
++      {
++       "box": [
++        34,
++        319,
++        104,
++        349
++       ],
++       "conf": 0.9999,
++       "text": "Bumbu"
++      },
++      {
++       "box": [
++        107,
++        320,
++        162,
++        350
++       ],
++       "conf": 0.9999,
++       "text": "Kaldu"
++      },
++      {
++       "box": [
++        169,
++        321,
++        215,
++        351
++       ],
++       "conf": 0.9964,
++       "text": "Ayam"
++      },
++      {
++       "box": [
++        227,
++        322,
++        239,
++        351
++       ],
++       "conf": 1.0,
++       "text": "1"
++      }
++     ]
++    },
++    {
++     "box": [
++      261,
++      334,
++      330,
++      361
++     ],
++     "conf": 0.9983,
++     "page": 1,
++     "text": "36000",
++     "words": [
++      {
++       "box": [
++        266,
++        334,
++        327,
++        361
++       ],
++       "conf": 1.0,
++       "text": "36000"
++      }
++     ]
++    },
++    {
++     "box": [
++      29,
++      344,
++      99,
++      374
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "36000",
++     "words": [
++      {
++       "box": [
++        34,
++        344,
++        99,
++        374
++       ],
++       "conf": 1.0,
++       "text": "36000"
++      }
++     ]
++    },
++    {
++     "box": [
++      28,
++      407,
++      128,
++      437
++     ],
++     "conf": 0.9952,
++     "page": 1,
++     "text": "Sub Total",
++     "words": [
++      {
++       "box": [
++        34,
++        407,
++        70,
++        437
++       ],
++       "conf": 1.0,
++       "text": "Sub"
++      },
++      {
++       "box": [
++        79,
++        407,
++        128,
++        437
++       ],
++       "conf": 1.0,
++       "text": "Total"
++      }
++     ]
++    },
++    {
++     "box": [
++      261,
++      420,
++      328,
++      448
++     ],
++     "conf": 0.9993,
++     "page": 1,
++     "text": "36000",
++     "words": [
++      {
++       "box": [
++        266,
++        420,
++        325,
++        448
++       ],
++       "conf": 1.0,
++       "text": "36000"
++      }
++     ]
++    },
++    {
++     "box": [
++      27,
++      446,
++      176,
++      475
++     ],
++     "conf": 0.9996,
++     "page": 1,
++     "text": "Discount (0 %)",
++     "words": [
++      {
++       "box": [
++        33,
++        446,
++        121,
++        475
++       ],
++       "conf": 1.0,
++       "text": "Discount"
++      },
++      {
++       "box": [
++        125,
++        446,
++        140,
++        475
++       ],
++       "conf": 1.0,
++       "text": "(0"
++      },
++      {
++       "box": [
++        149,
++        446,
++        174,
++        475
++       ],
++       "conf": 0.9999,
++       "text": "%)"
++      }
++     ]
++    },
++    {
++     "box": [
++      26,
++      480,
++      90,
++      511
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "Tunai",
++     "words": [
++      {
++       "box": [
++        33,
++        480,
++        90,
++        511
++       ],
++       "conf": 1.0,
++       "text": "Tunai"
++      }
++     ]
++    },
++    {
++     "box": [
++      261,
++      493,
++      329,
++      522
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "50000",
++     "words": [
++      {
++       "box": [
++        267,
++        493,
++        327,
++        522
++       ],
++       "conf": 1.0,
++       "text": "50000"
++      }
++     ]
++    },
++    {
++     "box": [
++      25,
++      557,
++      139,
++      589
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "Kembalian",
++     "words": [
++      {
++       "box": [
++        31,
++        557,
++        136,
++        589
++       ],
++       "conf": 1.0,
++       "text": "Kembalian"
++      }
++     ]
++    },
++    {
++     "box": [
++      263,
++      569,
++      329,
++      596
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "14000",
++     "words": [
++      {
++       "box": [
++        268,
++        569,
++        324,
++        596
++       ],
++       "conf": 1.0,
++       "text": "14000"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0010",
++   "split": "test",
++   "image": "images/cord-v2_test_0010.jpg",
++   "golden": {
++    "tax": null,
++    "total": 17000.0,
++    "change": 3000.0,
++    "discount": null,
++    "subtotal": 17000.0,
++    "card_paid": null,
++    "cash_paid": 20000.0,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "CINNAMON SUGAR",
++      "quantity": 1,
++      "line_total": 17000.0,
++      "unit_price": 17000.0
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "CINNAMONSUGAR\nx 17,000  17,000\nSUB TOTAL  17,000\nGRANDTOTAL  17,000\nCASHIDR  20,000\nCHANGE DUE  3,000",
++   "ocr_words": [
++    {
++     "box": [
++      45,
++      423,
++      251,
++      452
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "CINNAMONSUGAR",
++     "words": [
++      {
++       "box": [
++        52,
++        423,
++        247,
++        451
++       ],
++       "conf": 0.9999,
++       "text": "CINNAMONSUGAR"
++      }
++     ]
++    },
++    {
++     "box": [
++      92,
++      457,
++      197,
++      484
++     ],
++     "conf": 0.8613,
++     "page": 1,
++     "text": "x 17,000",
++     "words": [
++      {
++       "box": [
++        102,
++        457,
++        113,
++        484
++       ],
++       "conf": 0.5033,
++       "text": "x"
++      },
++      {
++       "box": [
++        129,
++        457,
++        194,
++        484
++       ],
++       "conf": 0.538,
++       "text": "17,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      447,
++      459,
++      527,
++      492
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "17,000",
++     "words": [
++      {
++       "box": [
++        454,
++        459,
++        523,
++        491
++       ],
++       "conf": 1.0,
++       "text": "17,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      18,
++      504,
++      144,
++      531
++     ],
++     "conf": 0.962,
++     "page": 1,
++     "text": "SUB TOTAL",
++     "words": [
++      {
++       "box": [
++        21,
++        504,
++        68,
++        531
++       ],
++       "conf": 1.0,
++       "text": "SUB"
++      },
++      {
++       "box": [
++        71,
++        504,
++        140,
++        531
++       ],
++       "conf": 0.9997,
++       "text": "TOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      447,
++      508,
++      528,
++      542
++     ],
++     "conf": 0.9994,
++     "page": 1,
++     "text": "17,000",
++     "words": [
++      {
++       "box": [
++        454,
++        508,
++        525,
++        541
++       ],
++       "conf": 1.0,
++       "text": "17,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      16,
++      570,
++      177,
++      601
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "GRANDTOTAL",
++     "words": [
++      {
++       "box": [
++        25,
++        570,
++        177,
++        601
++       ],
++       "conf": 1.0,
++       "text": "GRANDTOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      448,
++      580,
++      527,
++      611
++     ],
++     "conf": 0.9988,
++     "page": 1,
++     "text": "17,000",
++     "words": [
++      {
++       "box": [
++        455,
++        580,
++        523,
++        611
++       ],
++       "conf": 1.0,
++       "text": "17,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      15,
++      618,
++      127,
++      650
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "CASHIDR",
++     "words": [
++      {
++       "box": [
++        24,
++        618,
++        124,
++        650
++       ],
++       "conf": 0.9999,
++       "text": "CASHIDR"
++      }
++     ]
++    },
++    {
++     "box": [
++      446,
++      630,
++      525,
++      661
++     ],
++     "conf": 0.999,
++     "page": 1,
++     "text": "20,000",
++     "words": [
++      {
++       "box": [
++        452,
++        630,
++        522,
++        660
++       ],
++       "conf": 1.0,
++       "text": "20,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      18,
++      668,
++      169,
++      698
++     ],
++     "conf": 0.9722,
++     "page": 1,
++     "text": "CHANGE DUE",
++     "words": [
++      {
++       "box": [
++        21,
++        668,
++        118,
++        696
++       ],
++       "conf": 1.0,
++       "text": "CHANGE"
++      },
++      {
++       "box": [
++        120,
++        670,
++        168,
++        697
++       ],
++       "conf": 1.0,
++       "text": "DUE"
++      }
++     ]
++    },
++    {
++     "box": [
++      457,
++      677,
++      523,
++      705
++     ],
++     "conf": 0.9987,
++     "page": 1,
++     "text": "3,000",
++     "words": [
++      {
++       "box": [
++        462,
++        677,
++        521,
++        705
++       ],
++       "conf": 1.0,
++       "text": "3,000"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0011",
++   "split": "test",
++   "image": "images/cord-v2_test_0011.jpg",
++   "golden": {
++    "tax": null,
++    "total": 230000.0,
++    "change": 0.0,
++    "discount": null,
++    "subtotal": null,
++    "card_paid": null,
++    "cash_paid": 230000.0,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "BANABERRY FRESH CREAM CAK",
++      "quantity": 1,
++      "line_total": 230000.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "1 BANABERRY FRESH CREAM CAK 230,000\nTOTAL  CASH  230,000  230,000\nCHANGE  0",
++   "ocr_words": [
++    {
++     "box": [
++      112,
++      369,
++      402,
++      408
++     ],
++     "conf": 0.9958,
++     "page": 1,
++     "text": "1 BANABERRY FRESH CREAM CAK 230,000",
++     "words": [
++      {
++       "box": [
++        118,
++        382,
++        127,
++        407
++       ],
++       "conf": 0.9998,
++       "text": "1"
++      },
++      {
++       "box": [
++        131,
++        378,
++        207,
++        407
++       ],
++       "conf": 0.9989,
++       "text": "BANABERRY"
++      },
++      {
++       "box": [
++        210,
++        376,
++        253,
++        403
++       ],
++       "conf": 1.0,
++       "text": "FRESH"
++      },
++      {
++       "box": [
++        256,
++        373,
++        299,
++        401
++       ],
++       "conf": 0.9999,
++       "text": "CREAM"
++      },
++      {
++       "box": [
++        306,
++        372,
++        328,
++        398
++       ],
++       "conf": 0.9997,
++       "text": "CAK"
++      },
++      {
++       "box": [
++        344,
++        369,
++        402,
++        396
++       ],
++       "conf": 0.9986,
++       "text": "230,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      126,
++      417,
++      216,
++      460
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "TOTAL",
++     "words": [
++      {
++       "box": [
++        135,
++        417,
++        211,
++        459
++       ],
++       "conf": 1.0,
++       "text": "TOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      284,
++      407,
++      408,
++      451
++     ],
++     "conf": 0.9984,
++     "page": 1,
++     "text": "230,000",
++     "words": [
++      {
++       "box": [
++        291,
++        407,
++        404,
++        450
++       ],
++       "conf": 1.0,
++       "text": "230,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      342,
++      436,
++      409,
++      462
++     ],
++     "conf": 0.9978,
++     "page": 1,
++     "text": "230,000",
++     "words": [
++      {
++       "box": [
++        350,
++        436,
++        407,
++        461
++       ],
++       "conf": 1.0,
++       "text": "230,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      129,
++      452,
++      169,
++      472
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "CASH",
++     "words": [
++      {
++       "box": [
++        133,
++        452,
++        164,
++        472
++       ],
++       "conf": 0.9997,
++       "text": "CASH"
++      }
++     ]
++    },
++    {
++     "box": [
++      384,
++      453,
++      414,
++      490
++     ],
++     "conf": 0.9987,
++     "page": 1,
++     "text": "0",
++     "words": [
++      {
++       "box": [
++        385,
++        453,
++        414,
++        489
++       ],
++       "conf": 0.9987,
++       "text": "0"
++      }
++     ]
++    },
++    {
++     "box": [
++      124,
++      462,
++      235,
++      506
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "CHANGE",
++     "words": [
++      {
++       "box": [
++        131,
++        462,
++        232,
++        505
++       ],
++       "conf": 1.0,
++       "text": "CHANGE"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0012",
++   "split": "test",
++   "image": "images/cord-v2_test_0012.jpg",
++   "golden": {
++    "tax": null,
++    "total": 120000.0,
++    "change": 0.0,
++    "discount": null,
++    "subtotal": null,
++    "card_paid": 120000.0,
++    "cash_paid": null,
++    "item_count": 2,
++    "line_items": [
++     {
++      "name": "BLUS WANITA",
++      "quantity": 1,
++      "line_total": 120000.0,
++      "unit_price": 120000.0
++     },
++     {
++      "name": "SHOPPING BAG",
++      "quantity": 1,
++      "line_total": 0.0,
++      "unit_price": 880.0
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "27\n0571-1854 BLUS WANITA  1  8120,000 0%  120,000\n1002-0060 SHOPPING BAG\n2880 1008\nTOTAL (2 item)  120,000\nCC.Visa.BCA  120,000\nTotal Kembalian",
++   "ocr_words": [
++    {
++     "box": [
++      410,
++      265,
++      476,
++      326
++     ],
++     "conf": 0.95,
++     "page": 1,
++     "text": "27",
++     "words": [
++      {
++       "box": [
++        423,
++        265,
++        465,
++        326
++       ],
++       "conf": 0.9997,
++       "text": "27"
++      }
++     ]
++    },
++    {
++     "box": [
++      66,
++      348,
++      302,
++      393
++     ],
++     "conf": 0.999,
++     "page": 1,
++     "text": "0571-1854 BLUS WANITA",
++     "words": [
++      {
++       "box": [
++        76,
++        348,
++        186,
++        391
++       ],
++       "conf": 0.9998,
++       "text": "0571-1854"
++      },
++      {
++       "box": [
++        195,
++        350,
++        233,
++        392
++       ],
++       "conf": 1.0,
++       "text": "BLUS"
++      },
++      {
++       "box": [
++        242,
++        351,
++        302,
++        394
++       ],
++       "conf": 1.0,
++       "text": "WANITA"
++      }
++     ]
++    },
++    {
++     "box": [
++      123,
++      381,
++      179,
++      407
++     ],
++     "conf": 0.9932,
++     "page": 1,
++     "text": "1",
++     "words": [
++      {
++       "box": [
++        123,
++        381,
++        165,
++        406
++       ],
++       "conf": 0.9932,
++       "text": "1"
++      }
++     ]
++    },
++    {
++     "box": [
++      167,
++      381,
++      313,
++      416
++     ],
++     "conf": 0.916,
++     "page": 1,
++     "text": "8120,000 0%",
++     "words": [
++      {
++       "box": [
++        174,
++        381,
++        266,
++        415
++       ],
++       "conf": 0.312,
++       "text": "8120,000"
++      },
++      {
++       "box": [
++        286,
++        383,
++        309,
++        415
++       ],
++       "conf": 0.999,
++       "text": "0%"
++      }
++     ]
++    },
++    {
++     "box": [
++      340,
++      369,
++      429,
++      411
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "120,000",
++     "words": [
++      {
++       "box": [
++        342,
++        369,
++        429,
++        410
++       ],
++       "conf": 1.0,
++       "text": "120,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      66,
++      395,
++      316,
++      443
++     ],
++     "conf": 0.9617,
++     "page": 1,
++     "text": "1002-0060 SHOPPING BAG",
++     "words": [
++      {
++       "box": [
++        74,
++        395,
++        178,
++        434
++       ],
++       "conf": 0.9999,
++       "text": "1002-0060"
++      },
++      {
++       "box": [
++        187,
++        402,
++        275,
++        440
++       ],
++       "conf": 0.9996,
++       "text": "SHOPPING"
++      },
++      {
++       "box": [
++        284,
++        409,
++        312,
++        442
++       ],
++       "conf": 0.998,
++       "text": "BAG"
++      }
++     ]
++    },
++    {
++     "box": [
++      207,
++      434,
++      311,
++      467
++     ],
++     "conf": 0.6979,
++     "page": 1,
++     "text": "2880 1008",
++     "words": [
++      {
++       "box": [
++        209,
++        434,
++        253,
++        467
++       ],
++       "conf": 0.4432,
++       "text": "2880"
++      },
++      {
++       "box": [
++        264,
++        434,
++        308,
++        467
++       ],
++       "conf": 0.6786,
++       "text": "1008"
++      }
++     ]
++    },
++    {
++     "box": [
++      55,
++      480,
++      222,
++      525
++     ],
++     "conf": 0.9654,
++     "page": 1,
++     "text": "TOTAL (2 item)",
++     "words": [
++      {
++       "box": [
++        62,
++        480,
++        118,
++        517
++       ],
++       "conf": 0.9973,
++       "text": "TOTAL"
++      },
++      {
++       "box": [
++        132,
++        485,
++        156,
++        520
++       ],
++       "conf": 0.9977,
++       "text": "(2"
++      },
++      {
++       "box": [
++        165,
++        488,
++        221,
++        526
++       ],
++       "conf": 0.9999,
++       "text": "item)"
++      }
++     ]
++    },
++    {
++     "box": [
++      342,
++      482,
++      432,
++      517
++     ],
++     "conf": 0.9995,
++     "page": 1,
++     "text": "120,000",
++     "words": [
++      {
++       "box": [
++        347,
++        482,
++        432,
++        518
++       ],
++       "conf": 1.0,
++       "text": "120,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      50,
++      510,
++      186,
++      550
++     ],
++     "conf": 0.9954,
++     "page": 1,
++     "text": "CC.Visa.BCA",
++     "words": [
++      {
++       "box": [
++        57,
++        510,
++        182,
++        549
++       ],
++       "conf": 0.9971,
++       "text": "CC.Visa.BCA"
++      }
++     ]
++    },
++    {
++     "box": [
++      340,
++      510,
++      433,
++      546
++     ],
++     "conf": 0.9977,
++     "page": 1,
++     "text": "120,000",
++     "words": [
++      {
++       "box": [
++        346,
++        510,
++        433,
++        546
++       ],
++       "conf": 1.0,
++       "text": "120,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      49,
++      541,
++      223,
++      578
++     ],
++     "conf": 0.9947,
++     "page": 1,
++     "text": "Total Kembalian",
++     "words": [
++      {
++       "box": [
++        56,
++        541,
++        112,
++        574
++       ],
++       "conf": 0.9995,
++       "text": "Total"
++      },
++      {
++       "box": [
++        122,
++        543,
++        218,
++        577
++       ],
++       "conf": 0.9993,
++       "text": "Kembalian"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0013",
++   "split": "test",
++   "image": "images/cord-v2_test_0013.jpg",
++   "golden": {
++    "tax": 4664.0,
++    "total": 51300.0,
++    "change": 700.0,
++    "discount": null,
++    "subtotal": 46636.0,
++    "card_paid": null,
++    "cash_paid": 52000.0,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "BASO KUAH",
++      "quantity": 1,
++      "line_total": 43636.0,
++      "unit_price": 43636.0
++     },
++     {
++      "name": "A.MINERAL GELAS",
++      "quantity": 1,
++      "line_total": 3000.0,
++      "unit_price": 3000.0
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "ww.LUF LUSSwe\nODJOURNEY\nBASO KUAH\nA.MINERAL GELAS\nTOTAL\nDFP\nTAX 10.00 %\nGR RN\nTUNAI\nKEMBALI",
++   "ocr_words": [
++    {
++     "box": [
++      113,
++      252,
++      270,
++      274
++     ],
++     "conf": 0.6048,
++     "page": 1,
++     "text": "ww.LUF LUSSwe",
++     "words": [
++      {
++       "box": [
++        114,
++        252,
++        124,
++        271
++       ],
++       "conf": 0.6662,
++       "text": "w"
++      },
++      {
++       "box": [
++        138,
++        252,
++        191,
++        272
++       ],
++       "conf": 0.856,
++       "text": "w.LUF"
++      },
++      {
++       "box": [
++        193,
++        254,
++        244,
++        274
++       ],
++       "conf": 0.6242,
++       "text": "LUSSw"
++      },
++      {
++       "box": [
++        256,
++        255,
++        266,
++        274
++       ],
++       "conf": 0.6847,
++       "text": "e"
++      }
++     ]
++    },
++    {
++     "box": [
++      344,
++      275,
++      454,
++      294
++     ],
++     "conf": 0.9747,
++     "page": 1,
++     "text": "ODJOURNEY",
++     "words": [
++      {
++       "box": [
++        344,
++        275,
++        363,
++        294
++       ],
++       "conf": 0.8107,
++       "text": "OD"
++      },
++      {
++       "box": [
++        371,
++        275,
++        452,
++        294
++       ],
++       "conf": 0.9916,
++       "text": "JOURNEY"
++      }
++     ]
++    },
++    {
++     "box": [
++      102,
++      428,
++      211,
++      457
++     ],
++     "conf": 0.9415,
++     "page": 1,
++     "text": "BASO KUAH",
++     "words": [
++      {
++       "box": [
++        107,
++        428,
++        150,
++        455
++       ],
++       "conf": 0.9999,
++       "text": "BASO"
++      },
++      {
++       "box": [
++        161,
++        429,
++        208,
++        456
++       ],
++       "conf": 1.0,
++       "text": "KUAH"
++      }
++     ]
++    },
++    {
++     "box": [
++      100,
++      460,
++      279,
++      488
++     ],
++     "conf": 0.995,
++     "page": 1,
++     "text": "A.MINERAL GELAS",
++     "words": [
++      {
++       "box": [
++        105,
++        460,
++        206,
++        488
++       ],
++       "conf": 1.0,
++       "text": "A.MINERAL"
++      },
++      {
++       "box": [
++        221,
++        461,
++        278,
++        488
++       ],
++       "conf": 0.9986,
++       "text": "GELAS"
++      }
++     ]
++    },
++    {
++     "box": [
++      100,
++      492,
++      163,
++      519
++     ],
++     "conf": 0.9988,
++     "page": 1,
++     "text": "TOTAL",
++     "words": [
++      {
++       "box": [
++        105,
++        492,
++        163,
++        519
++       ],
++       "conf": 0.9998,
++       "text": "TOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      99,
++      525,
++      140,
++      552
++     ],
++     "conf": 0.9974,
++     "page": 1,
++     "text": "DFP",
++     "words": [
++      {
++       "box": [
++        104,
++        525,
++        138,
++        552
++       ],
++       "conf": 0.9999,
++       "text": "DFP"
++      }
++     ]
++    },
++    {
++     "box": [
++      100,
++      556,
++      235,
++      585
++     ],
++     "conf": 0.9758,
++     "page": 1,
++     "text": "TAX 10.00 %",
++     "words": [
++      {
++       "box": [
++        106,
++        556,
++        137,
++        585
++       ],
++       "conf": 1.0,
++       "text": "TAX"
++      },
++      {
++       "box": [
++        149,
++        556,
++        208,
++        585
++       ],
++       "conf": 1.0,
++       "text": "10.00"
++      },
++      {
++       "box": [
++        221,
++        556,
++        231,
++        585
++       ],
++       "conf": 1.0,
++       "text": "%"
++      }
++     ]
++    },
++    {
++     "box": [
++      98,
++      588,
++      232,
++      615
++     ],
++     "conf": 0.6221,
++     "page": 1,
++     "text": "GR RN",
++     "words": [
++      {
++       "box": [
++        100,
++        588,
++        136,
++        615
++       ],
++       "conf": 0.8193,
++       "text": "GR"
++      },
++      {
++       "box": [
++        177,
++        588,
++        194,
++        615
++       ],
++       "conf": 0.6188,
++       "text": "R"
++      },
++      {
++       "box": [
++        208,
++        588,
++        226,
++        615
++       ],
++       "conf": 0.8725,
++       "text": "N"
++      }
++     ]
++    },
++    {
++     "box": [
++      100,
++      617,
++      164,
++      644
++     ],
++     "conf": 0.9995,
++     "page": 1,
++     "text": "TUNAI",
++     "words": [
++      {
++       "box": [
++        106,
++        617,
++        162,
++        644
++       ],
++       "conf": 0.9996,
++       "text": "TUNAI"
++      }
++     ]
++    },
++    {
++     "box": [
++      102,
++      647,
++      187,
++      672
++     ],
++     "conf": 0.9991,
++     "page": 1,
++     "text": "KEMBALI",
++     "words": [
++      {
++       "box": [
++        106,
++        647,
++        183,
++        672
++       ],
++       "conf": 0.9998,
++       "text": "KEMBALI"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0014",
++   "split": "test",
++   "image": "images/cord-v2_test_0014.jpg",
++   "golden": {
++    "tax": 25585.0,
++    "total": 281435.0,
++    "change": 18565.0,
++    "discount": null,
++    "subtotal": 238000.0,
++    "card_paid": null,
++    "cash_paid": 200000.0,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "RedVelvet Cheese Slc",
++      "quantity": 1,
++      "line_total": 38000.0,
++      "unit_price": null
++     },
++     {
++      "name": "Chicken Baked Rice",
++      "quantity": 1,
++      "line_total": 55000.0,
++      "unit_price": null
++     },
++     {
++      "name": "Fish n Chips",
++      "quantity": 1,
++      "line_total": 65000.0,
++      "unit_price": null
++     },
++     {
++      "name": "Mushroom Soup",
++      "quantity": 1,
++      "line_total": 35000.0,
++      "unit_price": null
++     },
++     {
++      "name": "Chamomile",
++      "quantity": 1,
++      "line_total": 25000.0,
++      "unit_price": null
++     },
++     {
++      "name": "Iced Tea",
++      "quantity": 1,
++      "line_total": 20000.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": 17850.0
++   },
++   "ocr_text": "RedVelvet Cheese Slc  38,000\nChicken Baked Rice  55,000\n1  Fish n Chips  65,000\nNushroom Soup  35,000\n1  Chamonile  25,000\n1 Iced Tea  20,000\nSUBTOTAL  238,000\nService  17,850\nPB1  25,585\nTOTAL  281,435\nCoupon  100,000\nCAH  200,000\nChange  18,565",
++   "ocr_words": [
++    {
++     "box": [
++      166,
++      331,
++      314,
++      349
++     ],
++     "conf": 0.9921,
++     "page": 1,
++     "text": "RedVelvet Cheese Slc",
++     "words": [
++      {
++       "box": [
++        172,
++        331,
++        236,
++        348
++       ],
++       "conf": 0.9999,
++       "text": "RedVelvet"
++      },
++      {
++       "box": [
++        242,
++        332,
++        284,
++        349
++       ],
++       "conf": 0.9999,
++       "text": "Cheese"
++      },
++      {
++       "box": [
++        292,
++        332,
++        313,
++        350
++       ],
++       "conf": 0.9999,
++       "text": "Slc"
++      }
++     ]
++    },
++    {
++     "box": [
++      380,
++      330,
++      426,
++      349
++     ],
++     "conf": 0.9997,
++     "page": 1,
++     "text": "38,000",
++     "words": [
++      {
++       "box": [
++        384,
++        330,
++        425,
++        349
++       ],
++       "conf": 1.0,
++       "text": "38,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      166,
++      345,
++      300,
++      363
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "Chicken Baked Rice",
++     "words": [
++      {
++       "box": [
++        172,
++        345,
++        220,
++        362
++       ],
++       "conf": 0.9996,
++       "text": "Chicken"
++      },
++      {
++       "box": [
++        230,
++        346,
++        265,
++        362
++       ],
++       "conf": 0.9999,
++       "text": "Baked"
++      },
++      {
++       "box": [
++        272,
++        346,
++        298,
++        362
++       ],
++       "conf": 1.0,
++       "text": "Rice"
++      }
++     ]
++    },
++    {
++     "box": [
++      379,
++      344,
++      427,
++      364
++     ],
++     "conf": 0.9995,
++     "page": 1,
++     "text": "55,000",
++     "words": [
++      {
++       "box": [
++        384,
++        344,
++        426,
++        364
++       ],
++       "conf": 1.0,
++       "text": "55,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      156,
++      360,
++      167,
++      374
++     ],
++     "conf": 0.9992,
++     "page": 1,
++     "text": "1",
++     "words": [
++      {
++       "box": [
++        157,
++        360,
++        167,
++        374
++       ],
++       "conf": 0.9992,
++       "text": "1"
++      }
++     ]
++    },
++    {
++     "box": [
++      166,
++      359,
++      260,
++      378
++     ],
++     "conf": 0.9996,
++     "page": 1,
++     "text": "Fish n Chips",
++     "words": [
++      {
++       "box": [
++        172,
++        359,
++        202,
++        376
++       ],
++       "conf": 0.9998,
++       "text": "Fish"
++      },
++      {
++       "box": [
++        206,
++        360,
++        214,
++        376
++       ],
++       "conf": 1.0,
++       "text": "n"
++      },
++      {
++       "box": [
++        223,
++        360,
++        260,
++        377
++       ],
++       "conf": 1.0,
++       "text": "Chips"
++      }
++     ]
++    },
++    {
++     "box": [
++      380,
++      358,
++      428,
++      378
++     ],
++     "conf": 0.9986,
++     "page": 1,
++     "text": "65,000",
++     "words": [
++      {
++       "box": [
++        384,
++        358,
++        426,
++        378
++       ],
++       "conf": 0.9998,
++       "text": "65,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      167,
++      372,
++      267,
++      394
++     ],
++     "conf": 0.9491,
++     "page": 1,
++     "text": "Nushroom Soup",
++     "words": [
++      {
++       "box": [
++        170,
++        372,
++        230,
++        392
++       ],
++       "conf": 0.7617,
++       "text": "Nushroom"
++      },
++      {
++       "box": [
++        238,
++        374,
++        264,
++        394
++       ],
++       "conf": 0.9999,
++       "text": "Soup"
++      }
++     ]
++    },
++    {
++     "box": [
++      379,
++      371,
++      428,
++      392
++     ],
++     "conf": 0.9842,
++     "page": 1,
++     "text": "35,000",
++     "words": [
++      {
++       "box": [
++        384,
++        371,
++        426,
++        392
++       ],
++       "conf": 0.9997,
++       "text": "35,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      156,
++      388,
++      166,
++      401
++     ],
++     "conf": 0.9978,
++     "page": 1,
++     "text": "1",
++     "words": [
++      {
++       "box": [
++        156,
++        388,
++        166,
++        401
++       ],
++       "conf": 0.9978,
++       "text": "1"
++      }
++     ]
++    },
++    {
++     "box": [
++      166,
++      387,
++      238,
++      405
++     ],
++     "conf": 0.9449,
++     "page": 1,
++     "text": "Chamonile",
++     "words": [
++      {
++       "box": [
++        172,
++        387,
++        236,
++        405
++       ],
++       "conf": 1.0,
++       "text": "Chamonile"
++      }
++     ]
++    },
++    {
++     "box": [
++      379,
++      384,
++      429,
++      406
++     ],
++     "conf": 0.9797,
++     "page": 1,
++     "text": "25,000",
++     "words": [
++      {
++       "box": [
++        384,
++        384,
++        427,
++        406
++       ],
++       "conf": 0.9992,
++       "text": "25,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      153,
++      401,
++      232,
++      420
++     ],
++     "conf": 0.9941,
++     "page": 1,
++     "text": "1 Iced Tea",
++     "words": [
++      {
++       "box": [
++        157,
++        401,
++        164,
++        420
++       ],
++       "conf": 0.9571,
++       "text": "1"
++      },
++      {
++       "box": [
++        172,
++        401,
++        202,
++        420
++       ],
++       "conf": 0.9928,
++       "text": "Iced"
++      },
++      {
++       "box": [
++        208,
++        401,
++        231,
++        420
++       ],
++       "conf": 0.9998,
++       "text": "Tea"
++      }
++     ]
++    },
++    {
++     "box": [
++      379,
++      400,
++      428,
++      422
++     ],
++     "conf": 0.9994,
++     "page": 1,
++     "text": "20,000",
++     "words": [
++      {
++       "box": [
++        383,
++        400,
++        428,
++        422
++       ],
++       "conf": 1.0,
++       "text": "20,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      168,
++      429,
++      229,
++      446
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "SUBTOTAL",
++     "words": [
++      {
++       "box": [
++        172,
++        429,
++        228,
++        446
++       ],
++       "conf": 0.9999,
++       "text": "SUBTOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      373,
++      427,
++      429,
++      448
++     ],
++     "conf": 0.9988,
++     "page": 1,
++     "text": "238,000",
++     "words": [
++      {
++       "box": [
++        378,
++        427,
++        427,
++        447
++       ],
++       "conf": 1.0,
++       "text": "238,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      168,
++      444,
++      224,
++      462
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "Service",
++     "words": [
++      {
++       "box": [
++        171,
++        444,
++        224,
++        463
++       ],
++       "conf": 0.9986,
++       "text": "Service"
++      }
++     ]
++    },
++    {
++     "box": [
++      380,
++      442,
++      430,
++      462
++     ],
++     "conf": 0.9994,
++     "page": 1,
++     "text": "17,850",
++     "words": [
++      {
++       "box": [
++        384,
++        442,
++        426,
++        462
++       ],
++       "conf": 1.0,
++       "text": "17,850"
++      }
++     ]
++    },
++    {
++     "box": [
++      167,
++      458,
++      196,
++      476
++     ],
++     "conf": 0.9979,
++     "page": 1,
++     "text": "PB1",
++     "words": [
++      {
++       "box": [
++        170,
++        458,
++        193,
++        476
++       ],
++       "conf": 0.9999,
++       "text": "PB1"
++      }
++     ]
++    },
++    {
++     "box": [
++      379,
++      456,
++      430,
++      478
++     ],
++     "conf": 0.9996,
++     "page": 1,
++     "text": "25,585",
++     "words": [
++      {
++       "box": [
++        384,
++        456,
++        428,
++        478
++       ],
++       "conf": 1.0,
++       "text": "25,585"
++      }
++     ]
++    },
++    {
++     "box": [
++      171,
++      486,
++      245,
++      504
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "TOTAL",
++     "words": [
++      {
++       "box": [
++        172,
++        486,
++        241,
++        504
++       ],
++       "conf": 1.0,
++       "text": "TOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      327,
++      486,
++      430,
++      504
++     ],
++     "conf": 0.9715,
++     "page": 1,
++     "text": "281,435",
++     "words": [
++      {
++       "box": [
++        328,
++        486,
++        428,
++        504
++       ],
++       "conf": 1.0,
++       "text": "281,435"
++      }
++     ]
++    },
++    {
++     "box": [
++      168,
++      515,
++      218,
++      533
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "Coupon",
++     "words": [
++      {
++       "box": [
++        172,
++        515,
++        215,
++        533
++       ],
++       "conf": 0.9999,
++       "text": "Coupon"
++      }
++     ]
++    },
++    {
++     "box": [
++      376,
++      512,
++      432,
++      532
++     ],
++     "conf": 0.9995,
++     "page": 1,
++     "text": "100,000",
++     "words": [
++      {
++       "box": [
++        380,
++        512,
++        429,
++        532
++       ],
++       "conf": 1.0,
++       "text": "100,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      167,
++      528,
++      204,
++      548
++     ],
++     "conf": 0.8244,
++     "page": 1,
++     "text": "CAH",
++     "words": [
++      {
++       "box": [
++        167,
++        528,
++        203,
++        548
++       ],
++       "conf": 0.7039,
++       "text": "CAH"
++      }
++     ]
++    },
++    {
++     "box": [
++      376,
++      528,
++      432,
++      546
++     ],
++     "conf": 0.9986,
++     "page": 1,
++     "text": "200,000",
++     "words": [
++      {
++       "box": [
++        380,
++        528,
++        430,
++        546
++       ],
++       "conf": 1.0,
++       "text": "200,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      168,
++      542,
++      218,
++      564
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "Change",
++     "words": [
++      {
++       "box": [
++        172,
++        542,
++        217,
++        564
++       ],
++       "conf": 0.9999,
++       "text": "Change"
++      }
++     ]
++    },
++    {
++     "box": [
++      382,
++      541,
++      434,
++      563
++     ],
++     "conf": 0.999,
++     "page": 1,
++     "text": "18,565",
++     "words": [
++      {
++       "box": [
++        386,
++        541,
++        434,
++        563
++       ],
++       "conf": 1.0,
++       "text": "18,565"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0015",
++   "split": "test",
++   "image": "images/cord-v2_test_0015.jpg",
++   "golden": {
++    "tax": null,
++    "total": 63000.0,
++    "change": 7000.0,
++    "discount": null,
++    "subtotal": null,
++    "card_paid": null,
++    "cash_paid": 70000.0,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "Lemon Tea (L)",
++      "quantity": 1,
++      "line_total": 25000.0,
++      "unit_price": null
++     },
++     {
++      "name": "Caramel Small",
++      "quantity": 1,
++      "line_total": 38000.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "Lemon Tea (L)  25.000\nCaramel Small  38.000\nTOTAL  63.000\nCASH  70.000\nCHANGED  7.000",
++   "ocr_words": [
++    {
++     "box": [
++      78,
++      510,
++      241,
++      547
++     ],
++     "conf": 0.9642,
++     "page": 1,
++     "text": "Lemon Tea (L)",
++     "words": [
++      {
++       "box": [
++        86,
++        510,
++        146,
++        545
++       ],
++       "conf": 0.9999,
++       "text": "Lemon"
++      },
++      {
++       "box": [
++        162,
++        511,
++        199,
++        546
++       ],
++       "conf": 0.9997,
++       "text": "Tea"
++      },
++      {
++       "box": [
++        202,
++        511,
++        242,
++        547
++       ],
++       "conf": 0.9999,
++       "text": "(L)"
++      }
++     ]
++    },
++    {
++     "box": [
++      421,
++      522,
++      498,
++      559
++     ],
++     "conf": 0.94,
++     "page": 1,
++     "text": "25.000",
++     "words": [
++      {
++       "box": [
++        422,
++        522,
++        498,
++        560
++       ],
++       "conf": 0.6402,
++       "text": "25.000"
++      }
++     ]
++    },
++    {
++     "box": [
++      77,
++      539,
++      241,
++      577
++     ],
++     "conf": 0.9997,
++     "page": 1,
++     "text": "Caramel Small",
++     "words": [
++      {
++       "box": [
++        85,
++        539,
++        167,
++        575
++       ],
++       "conf": 1.0,
++       "text": "Caramel"
++      },
++      {
++       "box": [
++        178,
++        540,
++        241,
++        577
++       ],
++       "conf": 1.0,
++       "text": "Small"
++      }
++     ]
++    },
++    {
++     "box": [
++      421,
++      550,
++      499,
++      586
++     ],
++     "conf": 0.9864,
++     "page": 1,
++     "text": "38.000",
++     "words": [
++      {
++       "box": [
++        429,
++        550,
++        498,
++        585
++       ],
++       "conf": 1.0,
++       "text": "38.000"
++      }
++     ]
++    },
++    {
++     "box": [
++      418,
++      606,
++      503,
++      665
++     ],
++     "conf": 0.9988,
++     "page": 1,
++     "text": "63.000",
++     "words": [
++      {
++       "box": [
++        418,
++        606,
++        503,
++        665
++       ],
++       "conf": 1.0,
++       "text": "63.000"
++      }
++     ]
++    },
++    {
++     "box": [
++      263,
++      621,
++      330,
++      659
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "TOTAL",
++     "words": [
++      {
++       "box": [
++        272,
++        621,
++        327,
++        658
++       ],
++       "conf": 1.0,
++       "text": "TOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      15,
++      684,
++      80,
++      722
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "CASH",
++     "words": [
++      {
++       "box": [
++        24,
++        684,
++        75,
++        722
++       ],
++       "conf": 1.0,
++       "text": "CASH"
++      }
++     ]
++    },
++    {
++     "box": [
++      424,
++      689,
++      503,
++      726
++     ],
++     "conf": 0.9893,
++     "page": 1,
++     "text": "70.000",
++     "words": [
++      {
++       "box": [
++        427,
++        689,
++        501,
++        726
++       ],
++       "conf": 1.0,
++       "text": "70.000"
++      }
++     ]
++    },
++    {
++     "box": [
++      13,
++      716,
++      113,
++      755
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "CHANGED",
++     "words": [
++      {
++       "box": [
++        15,
++        716,
++        113,
++        755
++       ],
++       "conf": 1.0,
++       "text": "CHANGED"
++      }
++     ]
++    },
++    {
++     "box": [
++      433,
++      720,
++      504,
++      758
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "7.000",
++     "words": [
++      {
++       "box": [
++        442,
++        720,
++        503,
++        757
++       ],
++       "conf": 1.0,
++       "text": "7.000"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0016",
++   "split": "test",
++   "image": "images/cord-v2_test_0016.jpg",
++   "golden": {
++    "tax": 6364.0,
++    "total": 70000.0,
++    "change": 30000.0,
++    "discount": null,
++    "subtotal": 63636.0,
++    "card_paid": null,
++    "cash_paid": 100000.0,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "[LG] BLACK SAKURA",
++      "quantity": 1,
++      "line_total": 59091.0,
++      "unit_price": null
++     },
++     {
++      "name": "IVINERAL WATER (bundling) 5k",
++      "quantity": 1,
++      "line_total": 4545.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "1 [LG] BLACK SAKURA  59,091\n1LONGAN  0\n1 ROASTED ALMOND  0\n1 NANGGO  0\n1 VINERAL WATER (bundling) 5k  4,545\nSub Total  63,636\nPB1 (10%)  6,364\nRounding  0\nTotal  70,000\nCash Payment  100,000\nChange  30,000",
++   "ocr_words": [
++    {
++     "box": [
++      83,
++      488,
++      309,
++      516
++     ],
++     "conf": 0.9853,
++     "page": 1,
++     "text": "1 [LG] BLACK SAKURA",
++     "words": [
++      {
++       "box": [
++        87,
++        488,
++        100,
++        515
++       ],
++       "conf": 0.9997,
++       "text": "1"
++      },
++      {
++       "box": [
++        100,
++        488,
++        149,
++        515
++       ],
++       "conf": 0.9143,
++       "text": "[LG]"
++      },
++      {
++       "box": [
++        149,
++        488,
++        215,
++        515
++       ],
++       "conf": 0.9997,
++       "text": "BLACK"
++      },
++      {
++       "box": [
++        223,
++        489,
++        306,
++        515
++       ],
++       "conf": 0.9994,
++       "text": "SAKURA"
++      }
++     ]
++    },
++    {
++     "box": [
++      484,
++      491,
++      552,
++      519
++     ],
++     "conf": 0.9992,
++     "page": 1,
++     "text": "59,091",
++     "words": [
++      {
++       "box": [
++        490,
++        491,
++        551,
++        519
++       ],
++       "conf": 1.0,
++       "text": "59,091"
++      }
++     ]
++    },
++    {
++     "box": [
++      83,
++      511,
++      193,
++      537
++     ],
++     "conf": 0.9798,
++     "page": 1,
++     "text": "1LONGAN",
++     "words": [
++      {
++       "box": [
++        84,
++        511,
++        190,
++        537
++       ],
++       "conf": 0.9981,
++       "text": "1LONGAN"
++      }
++     ]
++    },
++    {
++     "box": [
++      535,
++      517,
++      554,
++      541
++     ],
++     "conf": 0.989,
++     "page": 1,
++     "text": "0",
++     "words": [
++      {
++       "box": [
++        535,
++        517,
++        554,
++        541
++       ],
++       "conf": 0.989,
++       "text": "0"
++      }
++     ]
++    },
++    {
++     "box": [
++      83,
++      535,
++      296,
++      559
++     ],
++     "conf": 0.9976,
++     "page": 1,
++     "text": "1 ROASTED ALMOND",
++     "words": [
++      {
++       "box": [
++        85,
++        535,
++        99,
++        559
++       ],
++       "conf": 0.9999,
++       "text": "1"
++      },
++      {
++       "box": [
++        104,
++        535,
++        203,
++        559
++       ],
++       "conf": 0.9872,
++       "text": "ROASTED"
++      },
++      {
++       "box": [
++        208,
++        535,
++        292,
++        559
++       ],
++       "conf": 1.0,
++       "text": "ALMOND"
++      }
++     ]
++    },
++    {
++     "box": [
++      536,
++      539,
++      555,
++      563
++     ],
++     "conf": 0.994,
++     "page": 1,
++     "text": "0",
++     "words": [
++      {
++       "box": [
++        536,
++        539,
++        555,
++        563
++       ],
++       "conf": 0.994,
++       "text": "0"
++      }
++     ]
++    },
++    {
++     "box": [
++      81,
++      558,
++      198,
++      582
++     ],
++     "conf": 0.9296,
++     "page": 1,
++     "text": "1 NANGGO",
++     "words": [
++      {
++       "box": [
++        83,
++        558,
++        98,
++        582
++       ],
++       "conf": 0.9999,
++       "text": "1"
++      },
++      {
++       "box": [
++        103,
++        558,
++        194,
++        582
++       ],
++       "conf": 0.5871,
++       "text": "NANGGO"
++      }
++     ]
++    },
++    {
++     "box": [
++      537,
++      562,
++      556,
++      585
++     ],
++     "conf": 0.9733,
++     "page": 1,
++     "text": "0",
++     "words": [
++      {
++       "box": [
++        537,
++        562,
++        556,
++        585
++       ],
++       "conf": 0.9733,
++       "text": "0"
++      }
++     ]
++    },
++    {
++     "box": [
++      79,
++      579,
++      403,
++      610
++     ],
++     "conf": 0.9867,
++     "page": 1,
++     "text": "1 VINERAL WATER (bundling) 5k",
++     "words": [
++      {
++       "box": [
++        84,
++        579,
++        96,
++        607
++       ],
++       "conf": 1.0,
++       "text": "1"
++      },
++      {
++       "box": [
++        103,
++        579,
++        191,
++        608
++       ],
++       "conf": 0.8721,
++       "text": "VINERAL"
++      },
++      {
++       "box": [
++        199,
++        579,
++        272,
++        609
++       ],
++       "conf": 0.779,
++       "text": "WATER"
++      },
++      {
++       "box": [
++        280,
++        580,
++        373,
++        610
++       ],
++       "conf": 0.9941,
++       "text": "(bundling)"
++      },
++      {
++       "box": [
++        380,
++        581,
++        401,
++        610
++       ],
++       "conf": 0.9999,
++       "text": "5k"
++      }
++     ]
++    },
++    {
++     "box": [
++      497,
++      583,
++      558,
++      611
++     ],
++     "conf": 0.9956,
++     "page": 1,
++     "text": "4,545",
++     "words": [
++      {
++       "box": [
++        504,
++        583,
++        551,
++        611
++       ],
++       "conf": 1.0,
++       "text": "4,545"
++      }
++     ]
++    },
++    {
++     "box": [
++      71,
++      627,
++      169,
++      653
++     ],
++     "conf": 0.9988,
++     "page": 1,
++     "text": "Sub Total",
++     "words": [
++      {
++       "box": [
++        76,
++        627,
++        113,
++        653
++       ],
++       "conf": 0.9999,
++       "text": "Sub"
++      },
++      {
++       "box": [
++        120,
++        627,
++        169,
++        653
++       ],
++       "conf": 1.0,
++       "text": "Total"
++      }
++     ]
++    },
++    {
++     "box": [
++      486,
++      630,
++      559,
++      658
++     ],
++     "conf": 0.9997,
++     "page": 1,
++     "text": "63,636",
++     "words": [
++      {
++       "box": [
++        492,
++        630,
++        553,
++        658
++       ],
++       "conf": 1.0,
++       "text": "63,636"
++      }
++     ]
++    },
++    {
++     "box": [
++      69,
++      647,
++      177,
++      680
++     ],
++     "conf": 0.9515,
++     "page": 1,
++     "text": "PB1 (10%)",
++     "words": [
++      {
++       "box": [
++        74,
++        647,
++        119,
++        678
++       ],
++       "conf": 0.9999,
++       "text": "PB1"
++      },
++      {
++       "box": [
++        120,
++        648,
++        177,
++        680
++       ],
++       "conf": 1.0,
++       "text": "(10%)"
++      }
++     ]
++    },
++    {
++     "box": [
++      498,
++      654,
++      559,
++      683
++     ],
++     "conf": 0.9975,
++     "page": 1,
++     "text": "6,364",
++     "words": [
++      {
++       "box": [
++        504,
++        654,
++        557,
++        683
++       ],
++       "conf": 1.0,
++       "text": "6,364"
++      }
++     ]
++    },
++    {
++     "box": [
++      67,
++      673,
++      168,
++      704
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "Rounding",
++     "words": [
++      {
++       "box": [
++        73,
++        673,
++        168,
++        704
++       ],
++       "conf": 1.0,
++       "text": "Rounding"
++      }
++     ]
++    },
++    {
++     "box": [
++      542,
++      681,
++      558,
++      703
++     ],
++     "conf": 0.9656,
++     "page": 1,
++     "text": "0",
++     "words": [
++      {
++       "box": [
++        542,
++        681,
++        558,
++        703
++       ],
++       "conf": 0.9656,
++       "text": "0"
++      }
++     ]
++    },
++    {
++     "box": [
++      68,
++      699,
++      134,
++      728
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "Total",
++     "words": [
++      {
++       "box": [
++        73,
++        699,
++        133,
++        728
++       ],
++       "conf": 0.9999,
++       "text": "Total"
++      }
++     ]
++    },
++    {
++     "box": [
++      477,
++      701,
++      561,
++      735
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "70,000",
++     "words": [
++      {
++       "box": [
++        485,
++        701,
++        557,
++        735
++       ],
++       "conf": 1.0,
++       "text": "70,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      64,
++      750,
++      215,
++      781
++     ],
++     "conf": 0.9993,
++     "page": 1,
++     "text": "Cash Payment",
++     "words": [
++      {
++       "box": [
++        69,
++        750,
++        120,
++        780
++       ],
++       "conf": 0.9998,
++       "text": "Cash"
++      },
++      {
++       "box": [
++        127,
++        750,
++        215,
++        782
++       ],
++       "conf": 1.0,
++       "text": "Payment"
++      }
++     ]
++    },
++    {
++     "box": [
++      477,
++      755,
++      562,
++      785
++     ],
++     "conf": 0.9997,
++     "page": 1,
++     "text": "100,000",
++     "words": [
++      {
++       "box": [
++        484,
++        755,
++        559,
++        785
++       ],
++       "conf": 1.0,
++       "text": "100,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      62,
++      774,
++      147,
++      807
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "Change",
++     "words": [
++      {
++       "box": [
++        68,
++        774,
++        146,
++        807
++       ],
++       "conf": 1.0,
++       "text": "Change"
++      }
++     ]
++    },
++    {
++     "box": [
++      488,
++      779,
++      562,
++      809
++     ],
++     "conf": 0.9987,
++     "page": 1,
++     "text": "30,000",
++     "words": [
++      {
++       "box": [
++        495,
++        779,
++        560,
++        809
++       ],
++       "conf": 1.0,
++       "text": "30,000"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0017",
++   "split": "test",
++   "image": "images/cord-v2_test_0017.jpg",
++   "golden": {
++    "tax": null,
++    "total": 91000.0,
++    "change": null,
++    "discount": 0.0,
++    "subtotal": 91000.0,
++    "card_paid": 91000.0,
++    "cash_paid": null,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "Goblin's Mace",
++      "quantity": 1,
++      "line_total": 25000.0,
++      "unit_price": null
++     },
++     {
++      "name": "Mozarella Hot Dog",
++      "quantity": 2,
++      "line_total": 38000.0,
++      "unit_price": null
++     },
++     {
++      "name": "Chili Pepper Croquette",
++      "quantity": 1,
++      "line_total": 14000.0,
++      "unit_price": null
++     },
++     {
++      "name": "Cheese Croquette",
++      "quantity": 1,
++      "line_total": 14000.0,
++      "unit_price": null
++     },
++     {
++      "name": "Plastik Amook",
++      "quantity": 1,
++      "line_total": 0.0,
++      "unit_price": null
++     },
++     {
++      "name": "Plastik Putih Take Away",
++      "quantity": 1,
++      "line_total": 0.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "Goblin's Mace  25,000\nMozarella Hot  38,000\nDog\nChili Pepper  14,000\nCroquette\nCheese  14,000\nCroquette\nPlastik Amook  0\nPlastik Putih  0\nTake Away\nSubtotal  91,000\nDlisount  (0)\nTOTAL  Rp. 91,000\nDebit  91,000\nxxXXXXxxxXXX",
++   "ocr_words": [
++    {
++     "box": [
++      215,
++      467,
++      296,
++      485
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "Goblin's Mace",
++     "words": [
++      {
++       "box": [
++        219,
++        467,
++        261,
++        485
++       ],
++       "conf": 0.9999,
++       "text": "Goblin's"
++      },
++      {
++       "box": [
++        267,
++        467,
++        294,
++        485
++       ],
++       "conf": 0.9999,
++       "text": "Mace"
++      }
++     ]
++    },
++    {
++     "box": [
++      443,
++      468,
++      483,
++      484
++     ],
++     "conf": 0.9994,
++     "page": 1,
++     "text": "25,000",
++     "words": [
++      {
++       "box": [
++        446,
++        468,
++        483,
++        484
++       ],
++       "conf": 1.0,
++       "text": "25,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      214,
++      491,
++      295,
++      509
++     ],
++     "conf": 0.9996,
++     "page": 1,
++     "text": "Mozarella Hot",
++     "words": [
++      {
++       "box": [
++        218,
++        491,
++        269,
++        509
++       ],
++       "conf": 1.0,
++       "text": "Mozarella"
++      },
++      {
++       "box": [
++        275,
++        491,
++        293,
++        509
++       ],
++       "conf": 0.9999,
++       "text": "Hot"
++      }
++     ]
++    },
++    {
++     "box": [
++      443,
++      491,
++      484,
++      509
++     ],
++     "conf": 0.9994,
++     "page": 1,
++     "text": "38,000",
++     "words": [
++      {
++       "box": [
++        447,
++        491,
++        481,
++        509
++       ],
++       "conf": 1.0,
++       "text": "38,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      215,
++      506,
++      243,
++      523
++     ],
++     "conf": 0.8625,
++     "page": 1,
++     "text": "Dog",
++     "words": [
++      {
++       "box": [
++        218,
++        506,
++        240,
++        523
++       ],
++       "conf": 0.8968,
++       "text": "Dog"
++      }
++     ]
++    },
++    {
++     "box": [
++      215,
++      520,
++      284,
++      536
++     ],
++     "conf": 0.9389,
++     "page": 1,
++     "text": "Chili Pepper",
++     "words": [
++      {
++       "box": [
++        219,
++        520,
++        243,
++        536
++       ],
++       "conf": 0.9999,
++       "text": "Chili"
++      },
++      {
++       "box": [
++        246,
++        520,
++        284,
++        536
++       ],
++       "conf": 0.9999,
++       "text": "Pepper"
++      }
++     ]
++    },
++    {
++     "box": [
++      444,
++      519,
++      484,
++      535
++     ],
++     "conf": 0.9991,
++     "page": 1,
++     "text": "14,000",
++     "words": [
++      {
++       "box": [
++        447,
++        519,
++        484,
++        535
++       ],
++       "conf": 1.0,
++       "text": "14,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      214,
++      534,
++      272,
++      550
++     ],
++     "conf": 0.9998,
++     "page": 1,
++     "text": "Croquette",
++     "words": [
++      {
++       "box": [
++        218,
++        534,
++        270,
++        550
++       ],
++       "conf": 0.9997,
++       "text": "Croquette"
++      }
++     ]
++    },
++    {
++     "box": [
++      214,
++      547,
++      261,
++      563
++     ],
++     "conf": 0.9965,
++     "page": 1,
++     "text": "Cheese",
++     "words": [
++      {
++       "box": [
++        217,
++        547,
++        259,
++        563
++       ],
++       "conf": 0.9999,
++       "text": "Cheese"
++      }
++     ]
++    },
++    {
++     "box": [
++      445,
++      545,
++      485,
++      562
++     ],
++     "conf": 0.9981,
++     "page": 1,
++     "text": "14,000",
++     "words": [
++      {
++       "box": [
++        448,
++        545,
++        484,
++        562
++       ],
++       "conf": 1.0,
++       "text": "14,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      214,
++      561,
++      271,
++      577
++     ],
++     "conf": 0.9995,
++     "page": 1,
++     "text": "Croquette",
++     "words": [
++      {
++       "box": [
++        218,
++        561,
++        270,
++        577
++       ],
++       "conf": 0.9986,
++       "text": "Croquette"
++      }
++     ]
++    },
++    {
++     "box": [
++      213,
++      575,
++      295,
++      591
++     ],
++     "conf": 0.9997,
++     "page": 1,
++     "text": "Plastik Amook",
++     "words": [
++      {
++       "box": [
++        216,
++        575,
++        252,
++        591
++       ],
++       "conf": 0.9999,
++       "text": "Plastik"
++      },
++      {
++       "box": [
++        255,
++        575,
++        293,
++        591
++       ],
++       "conf": 0.9996,
++       "text": "Amook"
++      }
++     ]
++    },
++    {
++     "box": [
++      476,
++      574,
++      485,
++      588
++     ],
++     "conf": 0.9878,
++     "page": 1,
++     "text": "0",
++     "words": [
++      {
++       "box": [
++        477,
++        574,
++        485,
++        588
++       ],
++       "conf": 0.9878,
++       "text": "0"
++      }
++     ]
++    },
++    {
++     "box": [
++      212,
++      599,
++      284,
++      616
++     ],
++     "conf": 0.999,
++     "page": 1,
++     "text": "Plastik Putih",
++     "words": [
++      {
++       "box": [
++        216,
++        599,
++        252,
++        616
++       ],
++       "conf": 0.9998,
++       "text": "Plastik"
++      },
++      {
++       "box": [
++        258,
++        599,
++        281,
++        616
++       ],
++       "conf": 0.9998,
++       "text": "Putih"
++      }
++     ]
++    },
++    {
++     "box": [
++      477,
++      598,
++      486,
++      612
++     ],
++     "conf": 0.836,
++     "page": 1,
++     "text": "0",
++     "words": [
++      {
++       "box": [
++        477,
++        598,
++        486,
++        612
++       ],
++       "conf": 0.836,
++       "text": "0"
++      }
++     ]
++    },
++    {
++     "box": [
++      212,
++      615,
++      276,
++      631
++     ],
++     "conf": 0.9996,
++     "page": 1,
++     "text": "Take Away",
++     "words": [
++      {
++       "box": [
++        216,
++        615,
++        241,
++        631
++       ],
++       "conf": 1.0,
++       "text": "Take"
++      },
++      {
++       "box": [
++        245,
++        615,
++        274,
++        631
++       ],
++       "conf": 0.9999,
++       "text": "Away"
++      }
++     ]
++    },
++    {
++     "box": [
++      212,
++      634,
++      261,
++      651
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "Subtotal",
++     "words": [
++      {
++       "box": [
++        216,
++        634,
++        261,
++        651
++       ],
++       "conf": 0.9999,
++       "text": "Subtotal"
++      }
++     ]
++    },
++    {
++     "box": [
++      447,
++      632,
++      489,
++      649
++     ],
++     "conf": 0.9981,
++     "page": 1,
++     "text": "91,000",
++     "words": [
++      {
++       "box": [
++        451,
++        632,
++        488,
++        649
++       ],
++       "conf": 1.0,
++       "text": "91,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      211,
++      659,
++      265,
++      677
++     ],
++     "conf": 0.7538,
++     "page": 1,
++     "text": "Dlisount",
++     "words": [
++      {
++       "box": [
++        212,
++        659,
++        230,
++        676
++       ],
++       "conf": 0.8603,
++       "text": "Dlis"
++      },
++      {
++       "box": [
++        241,
++        659,
++        264,
++        677
++       ],
++       "conf": 0.6104,
++       "text": "ount"
++      }
++     ]
++    },
++    {
++     "box": [
++      469,
++      657,
++      490,
++      677
++     ],
++     "conf": 0.9985,
++     "page": 1,
++     "text": "(0)",
++     "words": [
++      {
++       "box": [
++        470,
++        657,
++        490,
++        677
++       ],
++       "conf": 0.9997,
++       "text": "(0)"
++      }
++     ]
++    },
++    {
++     "box": [
++      211,
++      682,
++      266,
++      704
++     ],
++     "conf": 1.0,
++     "page": 1,
++     "text": "TOTAL",
++     "words": [
++      {
++       "box": [
++        215,
++        682,
++        261,
++        704
++       ],
++       "conf": 1.0,
++       "text": "TOTAL"
++      }
++     ]
++    },
++    {
++     "box": [
++      409,
++      681,
++      491,
++      703
++     ],
++     "conf": 0.963,
++     "page": 1,
++     "text": "Rp. 91,000",
++     "words": [
++      {
++       "box": [
++        414,
++        681,
++        441,
++        703
++       ],
++       "conf": 0.9999,
++       "text": "Rp."
++      },
++      {
++       "box": [
++        443,
++        681,
++        488,
++        703
++       ],
++       "conf": 0.9999,
++       "text": "91,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      210,
++      709,
++      247,
++      729
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "Debit",
++     "words": [
++      {
++       "box": [
++        215,
++        709,
++        247,
++        729
++       ],
++       "conf": 1.0,
++       "text": "Debit"
++      }
++     ]
++    },
++    {
++     "box": [
++      448,
++      709,
++      490,
++      726
++     ],
++     "conf": 0.9993,
++     "page": 1,
++     "text": "91,000",
++     "words": [
++      {
++       "box": [
++        452,
++        709,
++        489,
++        726
++       ],
++       "conf": 1.0,
++       "text": "91,000"
++      }
++     ]
++    },
++    {
++     "box": [
++      388,
++      734,
++      492,
++      752
++     ],
++     "conf": 0.5677,
++     "page": 1,
++     "text": "xxXXXXxxxXXX",
++     "words": [
++      {
++       "box": [
++        394,
++        734,
++        488,
++        752
++       ],
++       "conf": 0.6883,
++       "text": "xxXXXXxxxXXX"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0018",
++   "split": "test",
++   "image": "images/cord-v2_test_0018.jpg",
++   "golden": {
++    "tax": null,
++    "total": 156000.0,
++    "change": 0.0,
++    "discount": null,
++    "subtotal": null,
++    "card_paid": null,
++    "cash_paid": 156000.0,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "Propolis Cair",
++      "quantity": 1,
++      "line_total": 156000.0,
++      "unit_price": 156000.0
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "Propolis Cair 1  156000\n156000\nSub Total  156000\nTunai  156000\nKembalian  Rp.0",
++   "ocr_words": [
++    {
++     "box": [
++      18,
++      318,
++      169,
++      348
++     ],
++     "conf": 0.9988,
++     "page": 1,
++     "text": "Propolis Cair 1",
++     "words": [
++      {
++       "box": [
++        25,
++        318,
++        105,
++        348
++       ],
++       "conf": 1.0,
++       "text": "Propolis"
++      },
++      {
++       "box": [
++        110,
++        318,
++        155,
++        348
++       ],
++       "conf": 1.0,
++       "text": "Cair"
++      },
++      {
++       "box": [
++        155,
++        318,
++        165,
++        348
++       ],
++       "conf": 0.9997,
++       "text": "1"
++      }
++     ]
++    },
++    {
++     "box": [
++      249,
++      330,
++      330,
++      358
++     ],
++     "conf": 0.9996,
++     "page": 1,
++     "text": "156000",
++     "words": [
++      {
++       "box": [
++        254,
++        330,
++        327,
++        358
++       ],
++       "conf": 0.9999,
++       "text": "156000"
++      }
++     ]
++    },
++    {
++     "box": [
++      20,
++      345,
++      101,
++      373
++     ],
++     "conf": 0.9988,
++     "page": 1,
++     "text": "156000",
++     "words": [
++      {
++       "box": [
++        25,
++        345,
++        98,
++        373
++       ],
++       "conf": 1.0,
++       "text": "156000"
++      }
++     ]
++    },
++    {
++     "box": [
++      17,
++      408,
++      120,
++      438
++     ],
++     "conf": 0.9555,
++     "page": 1,
++     "text": "Sub Total",
++     "words": [
++      {
++       "box": [
++        24,
++        408,
++        59,
++        438
++       ],
++       "conf": 0.9999,
++       "text": "Sub"
++      },
++      {
++       "box": [
++        73,
++        408,
++        119,
++        438
++       ],
++       "conf": 1.0,
++       "text": "Total"
++      }
++     ]
++    },
++    {
++     "box": [
++      250,
++      420,
++      331,
++      450
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "156000",
++     "words": [
++      {
++       "box": [
++        256,
++        420,
++        328,
++        450
++       ],
++       "conf": 1.0,
++       "text": "156000"
++      }
++     ]
++    },
++    {
++     "box": [
++      16,
++      486,
++      81,
++      517
++     ],
++     "conf": 0.9996,
++     "page": 1,
++     "text": "Tunai",
++     "words": [
++      {
++       "box": [
++        23,
++        486,
++        81,
++        517
++       ],
++       "conf": 0.9999,
++       "text": "Tunai"
++      }
++     ]
++    },
++    {
++     "box": [
++      250,
++      496,
++      333,
++      530
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "156000",
++     "words": [
++      {
++       "box": [
++        251,
++        496,
++        333,
++        530
++       ],
++       "conf": 1.0,
++       "text": "156000"
++      }
++     ]
++    },
++    {
++     "box": [
++      16,
++      556,
++      131,
++      583
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "Kembalian",
++     "words": [
++      {
++       "box": [
++        21,
++        556,
++        127,
++        583
++       ],
++       "conf": 0.9999,
++       "text": "Kembalian"
++      }
++     ]
++    },
++    {
++     "box": [
++      268,
++      551,
++      335,
++      586
++     ],
++     "conf": 0.997,
++     "page": 1,
++     "text": "Rp.0",
++     "words": [
++      {
++       "box": [
++        275,
++        551,
++        330,
++        586
++       ],
++       "conf": 0.9998,
++       "text": "Rp.0"
++      }
++     ]
++    }
++   ]
++  },
++  {
++   "external_id": "cord-v2/test/0019",
++   "split": "test",
++   "image": "images/cord-v2_test_0019.jpg",
++   "golden": {
++    "tax": 16000.0,
++    "total": 176000.0,
++    "change": null,
++    "discount": null,
++    "subtotal": 160000.0,
++    "card_paid": null,
++    "cash_paid": null,
++    "item_count": null,
++    "line_items": [
++     {
++      "name": "AMBUSH DBL CHS",
++      "quantity": 4,
++      "line_total": 60000.0,
++      "unit_price": null
++     },
++     {
++      "name": "AMBUSH CHS BUR",
++      "quantity": 10,
++      "line_total": 100000.0,
++      "unit_price": null
++     }
++    ],
++    "service_charge": null
++   },
++   "ocr_text": "4 AMBUSH DBL CHS 60000\nO B SH  O\nNET SALES  160000\nTAX  16000\nAMOUNT DUE  176000",
++   "ocr_words": [
++    {
++     "box": [
++      92,
++      421,
++      436,
++      473
++     ],
++     "conf": 0.9898,
++     "page": 1,
++     "text": "4 AMBUSH DBL CHS 60000",
++     "words": [
++      {
++       "box": [
++        94,
++        421,
++        109,
++        459
++       ],
++       "conf": 0.9999,
++       "text": "4"
++      },
++      {
++       "box": [
++        126,
++        422,
++        207,
++        463
++       ],
++       "conf": 0.9976,
++       "text": "AMBUSH"
++      },
++      {
++       "box": [
++        223,
++        426,
++        264,
++        465
++       ],
++       "conf": 1.0,
++       "text": "DBL"
++      },
++      {
++       "box": [
++        281,
++        429,
++        327,
++        468
++       ],
++       "conf": 0.9928,
++       "text": "CHS"
++      },
++      {
++       "box": [
++        356,
++        432,
++        434,
++        472
++       ],
++       "conf": 0.9927,
++       "text": "60000"
++      }
++     ]
++    },
++    {
++     "box": [
++      72,
++      461,
++      433,
++      517
++     ],
++     "conf": 0.5203,
++     "page": 1,
++     "text": "O B SH  O",
++     "words": [
++      {
++       "box": [
++        85,
++        461,
++        119,
++        502
++       ],
++       "conf": 0.3566,
++       "text": "O"
++      },
++      {
++       "box": [
++        176,
++        465,
++        211,
++        506
++       ],
++       "conf": 0.3613,
++       "text": "B"
++      },
++      {
++       "box": [
++        242,
++        469,
++        309,
++        511
++       ],
++       "conf": 0.3006,
++       "text": "SH"
++      },
++      {
++       "box": [
++        392,
++        476,
++        427,
++        516
++       ],
++       "conf": 0.8884,
++       "text": "O"
++      }
++     ]
++    },
++    {
++     "box": [
++      113,
++      505,
++      252,
++      552
++     ],
++     "conf": 0.999,
++     "page": 1,
++     "text": "NET SALES",
++     "words": [
++      {
++       "box": [
++        122,
++        505,
++        164,
++        546
++       ],
++       "conf": 0.9919,
++       "text": "NET"
++      },
++      {
++       "box": [
++        174,
++        508,
++        247,
++        551
++       ],
++       "conf": 1.0,
++       "text": "SALES"
++      }
++     ]
++    },
++    {
++     "box": [
++      329,
++      516,
++      434,
++      562
++     ],
++     "conf": 0.9993,
++     "page": 1,
++     "text": "160000",
++     "words": [
++      {
++       "box": [
++        337,
++        516,
++        434,
++        562
++       ],
++       "conf": 0.9999,
++       "text": "160000"
++      }
++     ]
++    },
++    {
++     "box": [
++      111,
++      544,
++      246,
++      592
++     ],
++     "conf": 0.9943,
++     "page": 1,
++     "text": "TAX",
++     "words": [
++      {
++       "box": [
++        120,
++        544,
++        163,
++        588
++       ],
++       "conf": 0.9872,
++       "text": "TAX"
++      }
++     ]
++    },
++    {
++     "box": [
++      341,
++      562,
++      429,
++      606
++     ],
++     "conf": 0.9983,
++     "page": 1,
++     "text": "16000",
++     "words": [
++      {
++       "box": [
++        349,
++        562,
++        426,
++        606
++       ],
++       "conf": 1.0,
++       "text": "16000"
++      }
++     ]
++    },
++    {
++     "box": [
++      112,
++      588,
++      265,
++      637
++     ],
++     "conf": 0.9716,
++     "page": 1,
++     "text": "AMOUNT DUE",
++     "words": [
++      {
++       "box": [
++        121,
++        588,
++        205,
++        634
++       ],
++       "conf": 0.9999,
++       "text": "AMOUNT"
++      },
++      {
++       "box": [
++        216,
++        593,
++        259,
++        637
++       ],
++       "conf": 0.7818,
++       "text": "DUE"
++      }
++     ]
++    },
++    {
++     "box": [
++      328,
++      605,
++      431,
++      648
++     ],
++     "conf": 0.9999,
++     "page": 1,
++     "text": "176000",
++     "words": [
++      {
++       "box": [
++        336,
++        605,
++        431,
++        648
++       ],
++       "conf": 1.0,
++       "text": "176000"
++      }
++     ]
++    }
++   ]
++  }
++ ]
++}
+diff --git a/backend/src/fieldwise/cli.py b/backend/src/fieldwise/cli.py
+index fa17dfe..63d53e0 100644
+--- a/backend/src/fieldwise/cli.py
++++ b/backend/src/fieldwise/cli.py
+@@ -25,6 +25,7 @@
+ from fieldwise.extraction.pipeline import ExtractionOptions, prepare_extraction, run_extraction
+ from fieldwise.extraction.pricing import price_for
+ from fieldwise.extraction.prompts.registry import get_prompt
++from fieldwise.gate.bundle import GateBaseline, build_bundle, compare_to_baseline, load_bundle
+ from fieldwise.logging import configure_logging
+ from fieldwise.retrieval.embeddings import FastEmbedder
+ from fieldwise.retrieval.fewshot import embed_documents, make_retriever
+@@ -37,11 +38,15 @@
+ ingest_app = typer.Typer(help="Import documents and golden labels.", no_args_is_help=True)
+ ocr_app = typer.Typer(help="Run OCR over stored documents.", no_args_is_help=True)
+ eval_app = typer.Typer(help="Measure a configuration on a labelled split.", no_args_is_help=True)
++gate_app = typer.Typer(
++    help="The CI eval gate: replayed responses re-scored against a baseline.", no_args_is_help=True
++)
+ app.add_typer(db_app, name="db")
+ app.add_typer(schemas_app, name="schemas")
+ app.add_typer(ingest_app, name="ingest")
+ app.add_typer(ocr_app, name="ocr")
+ app.add_typer(eval_app, name="eval")
++app.add_typer(gate_app, name="gate")
+ console = Console()
+ 
+ 
+@@ -460,5 +465,92 @@ def eval_compare(
+         console.print(f"written: {path.relative_to(REPORTS_DIR.parents[1])}")
+ 
+ 
++GATE_DIR = Path(__file__).resolve().parents[2] / "evals" / "gate"
++BASELINE_PATH = Path(__file__).resolve().parents[2] / "evals" / "baseline.json"
++
++
++@gate_app.command("build")
++def gate_build(
++    limit: Annotated[int, typer.Option(help="Documents in the bundle.")] = 20,
++    split: Annotated[str, typer.Option(help="Split to take them from.")] = "test",
++    out: Annotated[Path, typer.Option(help="Bundle directory.")] = GATE_DIR,
++) -> None:
++    """Write the fixture bundle (downscaled images, OCR, golden labels) from the local database."""
++    with session_factory()() as session:
++        schema_row = get_schema(session, "receipt")
++        if schema_row is None:
++            raise typer.BadParameter("receipt schema missing; run `fieldwise schemas sync`")
++        count = build_bundle(session, get_storage(), schema_row, out, split=split, limit=limit)
++    console.print(f"bundle: {count} documents in {out}")
++
++
++@gate_app.command("run")
++def gate_run(
++    *,
++    prompt: Annotated[str, typer.Option(help="Prompt version to replay.")] = "v2",
++    model: Annotated[
++        str | None, typer.Option(help="Model the cassettes were recorded with.")
++    ] = None,
++    provider: Annotated[
++        str | None, typer.Option(help="Provider the cassettes were recorded with.")
++    ] = None,
++    bundle: Annotated[Path, typer.Option(help="Bundle directory.")] = GATE_DIR,
++    baseline: Annotated[Path, typer.Option(help="Baseline JSON.")] = BASELINE_PATH,
++    tolerance: Annotated[float, typer.Option(help="Allowed drop, absolute accuracy.")] = 0.02,
++    write: Annotated[bool, typer.Option(help="Write the new numbers as the baseline.")] = False,
++) -> None:
++    """Load the bundle, replay recorded responses, re-score, and fail on a regression."""
++    settings = get_settings()
++    llm = build_provider(settings, provider_name=provider, cassette_mode="replay")
++    storage = get_storage()
++    with session_factory()() as session:
++        schema_row = get_schema(session, "receipt")
++        if schema_row is None:
++            raise typer.BadParameter("receipt schema missing; run `fieldwise schemas sync`")
++        loaded = load_bundle(session, storage, schema_row, bundle)
++        session.commit()
++        console.print(f"bundle loaded: {loaded} new document(s)")
++        config = EvalConfig(
++            prompt=prompt,
++            model=model or settings.default_model,
++            effort=settings.default_effort,
++            split="test",
++            concurrency=1,
++            notes="ci gate (replay)",
++        )
++        run = run_eval(session, storage, config, llm)
++        session.commit()
++        print_summary(console, run)
++        current = GateBaseline(
++            prompt=run.prompt_version,
++            model=run.model,
++            overall_accuracy=run.overall_accuracy,
++            value_accuracy=run.value_accuracy,
++            doc_exact_rate=run.doc_exact_rate,
++            per_field={path: stats.get("accuracy") for path, stats in run.per_field.items()},
++            lists={path: stats.get("exact_rate") for path, stats in run.lists.items()},
++        )
++    if run.succeeded == 0:
++        console.print(
++            "[red]nothing was scored — are the cassettes for this prompt/model recorded?[/red]"
++        )
++        raise typer.Exit(code=2)
++    if write or not baseline.exists():
++        baseline.parent.mkdir(parents=True, exist_ok=True)
++        baseline.write_text(json.dumps(current.to_dict(), indent=2, sort_keys=True) + "\n")
++        console.print(f"[green]baseline written to {baseline}[/green]")
++        return
++    previous = GateBaseline.from_dict(json.loads(baseline.read_text()))
++    problems = compare_to_baseline(current, previous, tolerance)
++    if problems:
++        console.print(f"[red]regression against {baseline.name} (tolerance {tolerance:.0%}):[/red]")
++        for line in problems:
++            console.print(f"  [red]{line}[/red]")
++        raise typer.Exit(code=1)
++    console.print(
++        f"[green]no regression against {baseline.name} (tolerance {tolerance:.0%})[/green]"
++    )
++
++
+ if __name__ == "__main__":
+     app()
+diff --git a/backend/src/fieldwise/extraction/pipeline.py b/backend/src/fieldwise/extraction/pipeline.py
+index 29513ac..e603205 100644
+--- a/backend/src/fieldwise/extraction/pipeline.py
++++ b/backend/src/fieldwise/extraction/pipeline.py
+@@ -109,7 +109,8 @@ def prepare_extraction(
+         effort=options.effort,
+         max_tokens=options.max_tokens,
+         cache_key={
+-            "document": document.sha256,
++            # Stable across re-imports and downscaled fixture copies of dataset documents.
++            "document": document.external_id or document.sha256,
+             "schema": f"{schema.name}@{schema.version}",
+             "ocr_text": str(use_ocr_text),
+         },
+diff --git a/backend/src/fieldwise/gate/__init__.py b/backend/src/fieldwise/gate/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/backend/src/fieldwise/gate/bundle.py b/backend/src/fieldwise/gate/bundle.py
+new file mode 100644
+index 0000000..c8d9de8
+--- /dev/null
++++ b/backend/src/fieldwise/gate/bundle.py
+@@ -0,0 +1,158 @@
++"""The eval gate's fixture bundle: a handful of labelled test documents (downscaled page
++images, OCR spans, golden labels) that CI loads into a fresh database and re-scores against
++recorded model responses. No model is called and no dataset is downloaded."""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from fieldwise.db.models import Document, GoldenLabel, Schema
++from fieldwise.documents.render import downscale_jpeg
++from fieldwise.documents.service import create_document
++from fieldwise.evals.runner import labelled_documents
++from fieldwise.storage import Storage
++
++BUNDLE_MAX_EDGE = 1000
++
++
++@dataclass(frozen=True)
++class GateBaseline:
++    prompt: str
++    model: str
++    overall_accuracy: float | None
++    value_accuracy: float | None
++    doc_exact_rate: float | None
++    per_field: dict[str, float | None]
++    lists: dict[str, float | None]
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "prompt": self.prompt,
++            "model": self.model,
++            "overall_accuracy": self.overall_accuracy,
++            "value_accuracy": self.value_accuracy,
++            "doc_exact_rate": self.doc_exact_rate,
++            "per_field": self.per_field,
++            "lists": self.lists,
++        }
++
++    @classmethod
++    def from_dict(cls, data: dict[str, Any]) -> GateBaseline:
++        return cls(
++            prompt=str(data["prompt"]),
++            model=str(data["model"]),
++            overall_accuracy=data.get("overall_accuracy"),
++            value_accuracy=data.get("value_accuracy"),
++            doc_exact_rate=data.get("doc_exact_rate"),
++            per_field=dict(data.get("per_field", {})),
++            lists=dict(data.get("lists", {})),
++        )
++
++
++def build_bundle(
++    session: Session,
++    storage: Storage,
++    schema: Schema,
++    out: Path,
++    *,
++    split: str = "test",
++    limit: int = 20,
++) -> int:
++    """Writes manifest.json and images/ for the first `limit` labelled documents of the split."""
++    (out / "images").mkdir(parents=True, exist_ok=True)
++    entries = []
++    for document, golden in labelled_documents(session, schema, split, limit):
++        if not document.external_id or not document.pages:
++            continue
++        page = document.pages[0]
++        jpeg = downscale_jpeg(storage.get(str(page["key"])), BUNDLE_MAX_EDGE)
++        stem = document.external_id.replace("/", "_")
++        (out / "images" / f"{stem}.jpg").write_bytes(jpeg)
++        scale = BUNDLE_MAX_EDGE / max(int(page["width"]), int(page["height"]))
++        scale = min(scale, 1.0)
++        spans = [
++            {
++                **span,
++                "box": [round(v * scale) for v in span["box"]],
++                "words": [
++                    {**w, "box": [round(v * scale) for v in w["box"]]}
++                    for w in span.get("words", [])
++                ],
++            }
++            for span in (document.ocr_words or [])
++        ]
++        entries.append(
++            {
++                "external_id": document.external_id,
++                "split": split,
++                "image": f"images/{stem}.jpg",
++                "golden": golden,
++                "ocr_text": document.ocr_text,
++                "ocr_words": spans,
++            }
++        )
++    (out / "manifest.json").write_text(
++        json.dumps({"schema": schema.name, "documents": entries}, indent=1, ensure_ascii=False)
++        + "\n",
++        encoding="utf-8",
++    )
++    return len(entries)
++
++
++def load_bundle(session: Session, storage: Storage, schema: Schema, bundle: Path) -> int:
++    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
++    loaded = 0
++    for entry in manifest["documents"]:
++        existing = session.scalars(
++            select(Document).where(Document.external_id == entry["external_id"])
++        ).first()
++        if existing is not None:
++            continue
++        document = create_document(
++            session,
++            storage,
++            data=(bundle / entry["image"]).read_bytes(),
++            name=entry["external_id"],
++            source="cord",
++            split=entry["split"],
++            external_id=entry["external_id"],
++        )
++        document.ocr_text = entry.get("ocr_text")
++        document.ocr_words = entry.get("ocr_words") or []
++        document.ocr_status = "done"
++        session.add(
++            GoldenLabel(
++                document_id=document.id, schema_id=schema.id, data=entry["golden"], source="dataset"
++            )
++        )
++        loaded += 1
++    session.flush()
++    return loaded
++
++
++def compare_to_baseline(
++    current: GateBaseline, baseline: GateBaseline, tolerance: float
++) -> list[str]:
++    """Regressions larger than `tolerance` (absolute accuracy points), as human-readable lines."""
++    problems: list[str] = []
++
++    def check(name: str, before: float | None, after: float | None) -> None:
++        if before is None or after is None:
++            return
++        if after < before - tolerance:
++            problems.append(f"{name}: {before * 100:.1f}% → {after * 100:.1f}%")
++
++    check("overall_accuracy", baseline.overall_accuracy, current.overall_accuracy)
++    check("value_accuracy", baseline.value_accuracy, current.value_accuracy)
++    check("doc_exact_rate", baseline.doc_exact_rate, current.doc_exact_rate)
++    for path, before in baseline.per_field.items():
++        check(path, before, current.per_field.get(path))
++    for path, before in baseline.lists.items():
++        check(f"{path} (exact)", before, current.lists.get(path))
++    return problems
+diff --git a/backend/tests/integration/test_api.py b/backend/tests/integration/test_api.py
+index 40b6a3e..d815a3a 100644
+--- a/backend/tests/integration/test_api.py
++++ b/backend/tests/integration/test_api.py
+@@ -161,7 +161,9 @@ def test_evals_endpoints(
+         json.loads((FIXTURES / f"{stem}.json").read_text()),
+     )
+     import_rows(session, storage, iter([row]), schema)
+-    golden_by_sha = {d.sha256: g for d, g in labelled_documents(session, schema, "test")}
++    golden_by_sha = {
++        d.external_id or d.sha256: g for d, g in labelled_documents(session, schema, "test")
++    }
+     run = run_eval(
+         session,
+         storage,
+diff --git a/backend/tests/integration/test_eval_runner.py b/backend/tests/integration/test_eval_runner.py
+index 32d28e0..0d27cd2 100644
+--- a/backend/tests/integration/test_eval_runner.py
++++ b/backend/tests/integration/test_eval_runner.py
+@@ -41,7 +41,9 @@ def labelled(session: Session, storage: LocalStorage) -> None:
+ 
+ def test_oracle_and_null_baseline(session: Session, storage: LocalStorage, labelled: None) -> None:
+     schema = sync_builtins(session)[0]
+-    golden_by_sha = {d.sha256: g for d, g in labelled_documents(session, schema, "test")}
++    golden_by_sha = {
++        d.external_id or d.sha256: g for d, g in labelled_documents(session, schema, "test")
++    }
+     oracle = FakeProvider(lambda req: golden_by_sha[req.cache_key["document"]])
+ 
+     run = run_eval(session, storage, EvalConfig(model="claude-sonnet-5", concurrency=1), oracle)
+@@ -70,8 +72,8 @@ def test_failures_go_to_the_sidecar_not_the_score(
+ ) -> None:
+     schema = sync_builtins(session)[0]
+     docs = labelled_documents(session, schema, "test")
+-    golden_by_sha = {d.sha256: g for d, g in docs}
+-    first_sha = docs[0][0].sha256
++    golden_by_sha = {d.external_id or d.sha256: g for d, g in docs}
++    first_sha = docs[0][0].external_id or docs[0][0].sha256
+ 
+     def flaky(request: LLMRequest) -> dict[str, object]:
+         if request.cache_key["document"] == first_sha:
+@@ -93,7 +95,9 @@ def test_batch_mode_and_reports(
+     session: Session, storage: LocalStorage, labelled: None, tmp_path: Path
+ ) -> None:
+     schema = sync_builtins(session)[0]
+-    golden_by_sha = {d.sha256: g for d, g in labelled_documents(session, schema, "test")}
++    golden_by_sha = {
++        d.external_id or d.sha256: g for d, g in labelled_documents(session, schema, "test")
++    }
+     provider = FakeProvider(lambda req: golden_by_sha[req.cache_key["document"]])
+     statuses: list[str] = []
+ 
+diff --git a/backend/tests/integration/test_gate_bundle.py b/backend/tests/integration/test_gate_bundle.py
+new file mode 100644
+index 0000000..9425fb2
+--- /dev/null
++++ b/backend/tests/integration/test_gate_bundle.py
+@@ -0,0 +1,61 @@
++import json
++from pathlib import Path
++
++import pytest
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from fieldwise.db.models import Document
++from fieldwise.documents.cord_import import CordRow, import_rows
++from fieldwise.documents.ocr import FakeOcrProvider, OcrSpan
++from fieldwise.documents.ocr_service import ocr_document
++from fieldwise.evals.runner import labelled_documents
++from fieldwise.gate.bundle import build_bundle, load_bundle
++from fieldwise.schemas.registry import sync_builtins
++from fieldwise.storage import LocalStorage
++
++pytestmark = pytest.mark.integration
++
++FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "cord"
++
++
++def test_bundle_round_trip(session: Session, storage: LocalStorage, tmp_path: Path) -> None:
++    schema = sync_builtins(session)[0]
++    stem = "cord-v2_validation_0000"
++    row = CordRow(
++        "test",
++        0,
++        (FIXTURES / f"{stem}.jpg").read_bytes(),
++        json.loads((FIXTURES / f"{stem}.json").read_text()),
++    )
++    import_rows(session, storage, iter([row]), schema)
++    document = session.scalars(select(Document)).one()
++    ocr_document(document, storage, FakeOcrProvider([OcrSpan("TOTAL", (100, 200, 300, 240), 0.9)]))
++
++    out = tmp_path / "gate"
++    assert build_bundle(session, storage, schema, out, limit=20) == 1
++    manifest = json.loads((out / "manifest.json").read_text())
++    entry = manifest["documents"][0]
++    assert entry["external_id"] == "cord-v2/test/0000"
++    assert entry["golden"]["total"] == 45500.0
++    assert entry["ocr_words"][0]["box"] == [
++        100,
++        200,
++        300,
++        240,
++    ]  # fixture is below the max edge: no scaling
++    assert (out / entry["image"]).exists()
++
++    # A second, empty database (simulated by deleting the document) loads the bundle back.
++    session.delete(document)
++    session.flush()
++    other_storage = LocalStorage(tmp_path / "other")
++    assert load_bundle(session, other_storage, schema, out) == 1
++    assert load_bundle(session, other_storage, schema, out) == 0  # idempotent
++    loaded = labelled_documents(session, schema, "test")
++    assert len(loaded) == 1
++    restored, golden = loaded[0]
++    assert restored.external_id == "cord-v2/test/0000"
++    assert restored.ocr_status == "done"
++    assert restored.ocr_text == "TOTAL"
++    assert golden["total"] == 45500.0
+diff --git a/backend/tests/unit/test_gate.py b/backend/tests/unit/test_gate.py
+new file mode 100644
+index 0000000..cede3fc
+--- /dev/null
++++ b/backend/tests/unit/test_gate.py
+@@ -0,0 +1,38 @@
++from fieldwise.gate.bundle import GateBaseline, compare_to_baseline
++
++
++def baseline(**overrides: object) -> GateBaseline:
++    base = {
++        "prompt": "v2",
++        "model": "m",
++        "overall_accuracy": 0.91,
++        "value_accuracy": 0.95,
++        "doc_exact_rate": 0.5,
++        "per_field": {"total": 0.94, "tax": 1.0},
++        "lists": {"line_items": 0.67},
++    }
++    base.update(overrides)
++    return GateBaseline.from_dict(base)
++
++
++def test_no_regression_within_tolerance() -> None:
++    current = baseline(overall_accuracy=0.90, per_field={"total": 0.93, "tax": 1.0})
++    assert compare_to_baseline(current, baseline(), tolerance=0.02) == []
++
++
++def test_regressions_are_named() -> None:
++    current = baseline(
++        value_accuracy=0.90, per_field={"total": 0.80, "tax": 1.0}, lists={"line_items": 0.5}
++    )
++    problems = compare_to_baseline(current, baseline(), tolerance=0.02)
++    assert problems == [
++        "value_accuracy: 95.0% → 90.0%",
++        "total: 94.0% → 80.0%",
++        "line_items (exact): 67.0% → 50.0%",
++    ]
++
++
++def test_missing_numbers_are_skipped_and_round_trip() -> None:
++    current = baseline(per_field={"tax": 1.0}, overall_accuracy=None)
++    assert compare_to_baseline(current, baseline(), tolerance=0.02) == []
++    assert GateBaseline.from_dict(baseline().to_dict()) == baseline()
+diff --git a/docs/adr/0005-recorded-responses-make-ci-free.md b/docs/adr/0005-recorded-responses-make-ci-free.md
+new file mode 100644
+index 0000000..d207c9f
+--- /dev/null
++++ b/docs/adr/0005-recorded-responses-make-ci-free.md
+@@ -0,0 +1,27 @@
++# ADR 0005: Recorded model responses make the CI gate free and deterministic
++
++Status: accepted · 2026-09-18
++
++## Context
++
++Every change to a prompt, the schema compiler, a matcher or the importer can move accuracy, and the
++only trustworthy check is to re-score. Calling a model from CI would cost money on every push,
++depend on a secret, and vary between runs.
++
++## Decision
++
++The cassette provider records each model response under a key made of what the request was built
++from — document id, prompt version, schema version, model, effort, OCR-text flag, few-shot example
++ids, and a hash of the rendered system prompt and output schema — not of the request bytes. CI
++loads a committed bundle of 20 labelled test receipts (downscaled images, OCR spans, golden labels),
++replays the recordings for one configuration, re-scores them and fails when any field's accuracy,
++the value accuracy, the document exact-match rate or a list's exact rate drops more than two points
++below `evals/baseline.json`. `fieldwise gate run --write` refreshes the baseline deliberately.
++
++## Consequences
++
++- A prompt or schema change misses the cassettes (the system-prompt hash changed) and the gate
++  reports "nothing was scored" — the change must be recorded and the baseline rewritten in the same
++  pull request, which is the point: numbers travel with the change.
++- Grader and importer changes replay for free: the v1 re-score after the parser fix cost nothing.
++- Truncated answers are never recorded, so a re-run retries them instead of replaying a failure.
+diff --git a/justfile b/justfile
+index 7369234..ca99471 100644
+--- a/justfile
++++ b/justfile
+@@ -40,6 +40,10 @@ web-check:
+ web-client:
+     cd web && pnpm gen:api
+ 
++# Rebuild the gate bundle from the local database (after re-ingesting or changing OCR)
++gate-build:
++    cd backend && uv run fieldwise gate build --limit 20
++
+ # Everything CI runs
+ check: backend-check openapi-check web-check
+ 

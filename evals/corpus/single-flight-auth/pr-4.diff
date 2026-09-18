@@ -1,0 +1,13 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 8d67865..46e5931 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -17,7 +17,7 @@ jobs:
+       matrix:
+         node: [22, 24]
+     steps:
+-      - uses: actions/checkout@v5
++      - uses: actions/checkout@v7
+       - uses: pnpm/action-setup@v4
+       - uses: actions/setup-node@v5
+         with:

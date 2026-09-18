@@ -18,22 +18,28 @@ from second_opinion.config import Settings, load_settings
 from second_opinion.diff import filter_diff, parse_diff
 from second_opinion.evals import (
     build_cases,
+    compute,
     load_cases,
     load_index,
+    load_run,
     render_comparison,
     run_cases,
+    run_path,
     slugify,
     summary_line,
     write_cases,
     write_report,
 )
 from second_opinion.evals.dataset import CASES_DIR, INDEX_PATH
-from second_opinion.evals.runner import CASSETTES_DIR
+from second_opinion.evals.runner import CASSETTES_DIR, ROOT
 from second_opinion.findings import SEVERITY_ORDER, Finding
+from second_opinion.gate import BASELINE_PATH, check_against, load_baseline, write_baseline
 from second_opinion.github import GitHubClient, event_pull_number, post_review, repo_from_env
 from second_opinion.llm import LLMError, make_provider
 from second_opinion.pipeline import ReviewRun, run_review
 from second_opinion.report import render_markdown
+
+RUNS_TMP = ROOT / "evals" / "runs" / ".replay"
 
 app = typer.Typer(
     name="second-opinion",
@@ -346,3 +352,49 @@ def eval_slug(model: ModelOption = None, prompt: PromptOption = None) -> None:
     """Print the run slug for a model and prompt (what `report` and `compare` take)."""
     settings = settings_from(None, model, prompt)
     typer.echo(slugify(settings.model, settings.prompt_version))
+
+
+gate_app = typer.Typer(help="The eval gate CI runs on replayed responses.", no_args_is_help=True)
+app.add_typer(gate_app, name="gate")
+
+
+@gate_app.command("write")
+def gate_write(
+    slug: Annotated[str, typer.Argument(help="The run to become the baseline")],
+    margin: Annotated[float, typer.Option(help="Allowed drop in recall/precision")] = 0.02,
+) -> None:
+    """Write evals/baseline.json from a run file."""
+    baseline = write_baseline(slug, margin=margin)
+    typer.echo(f"baseline {baseline.slug}: {json.dumps(baseline.to_dict())} -> {BASELINE_PATH}")
+
+
+@gate_app.command("check")
+def gate_check(
+    replay: Annotated[bool, typer.Option(help="Re-score the baseline run from cassettes")] = True,
+) -> None:
+    """Replay the baseline run from recorded responses and compare with the baseline."""
+    baseline = load_baseline()
+    model, prompt = baseline.slug.rsplit("--", 1)
+    if replay:
+        cases = load_cases() if CASES_DIR.exists() and any(CASES_DIR.glob("*.json")) else []
+        if not cases:
+            write_cases(build_cases())
+            cases = load_cases()
+        rows = load_run(run_path(baseline.slug))
+        model = str(rows[0]["model"]) if rows else model
+        settings = load_settings(provider="openai", model=model, prompt_version=prompt)
+        llm = make_provider(settings, cassette_dir=CASSETTES_DIR, cassette_mode="replay")
+        outcome = run_cases(cases, settings, llm, runs_dir=RUNS_TMP, resume=False)
+        if outcome.stopped_by:
+            typer.echo(f"gate: replay stopped — {outcome.stopped_by}", err=True)
+            raise typer.Exit(code=1)
+        metrics = compute(load_run(run_path(outcome.slug, RUNS_TMP)))
+    else:
+        metrics = compute(load_run(run_path(baseline.slug)))
+    failures = check_against(metrics, baseline)
+    typer.echo(summary_line(metrics))
+    if failures:
+        for failure in failures:
+            typer.echo(f"gate: {failure}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(f"gate: ok against {baseline.slug}")

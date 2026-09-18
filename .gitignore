@@ -16,3 +16,4 @@ dist/
 .vscode/
 evals/cases/
 evals/runs/*.tmp
+evals/runs/.replay/

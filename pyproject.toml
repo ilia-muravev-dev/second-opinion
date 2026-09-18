@@ -45,6 +45,7 @@ src = ["src", "tests"]
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF", "PT", "ANN", "PL", "S"]
 ignore = [
   "PLR0913", # explicit pipelines take many arguments
+  "PLR0917", # Typer commands take their options positionally
   "PLR2004", # magic numbers in tests and thresholds
   "S101",    # assert is the test idiom
   "S311",    # random is used for seeded sampling, never security

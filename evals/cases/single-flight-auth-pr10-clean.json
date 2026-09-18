@@ -1,0 +1,9 @@
+{
+ "id": "single-flight-auth-pr10-clean",
+ "repo": "single-flight-auth",
+ "pr": 10,
+ "kind": "clean",
+ "tokens": 491,
+ "labels": [],
+ "diff": "diff --git a/.changeset/first-release.md b/.changeset/first-release.md\nnew file mode 100644\n--- /dev/null\n+++ b/.changeset/first-release.md\n@@ -0,0 +1,6 @@\n+---\n+'single-flight-auth': minor\n+---\n+\n+First release: single-flight refresh within a tab, Web Locks (or a localStorage lease) across tabs,\n+BroadcastChannel sync, `fetch` with a single 401 retry, and session-lost handling.\ndiff --git a/.github/workflows/release.yml b/.github/workflows/release.yml\nnew file mode 100644\n--- /dev/null\n+++ b/.github/workflows/release.yml\n@@ -0,0 +1,41 @@\n+name: Release\n+\n+on:\n+  push:\n+    branches: [main]\n+\n+concurrency: release-${{ github.ref }}\n+\n+permissions:\n+  contents: write\n+  pull-requests: write\n+  id-token: write\n+\n+jobs:\n+  release:\n+    name: Version or publish\n+    runs-on: ubuntu-latest\n+    steps:\n+      - uses: actions/checkout@v7\n+        with:\n+          fetch-depth: 0\n+      - uses: pnpm/action-setup@v6\n+      - uses: actions/setup-node@v7\n+        with:\n+          node-version: 24\n+          cache: pnpm\n+          registry-url: https://registry.npmjs.org\n+      - run: pnpm install --frozen-lockfile\n+      - run: pnpm check\n+      - name: Open the version PR or publish to npm\n+        uses: changesets/action@v1\n+        with:\n+          version: pnpm changeset version\n+          publish: pnpm release\n+          commit: 'chore: release'\n+          title: 'chore: release'\n+        env:\n+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n+          # Trusted publishing (OIDC) needs no token; NPM_TOKEN is the fallback.\n+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}\n+          NPM_CONFIG_PROVENANCE: 'true'\n"
+}

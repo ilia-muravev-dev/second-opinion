@@ -1,0 +1,9 @@
+{
+ "id": "single-flight-auth-pr4-clean",
+ "repo": "single-flight-auth",
+ "pr": 4,
+ "kind": "clean",
+ "tokens": 92,
+ "labels": [],
+ "diff": "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n@@ -17,7 +17,7 @@ jobs:\n       matrix:\n         node: [22, 24]\n     steps:\n-      - uses: actions/checkout@v5\n+      - uses: actions/checkout@v7\n       - uses: pnpm/action-setup@v4\n       - uses: actions/setup-node@v5\n         with:\n"
+}

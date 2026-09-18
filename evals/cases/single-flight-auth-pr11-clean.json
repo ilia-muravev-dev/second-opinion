@@ -1,0 +1,9 @@
+{
+ "id": "single-flight-auth-pr11-clean",
+ "repo": "single-flight-auth",
+ "pr": 11,
+ "kind": "clean",
+ "tokens": 268,
+ "labels": [],
+ "diff": "diff --git a/.changeset/first-release.md b/.changeset/first-release.md\ndeleted file mode 100644\n--- a/.changeset/first-release.md\n+++ /dev/null\n@@ -1,6 +0,0 @@\n----\n-'single-flight-auth': minor\n----\n-\n-First release: single-flight refresh within a tab, Web Locks (or a localStorage lease) across tabs,\n-BroadcastChannel sync, `fetch` with a single 401 retry, and session-lost handling.\ndiff --git a/CHANGELOG.md b/CHANGELOG.md\nnew file mode 100644\n--- /dev/null\n+++ b/CHANGELOG.md\n@@ -0,0 +1,8 @@\n+# single-flight-auth\n+\n+## 0.1.0\n+\n+### Minor Changes\n+\n+- [#10](https://github.com/ilia-muravev-dev/single-flight-auth/pull/10) [`811be98`](https://github.com/ilia-muravev-dev/single-flight-auth/commit/811be988bda2b140cac2635c66b720b3e39c3840) Thanks [@ilia-muravev-dev](https://github.com/ilia-muravev-dev)! - First release: single-flight refresh within a tab, Web Locks (or a localStorage lease) across tabs,\n+  BroadcastChannel sync, `fetch` with a single 401 retry, and session-lost handling.\ndiff --git a/package.json b/package.json\n--- a/package.json\n+++ b/package.json\n@@ -1,6 +1,6 @@\n {\n   \"name\": \"single-flight-auth\",\n-  \"version\": \"0.0.0\",\n+  \"version\": \"0.1.0\",\n   \"description\": \"Single-flight access-token refresh within and across browser tabs. Fixes the \\\"random 401\\\" caused by refresh-token rotation races.\",\n   \"keywords\": [\n     \"auth\",\n"
+}

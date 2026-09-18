@@ -26,11 +26,18 @@ class PostOutcome:
     notes: list[str] = field(default_factory=list)
 
 
+def same_hunk(f: Finding, end: int) -> bool:
+    return f.hunk_range is not None and f.hunk_range[0] <= end <= f.hunk_range[1]
+
+
 def inline_comment_for(f: Finding) -> InlineComment | None:
     if f.line is None:
         return None
-    # A range is (start_line, line) on GitHub; the finding's line is the start of its range.
+    # A range is (start_line, line) on GitHub and must stay inside one hunk; a range that does
+    # not is posted as a single line rather than refused.
     end = f.end_line if f.end_line is not None and f.end_line > f.line else None
+    if end is not None and not same_hunk(f, end):
+        end = None
     return InlineComment(
         path=f.file,
         line=end if end is not None else f.line,
@@ -63,11 +70,11 @@ def post_review(
                 client.create_review(pr, body=body, comments=comments)
                 outcome.inline_posted = len(comments)
             except GitHubError as error:
-                if error.status != 422:
-                    raise
+                # whatever GitHub's reason (422 anchors, 403 rate limit, 5xx), the summary still
+                # goes out; if that fails too, the error propagates from upsert_summary below
                 outcome.inline_fell_back = True
                 outcome.notes.append(
-                    f"GitHub refused the inline anchors ({error}); findings are in the summary only"
+                    f"inline comments could not be posted ({error}); findings are in the summary only"
                 )
     summary = render_markdown(report)
     if outcome.notes:

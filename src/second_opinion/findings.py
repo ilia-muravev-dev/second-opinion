@@ -40,6 +40,9 @@ class Finding(BaseModel):
     check: str | None = Field(default=None, description="The deterministic check that fired")
     verdict: Literal["confirmed", "plausible", "rejected"] | None = None
     verdict_reason: str | None = None
+    hunk_range: tuple[int, int] | None = Field(
+        default=None, description="New-side first/last line of the hunk the anchor sits in"
+    )
 
     @computed_field  # type: ignore[prop-decorator]
     @property

@@ -1,0 +1,9 @@
+{
+ "id": "single-flight-auth-pr9-clean",
+ "repo": "single-flight-auth",
+ "pr": 9,
+ "kind": "clean",
+ "tokens": 118,
+ "labels": [],
+ "diff": "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n--- a/.github/workflows/ci.yml\n+++ b/.github/workflows/ci.yml\n@@ -47,7 +47,7 @@ jobs:\n       - name: Publish the race summary\n         if: always()\n         run: cat test-results/race-summary.md >> \"$GITHUB_STEP_SUMMARY\" || true\n-      - uses: actions/upload-artifact@v4\n+      - uses: actions/upload-artifact@v7\n         if: failure()\n         with:\n           name: playwright-report\n"
+}

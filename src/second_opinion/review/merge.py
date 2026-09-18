@@ -52,6 +52,7 @@ def to_finding(raw: ModelFinding, diff: Diff, stats: MergeStats) -> Finding | No
         explanation=raw.explanation.strip(),
         suggestion=(raw.suggestion or "").strip() or None,
         confidence=raw.confidence,
+        hunk_range=hunk_range,
     )
 
 

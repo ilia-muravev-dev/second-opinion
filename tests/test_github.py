@@ -110,17 +110,18 @@ def test_rerun_skips_seen_fingerprints_and_edits_the_summary(respx_mock: respx.M
     assert patched.called
 
 
+@pytest.mark.parametrize("status", [422, 403, 500])
 @respx.mock(base_url=BASE)
-def test_refused_anchors_fall_back_to_the_summary(respx_mock: respx.MockRouter) -> None:
+def test_any_refusal_of_inline_comments_falls_back_to_the_summary(
+    respx_mock: respx.MockRouter, status: int
+) -> None:
     respx_mock.get("/repos/o/r/pulls/7/comments").respond(200, json=[])
-    respx_mock.post("/repos/o/r/pulls/7/reviews").respond(
-        422, json={"message": "Validation Failed: line must be part of the diff"}
-    )
+    respx_mock.post("/repos/o/r/pulls/7/reviews").respond(status, json={"message": "no"})
     respx_mock.get("/repos/o/r/issues/7/comments").respond(200, json=[])
     created = respx_mock.post("/repos/o/r/issues/7/comments").respond(201, json={"id": 2})
     outcome = post_review(client(), pr(), ReviewReport(findings=[finding()]), mode="review")
     assert outcome.inline_fell_back
-    assert "refused the inline anchors" in json.loads(created.calls[0].request.content)["body"]
+    assert "could not be posted" in json.loads(created.calls[0].request.content)["body"]
 
 
 @respx.mock(base_url=BASE)
@@ -134,11 +135,14 @@ def test_summary_mode_posts_no_inline_comments(respx_mock: respx.MockRouter) -> 
     )
 
 
-def test_ranges_become_start_line_and_line() -> None:
-    comment = inline_comment_for(finding(line=4, end_line=6))
+def test_ranges_become_start_line_and_line_inside_one_hunk() -> None:
+    comment = inline_comment_for(finding(line=4, end_line=6, hunk_range=(1, 10)))
     assert comment is not None
     assert (comment.start_line, comment.line) == (4, 6)
     assert comment.payload()["start_side"] == "RIGHT"
+    crossing = inline_comment_for(finding(line=4, end_line=12, hunk_range=(1, 10)))
+    assert crossing is not None
+    assert (crossing.start_line, crossing.line) == (None, 4)
     assert inline_comment_for(finding(line=None)) is None
 
 

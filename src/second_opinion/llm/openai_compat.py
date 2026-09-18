@@ -60,6 +60,8 @@ class OpenAICompatibleProvider:
         extra_body: dict[str, Any] = {}
         if self.name == "openrouter":
             extra_body["usage"] = {"include": True}
+            # Reasoning models otherwise think until max_tokens and answer with nothing.
+            extra_body["reasoning"] = {"effort": request.effort}
         return self.client.chat.completions.create(
             model=request.model,
             messages=messages,
@@ -108,8 +110,16 @@ class OpenAICompatibleProvider:
         prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
         cached = _cached_tokens(usage)
         reported_cost = _reported_cost(usage)
+        text = choice.message.content or ""
+        if not text.strip() and getattr(choice.message, "reasoning", None):
+            raise LLMError(
+                "bad_request",
+                "the model spent its output on reasoning and returned no answer; "
+                "raise max_tokens or lower the effort",
+                retryable=False,
+            )
         return LLMResponse(
-            text=strip_fences(choice.message.content or ""),
+            text=strip_fences(text),
             usage=LLMUsage(
                 input_tokens=max(prompt_tokens - cached, 0),
                 cache_read_tokens=cached,

@@ -27,8 +27,10 @@ class LLMRequest:
     system: str
     user: str
     output_schema: dict[str, Any]
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     temperature: float = 0.0
+    # How much thinking to ask for; reasoning models spend output tokens on it.
+    effort: str = "low"
     # What identifies this request for the cassette: normally the case id, prompt version and
     # chunk index — never the bytes of the diff, so a cosmetic re-render does not miss.
     cache_key: dict[str, str] = field(default_factory=dict)
@@ -42,6 +44,7 @@ class LLMRequest:
             ).hexdigest()[:16],
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
+            "effort": self.effort,
             **(self.cache_key or {"user": hashlib.sha256(self.user.encode()).hexdigest()[:16]}),
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:32]

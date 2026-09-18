@@ -1,0 +1,85 @@
+name: second-opinion
+description: >-
+  Reviews the pull request: deterministic checks, a model review with structured output, a second
+  pass that verifies each finding — posted as inline comments plus one summary comment.
+author: Ilia Muravev
+branding:
+  icon: eye
+  color: purple
+inputs:
+  github-token:
+    description: Token with pull-requests write permission
+    default: ${{ github.token }}
+  provider:
+    description: anthropic | openai (any OpenAI-compatible endpoint, e.g. OpenRouter)
+    default: anthropic
+  model:
+    description: Model id for the provider
+    default: claude-haiku-4-5-20251001
+  anthropic-api-key:
+    description: Anthropic API key (provider anthropic)
+    default: ""
+  openai-api-key:
+    description: API key for the OpenAI-compatible endpoint (provider openai)
+    default: ""
+  openai-base-url:
+    description: Base URL of the OpenAI-compatible endpoint
+    default: https://openrouter.ai/api/v1
+  prompt:
+    description: Prompt version
+    default: v1
+  min-confidence:
+    description: Findings below this confidence are not posted (0–1)
+    default: "0.5"
+  max-findings:
+    description: At most this many model findings
+    default: "15"
+  post:
+    description: review (inline + summary) | summary | none
+    default: review
+  fail-on:
+    description: Fail the check when a finding of this severity or worse exists (none | high | medium | low)
+    default: none
+  pr-number:
+    description: Pull request number (default: from the event)
+    default: ""
+outputs:
+  findings:
+    description: Number of findings
+    value: ${{ steps.review.outputs.findings }}
+  high:
+    description: Number of high-severity findings
+    value: ${{ steps.review.outputs.high }}
+  requests:
+    description: Model requests made
+    value: ${{ steps.review.outputs.requests }}
+  cost_usd:
+    description: Cost when known
+    value: ${{ steps.review.outputs.cost_usd }}
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v10.1.0
+      with:
+        enable-cache: true
+        cache-dependency-glob: ${{ github.action_path }}/uv.lock
+    - id: review
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        SO_PROVIDER: ${{ inputs.provider }}
+        SO_MODEL: ${{ inputs.model }}
+        SO_ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        SO_OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        SO_OPENAI_BASE_URL: ${{ inputs.openai-base-url }}
+        SO_PROMPT_VERSION: ${{ inputs.prompt }}
+        SO_MIN_CONFIDENCE: ${{ inputs.min-confidence }}
+        SO_MAX_FINDINGS: ${{ inputs.max-findings }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        POST: ${{ inputs.post }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        set -euo pipefail
+        args=(review --post "$POST" --fail-on "$FAIL_ON")
+        if [ -n "$PR_NUMBER" ]; then args+=(--pr "$PR_NUMBER"); fi
+        uv run --frozen --directory "$GITHUB_ACTION_PATH" second-opinion "${args[@]}"

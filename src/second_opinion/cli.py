@@ -4,6 +4,7 @@ pull requests that implement them; the skeleton only knows how to introduce itse
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Annotated
 
@@ -15,9 +16,10 @@ from second_opinion import __version__
 from second_opinion.checks import run_checks
 from second_opinion.config import Settings, load_settings
 from second_opinion.diff import filter_diff, parse_diff
-from second_opinion.findings import Finding
+from second_opinion.findings import SEVERITY_ORDER, Finding
+from second_opinion.github import GitHubClient, event_pull_number, post_review, repo_from_env
 from second_opinion.llm import make_provider
-from second_opinion.pipeline import run_review
+from second_opinion.pipeline import ReviewRun, run_review
 from second_opinion.report import render_markdown
 
 app = typer.Typer(
@@ -42,6 +44,9 @@ def version() -> None:
 DiffOption = Annotated[
     Path, typer.Option("--diff", exists=True, dir_okay=False, help="A unified diff file")
 ]
+OptionalDiffOption = Annotated[
+    Path | None, typer.Option("--diff", exists=True, dir_okay=False, help="A unified diff file")
+]
 JsonOption = Annotated[bool, typer.Option("--json", help="Print findings as JSON")]
 ProviderOption = Annotated[
     str | None, typer.Option("--provider", help="anthropic | openai | fake (default: SO_PROVIDER)")
@@ -65,7 +70,13 @@ def settings_from(provider: str | None, model: str | None, prompt: str | None) -
 
 @app.command()
 def review(
-    diff: DiffOption,
+    diff: OptionalDiffOption = None,
+    pr: Annotated[int | None, typer.Option("--pr", help="Pull request number")] = None,
+    repo: Annotated[
+        str | None, typer.Option("--repo", help="owner/name (default: $GITHUB_REPOSITORY)")
+    ] = None,
+    post: Annotated[str, typer.Option("--post", help="review | summary | none")] = "none",
+    fail_on: Annotated[str, typer.Option("--fail-on", help="none | high | medium | low")] = "none",
     provider: ProviderOption = None,
     model: ModelOption = None,
     prompt: PromptOption = None,
@@ -73,12 +84,55 @@ def review(
     checks_only: Annotated[bool, typer.Option("--checks-only", help="Skip the model")] = False,
     as_json: JsonOption = False,
 ) -> None:
-    """Review a unified diff: deterministic checks, then the model. Markdown on stdout."""
+    """Review a diff file or a pull request: deterministic checks, then the model.
+
+    With --pr the diff comes from GitHub and --post decides what goes back: inline comments plus
+    a summary (review), the summary only, or nothing (the default; markdown on stdout)."""
     settings = settings_from(provider, model, prompt)
+    if post not in {"review", "summary", "none"}:
+        raise typer.BadParameter("--post must be review, summary or none")
+    if fail_on not in {"none", *SEVERITY_ORDER}:
+        raise typer.BadParameter("--fail-on must be none, high, medium or low")
     llm = None if checks_only else make_provider(settings)
-    run = run_review(
-        diff.read_text(encoding="utf-8"), settings, llm, title=title, checks_only=checks_only
-    )
+    if diff is not None:
+        run = run_review(
+            diff.read_text(encoding="utf-8"), settings, llm, title=title, checks_only=checks_only
+        )
+    else:
+        number = pr or event_pull_number()
+        slug = repo.split("/", 1) if repo else repo_from_env()
+        if number is None or slug is None:
+            raise typer.BadParameter("give --diff, or --pr and --repo (or run inside Actions)")
+        token = settings.github_token or os.environ.get("GITHUB_TOKEN")
+        if not token:
+            raise typer.BadParameter("a GitHub token is required: SO_GITHUB_TOKEN or GITHUB_TOKEN")
+        client = GitHubClient(token)
+        pull = client.get_pull(slug[0], slug[1], number)
+        run = run_review(
+            client.get_diff(slug[0], slug[1], number),
+            settings,
+            llm,
+            title=pull.title,
+            description=pull.body,
+            checks_only=checks_only,
+        )
+        if post != "none":
+            outcome = post_review(client, pull, run.report, mode=post)
+            typer.echo(
+                f"posted: {outcome.inline_posted} inline, "
+                f"{outcome.inline_skipped_seen} already there, summary "
+                f"{'updated' if outcome.summary_updated else 'not posted'}",
+                err=True,
+            )
+    emit(run, as_json)
+    write_outputs(run)
+    if fail_on != "none" and any(
+        SEVERITY_ORDER[f.severity] <= SEVERITY_ORDER[fail_on] for f in run.report.findings
+    ):
+        raise typer.Exit(code=2)
+
+
+def emit(run: ReviewRun, as_json: bool) -> None:
     if as_json:
         typer.echo(
             json.dumps(
@@ -96,6 +150,18 @@ def review(
         )
         return
     typer.echo(render_markdown(run.report), nl=False)
+
+
+def write_outputs(run: ReviewRun) -> None:
+    """Action outputs, when running inside GitHub Actions."""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with Path(path).open("a", encoding="utf-8") as handle:
+        handle.write(f"findings={len(run.report.findings)}\n")
+        handle.write(f"high={sum(1 for f in run.report.findings if f.severity == 'high')}\n")
+        handle.write(f"requests={run.report.requests}\n")
+        handle.write(f"cost_usd={run.report.cost_usd if run.report.cost_usd is not None else ''}\n")
 
 
 @app.command()

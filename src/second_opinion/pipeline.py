@@ -48,6 +48,7 @@ def run_review(
             min_confidence=settings.min_confidence,
             max_findings=settings.max_findings,
             case_id=case_id,
+            effort=settings.effort,
         )
         findings = sort_findings(findings + result.findings)
     report = ReviewReport(

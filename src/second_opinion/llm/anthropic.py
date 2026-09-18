@@ -41,6 +41,7 @@ class AnthropicProvider:
                 ],
                 messages=[{"role": "user", "content": request.user}],
                 output_config={
+                    "effort": cast(Any, request.effort),
                     "format": {"type": "json_schema", "schema": request.output_schema},
                 },
             )

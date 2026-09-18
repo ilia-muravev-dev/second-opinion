@@ -94,6 +94,7 @@ def review_diff(
     min_confidence: float,
     max_findings: int,
     case_id: str | None = None,
+    effort: str = "low",
 ) -> ReviewResult:
     context = context or ReviewContext()
     system = load_prompt(prompt_version)
@@ -110,7 +111,8 @@ def review_diff(
             system=system,
             user=build_user_message(chunk, context, prompt_version),
             output_schema=REVIEW_SCHEMA,
-            max_tokens=4096,
+            max_tokens=8192,
+            effort=effort,
             cache_key=(
                 {"case": case_id, "prompt": prompt_version, "chunk": f"{chunk.index}/{chunk.total}"}
                 if case_id

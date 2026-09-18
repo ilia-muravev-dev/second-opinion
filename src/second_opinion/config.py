@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     max_pr_tokens: int = Field(default=120_000, ge=2_000)
     max_findings: int = Field(default=15, ge=1)
     min_confidence: float = Field(default=0.5, ge=0, le=1)
+    # low | medium | high: thinking budget for models that reason
+    effort: str = "low"
     github_token: str | None = None
     log_level: str = "info"
 

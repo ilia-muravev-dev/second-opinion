@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr4-m3",
+    "chunk": "2/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 9618,
+    "request_id": "gen-1789812158-CaF9n0LoVbzL55XHycgW",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":100,\"end_line\":122,\"explanation\":\"`labelled_documents` is an iterator, but it is consumed twice: once at line 122 and again at line 123. If it is a generator\u2014as its name and use with `iter(rows)` suggest\u2014the second loop is empty, so the test neither OCRs the documents nor validates the claimed oracle accuracy. Materialize it once before building `golden_by_sha`.\",\"file\":\"backend/tests/integration/test_eval_runner.py\",\"line\":122,\"severity\":\"high\",\"suggestion\":\"Materialize `list(labelled_documents(...))` once before building `golden_by_sha`.\",\"title\":\"Integration test may evaluate an empty document set\"},{\"category\":\"correctness\",\"confidence\":100,\"end_line\":143,\"explanation\":\"The report template renders the `missing` column at line 143, but the JSON counts for `line_items[].name`, `quantity`, `line_total`, and `unit_price` contain no `missing` keys (lines 173\u2013177, 191\u2013193, 207\u2013210, and 224\u2013228). Unless rendering explicitly defaults absent keys to zero, these rows will fail or be incomplete, so the generated Markdown does not reliably represent the recorded results.\",\"file\":\"docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-37d35c46.json\",\"line\":143,\"severity\":\"medium\",\"suggestion\":\"Emit a zero for every count label, including `missing`, when serializing results.\",\"title\":\"Report JSON can omit fields required by the Markdown template\"}],\"summary\":\"The change adds extraction-evaluation grading, aggregation, reporting, and baseline fixtures. The main risks are an integration test that may iterate a one-shot document collection twice and report data whose count keys may not match the Markdown renderer.\"}",
+    "usage": {
+      "cache_read_tokens": 11840,
+      "cache_write_tokens": 0,
+      "input_tokens": 23,
+      "output_tokens": 432
+    }
+  }
+}

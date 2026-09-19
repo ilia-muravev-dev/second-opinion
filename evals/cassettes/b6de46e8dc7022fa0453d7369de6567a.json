@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr3-m2",
+    "chunk": "2/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 2480,
+    "request_id": "gen-1789812104-AfjpfUC0xsTbSwt7wScz",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[],\"summary\":\"Adds unit coverage for Anthropic request serialization, usage and SDK error classification, served-model validation, plus FakeProvider serialization and LLMResponse round-tripping. The tests shown are consistent with the stated behavior; no blocking defect is visible in this diff.\"}",
+    "usage": {
+      "cache_read_tokens": 2432,
+      "cache_write_tokens": 0,
+      "input_tokens": 27,
+      "output_tokens": 59
+    }
+  }
+}

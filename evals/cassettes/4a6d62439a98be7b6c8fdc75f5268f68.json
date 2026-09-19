@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr13-m2",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 5420,
+    "request_id": "gen-1789811975-uOgmngpp0HVSNL5ugLlJ",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"security\",\n      \"confidence\": 1.0,\n      \"end_line\": 470,\n      \"explanation\": \"`PAYMENT_API_SECRET` embeds a value explicitly named as a live secret in source-controlled code. This exposes the credential to every checkout and CI log and is a concrete security incident requiring immediate revocation and removal.\",\n      \"file\": \"backend/src/fieldwise/cli.py\",\n      \"line\": 470,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Remove the secret from the repository, revoke/rotate it, and source it from the deployment secret manager or environment.\"\n    ,\n      \"title\": \"Live payment API secret is committed in source code\"\n    }\n  ],\n  \"summary\": \"The change adds a replay-based evaluation gate with committed fixtures and baseline metrics, plus bundle-building and comparison tooling. The primary blocking risk is the live payment API secret committed in `cli.py`.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 9519,
+      "output_tokens": 231
+    }
+  }
+}

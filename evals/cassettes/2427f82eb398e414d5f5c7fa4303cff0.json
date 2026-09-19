@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr16-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 8720,
+    "request_id": "gen-1789812036-vrjamipNIwc21y9ND2NL",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":0.98,\"end_line\":23,\"explanation\":\"The new string branch returns `\\\"\\\"` for every string schema, including `\\\"\\\".join` fields. Such fields require an array of strings, so `parse_output` cannot validate the fake answer against either schema and the test will fail. The string fallback should be conditional on `schema.get(\\\"format\\\") != \\\"string_array\\\"`.\",\"file\":\"backend/src/fieldwise/extraction/factory.py\",\"line\":23,\"severity\":\"high\",\"suggestion\":\"Return an empty list for `format: string_array` (or otherwise generate a schema-correct value), while retaining `\\\"\\\"` only for ordinary strings.\",\"title\":\"Fake answer generator emits the wrong type for string-array fields\"},{\"category\":\"testing\",\"confidence\":0.99,\"end_line\":52,\"explanation\":\"The test calls `parse_output(...)` without asserting its return value. A parser that rejects the value and returns an empty result will still let the test pass, so this does not prove the generated answer is valid. Capture the result and assert it equals `empty_answer(request)` (or the intended parsed representation).\",\"file\":\"backend/tests/unit/test_gate.py\",\"line\":52,\"severity\":\"high\",\"suggestion\":\"Use `assert parse_output(...) == empty_answer(request)` so rejection or loss of data fails the test.\",\"title\":\"Validity test does not assert parser acceptance\"}],\"summary\":\"The change adds empty-string values for required string fields and a fake-answer smoke test across built-in schemas. The main risk is that the generator does not honor the `string_array` schema shape, and the test can pass even when parsing rejects the generated answer.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 845,
+      "output_tokens": 361
+    }
+  }
+}

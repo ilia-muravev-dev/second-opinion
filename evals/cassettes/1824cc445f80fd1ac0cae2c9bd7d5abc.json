@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr10-m1",
+    "chunk": "1/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 14669,
+    "request_id": "gen-1789811861-01w6LkuBD71xpCrmv1zB",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":0.99,\"end_line\":115,\"explanation\":\"The upload tab filters the already paginated response in memory, but uses the unfiltered response total for pagination. If the backend returns 25 items containing only 5 uploads, the UI shows 5/25 items and still offers a next page; the next page can therefore skip uploads and report false counts.\",\"file\":\"web/src/app/documents/page.tsx\",\"line\":115,\"severity\":\"medium\",\"suggestion\":\"Filter before paginating in the backend/API, or compute pages and displayed counts from the filtered items while preserving the overall total separately.\",\"title\":\"Upload pagination uses the wrong total\"},{\"category\":\"correctness\",\"confidence\":0.96,\"end_line\":29,\"explanation\":\"`saveCorrection` iterates over leaves flattened from `data` and updates `data` during that iteration. For a repeated schema, the initial flattened leaf objects retain stale array indexes; after `setAtPath` inserts or removes an item, later writes can target the old index and overwrite a different element. This can corrupt a multi-item list even when the user edited only one entry.\",\"file\":\"web/src/app/documents/[id]/review.tsx\",\"line\":29,\"severity\":\"high\",\"suggestion\":\"Build the corrected result from the current schema and existing data with index-aware paths, or rebuild all affected repeated fields before walking the resulting structure.\",\"title\":\"Correction writes can overwrite the wrong list element\"},{\"category\":\"correctness\",\"confidence\":0.99,\"end_line\":50,\"explanation\":\"The default-run effect changes `selectedRunId` whenever the selected run disappears from `runs.data`. A transient polling gap, server-side ordering change, or temporary empty response therefore replaces the user's explicit run selection with the newest run instead of preserving it.\",\"file\":\"web/src/app/documents/[id]/review.tsx\",\"line\":50,\"severity\":\"medium\",\"suggestion\":\"Only auto-select on initial load or a newly queued run, and preserve an explicit selection across temporary list gaps.\",\"title\":\"Run selection is not stable across transient gaps\"},{\"category\":\"correctness\",\"confidence\":0.98,\"end_line\":11,\"explanation\":\"The rewrite targets `/:path*`, so the proxy destination drops the literal `/api` prefix. A browser request to `/api/documents` is proxied to `http://api:8000/documents`, not `/api/documents`; it will fail if the FastAPI routes are mounted under `/api`, as the UI's `/api` convention and generated client imply.\",\"file\":\"web/next.config.ts\",\"line\":11,\"severity\":\"high\",\"suggestion\":\"Proxy to `${API_URL}/api/:path*` (or configure the backend and client consistently with prefixless routes).\",\"title\":\"API rewrite strips the /api prefix\"}],\"summary\":\"The change adds a Next.js review and evaluation UI, generated API typing, local/Docker setup, and web CI checks. The main risks are incorrect upload pagination, unsafe correction of repeated fields, unstable run selection, and a likely `/api` routing mismatch.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 29467,
+      "output_tokens": 652
+    }
+  }
+}

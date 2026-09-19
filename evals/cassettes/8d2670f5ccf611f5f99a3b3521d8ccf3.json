@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr18-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 1275,
+    "request_id": "gen-1789812053-HhbuGyXrIMaP7LfQsDSw",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[],\"summary\":\"Updates the Ollama example to recommend and document a 16k-context model variant. No blocking defect is visible in this documentation-only change.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 712,
+      "output_tokens": 39
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr14-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 7834,
+    "request_id": "gen-1789811981-3MQpC45wEi0g9cS9GWzS",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"security\",\"confidence\":0.98,\"end_line\":20,\"explanation\":\"`path.join(\\\"/\\\")` is interpolated into the upstream URL at line 20, so an encoded slash in `params.path` can be decoded into a new URL path segment and escape `/api` (for example, `path=..%2Fhealth`). This exposes routes intended to be backend-only and can enable SSRF if those routes accept arbitrary URLs. The path must be decoded and validated as a single backend path segment, or rejected if it contains a decoded slash.\",\"file\":\"web/src/app/api/[...path]/route.ts\",\"line\":20,\"severity\":\"high\",\"suggestion\":\"Reject decoded slashes and path traversal before constructing the target URL.\",\"title\":\"Encoded slash escapes the /api prefix\"},{\"category\":\"correctness\",\"confidence\":0.97,\"end_line\":39,\"explanation\":\"The response body is forwarded as a stream at line 39 after `content-encoding` is removed at line 37. If the backend returns a compressed body\u2014as Uvicorn commonly does when the browser sends `Accept-Encoding`\u2014the browser receives compressed bytes without decompression metadata and cannot render them. Content must be decompressed before stripping that header, or the encoding and matching `content-length` must be preserved.\",\"file\":\"web/src/app/api/[...path]/route.ts\",\"line\":37,\"severity\":\"high\",\"suggestion\":\"Decode compressed upstream bodies before removing `content-encoding`, or preserve a valid encoding/length pair.\",\"title\":\"Compressed upstream responses are returned undecoded\"}],\"summary\":\"The change adds a fake-provider Docker profile and Playwright end-to-end flow, replaces Next.js build-time API rewrites with a runtime proxy, and adjusts review-run selection. The main risks are unsafe catch-all URL construction and mishandling of compressed upstream responses.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 4494,
+      "output_tokens": 394
+    }
+  }
+}

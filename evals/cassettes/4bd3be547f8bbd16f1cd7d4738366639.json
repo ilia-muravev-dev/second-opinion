@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr13-m1",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 34812,
+    "request_id": "gen-1789811941-eEeTxD2Yz53NwCfWCtEL",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"security\",\n      \"confidence\": 0.99,\n      \"end_line\": 120,\n      \"explanation\": \"The bundle manifest is treated as trusted input: entry[\\\"image\\\"] is joined directly to bundle and read into memory, then passed to create_document. A manifest can use an absolute path or a path such as ../../secrets.txt, causing the gate to upload and persist arbitrary host files. The same traversal pattern can overwrite fixture images during build_bundle through stem derived from external_id.\",\n      \"file\": \"backend/src/fieldwise/gate/bundle.py\",\n      \"line\": 120,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Resolve candidate paths under the bundle root and reject paths that escape it; constrain generated image names to a safe basename and reject conflicting external IDs.\"\n    ,\n      \"title\": \"Bundle paths permit arbitrary file exfiltration and fixture overwrite\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.94,\n      \"end_line\": 531,\n      \"explanation\": \"The CLI maps each metric with stats.get without checking for an empty result. If run_eval returns no per-field or list statistics while succeeded is nonzero, current contains None for those metrics and compare_to_baseline silently skips them, allowing the gate to pass despite missing score coverage.\",\n      \"file\": \"backend/src/fieldwise/cli.py\",\n      \"line\": 531,\n      \"severity\": \"medium\",\n      \"suggestion\": \"Require at least one per-field or list statistic, or fail when an expected metric is absent instead of converting it to None.\",\n      \"title\": \"Missing per-field/list scores silently bypass the gate\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.89,\n      \"end_line\": 77,\n      \"explanation\": \"The scaling denominator is min(width, height), but downscale_jpeg scales against the maximum edge. For a non-square page, the stored OCR coordinates are scaled differently from the stored image, so replayed extraction sees misaligned OCR boxes. The integration fixture only covers a below-limit image and does not exercise this path.\",\n      \"file\": \"backend/src/fieldwise/gate/bundle.py\",\n      \"line\": 77,\n      \"severity\": \"medium\",\n      \"suggestion\": \"Scale coordinates using the same longest-edge calculation as downscale_jpeg, or preserve original coordinates together with the original image.\",\n      \"title\": \"OCR coordinates are scaled with the wrong image dimension\"\n    }\n  ],\n  \"summary\": \"The change adds a committed, replay-based evaluation gate with a generated bundle and baseline comparison. Its main risks are unvalidated bundle path handling, coordinate corruption for non-square pages, and incomplete metric coverage being accepted as a passing gate.\"\n}",
+    "usage": {
+      "cache_read_tokens": 4096,
+      "cache_write_tokens": 0,
+      "input_tokens": 5347,
+      "output_tokens": 651
+    }
+  }
+}

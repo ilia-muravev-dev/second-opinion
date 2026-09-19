@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr5-m2",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 6197,
+    "request_id": "gen-1789812183-vq4cqWN5oSiSVB8XVtnK",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 231,\n      \"explanation\": \"remap_labels() returns nothing because its final expression is unreturned. The CLI at line 122 always prints `None changed`, and callers such as the test at line 91 cannot observe the actual count.\",\n      \"file\": \"backend/src/fieldwise/documents/cord_import.py\",\n      \"line\": 231,\n      \"severity\": \"medium\"\n    ,\n      \"suggestion\": \"Return `changed` explicitly after `session.flush()`.\"\n    ,\n      \"title\": \"Remap result is always reported as None\"\n    }\n  ],\n  \"summary\": \"The change adds raw CORD annotations, a remapping command, parser and money-normalization fixes, and a v2 OCR-aware prompt/evals. Its main functional defect is that remapping succeeds but reports the wrong result.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 15539,
+      "output_tokens": 232
+    }
+  }
+}

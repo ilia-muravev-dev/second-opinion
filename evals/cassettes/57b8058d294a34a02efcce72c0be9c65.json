@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "single-flight-auth-pr1-m2",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 9742,
+    "request_id": "gen-1789812293-a4dfiEhpalRTBcvV2Cs6",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":98,\"end_line\":110,\"explanation\":\"Line 110 computes `Math.min(0, remainingTime)`, which is always 0 for a live lease. The wait therefore never spans the lease lifetime; every contender repeatedly rewrites the lease at line 105 before the 5\u201315 ms ownership check at line 107. Concurrent `leaseLock` instances can overwrite each other's leases, observe themselves as owners, and enter `fn()` simultaneously. The contention test at cross-tab-lock.test.ts:32 is flaky and does not establish mutual exclusion.\",\"file\":\"src/cross-tab-lock.ts\",\"line\":109,\"severity\":\"high\",\"suggestion\":\"Compute the positive remaining duration (for example, `Math.max(0, current.expiresAt - config.now())`) and wait for that duration or a release signal.\",\"title\":\"Lease wait immediately times out and permits overlapping critical sections\"},{\"category\":\"correctness\",\"confidence\":97,\"end_line\":62,\"explanation\":\"Line 62 accepts any finite number as `expiresAt`, including past timestamps. An expired token can therefore be returned by storage and used for an API request before refresh is triggered. If the project's contract is epoch milliseconds, the test's `expiresAt: 1` at storage.test.ts:35 is itself invalid and masks the bug.\",\"file\":\"src/storage.ts\",\"line\":7,\"severity\":\"high\",\"suggestion\":\"Validate that `expiresAt` is in the future according to the clock used by the client, and make the unit explicit in the type/API.\",\"title\":\"Expired token sets pass validation\"}],\"summary\":\"The change adds cross-tab token storage, broadcast synchronization, single-flight refresh, and Web Locks/localStorage lease locking. Its main risk is that the fallback lease algorithm can allow concurrent refreshes, defeating the protection against rotating-refresh-token races; token validation also permits already-expired credentials.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 12379,
+      "output_tokens": 418
+    }
+  }
+}

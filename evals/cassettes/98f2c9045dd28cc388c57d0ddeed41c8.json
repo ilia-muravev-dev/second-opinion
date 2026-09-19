@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr5-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 13150,
+    "request_id": "gen-1789812167-d5FvF42uy1K2kdVQqwZl",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":99,\"end_line\":231,\"explanation\":\"`remap_labels()` updates only rows whose `source == \\\"dataset\\\"` (lines 219\u2013221). A corrected label can retain `source=\\\"dataset\\\"` when the importer finds an existing row: the upsert changes `data` and `raw` at lines 198\u2013202 but never changes `source`. It will therefore be silently skipped by remapping even though it contains remappable raw data. Either all rows with non-null `raw` should be remapped, or corrected rows must preserve a correction marker that the filter recognizes.\",\"file\":\"backend/src/fieldwise/documents/cord_import.py\",\"line\":220,\"severity\":\"high\",\"suggestion\":\"Base the remap filter on the presence of `raw`, or ensure corrected rows are never classified as source `dataset`.\",\"title\":\"Corrected labels can be skipped by remapping\"},{\"category\":\"correctness\",\"confidence\":99,\"end_line\":31,\"explanation\":\"The prompt declares that a period or comma between groups of three digits is always a thousands separator (line 5), but the added parser tests require `Rp. 111,000` to become 111000 (line 20). Under the stated rule, `111,000` should be interpreted as 111000000, so the prompt and parser disagree on the same input. This can make model outputs fail evaluation or normalize printed amounts incorrectly.\",\"file\":\"backend/tests/unit/test_values.py\",\"line\":20,\"severity\":\"high\",\"suggestion\":\"Define separator precedence explicitly\u2014e.g. treat the final separator as decimal when it is followed by one or two digits, otherwise as thousands\u2014and make the prompt and tests use the same rule.\",\"title\":\"Prompt and parser disagree on separator semantics\"},{\"category\":\"correctness\",\"confidence\":98,\"end_line\":123,\"explanation\":\"`map_gt_parse()` now uses `price` only when `_money(raw.get(\\\"price\\\"))` returns a value (lines 121\u2013123). Invalid values such as `\\\"\\\"`, `\\\"free\\\"`, or `\\\"Rp.\\\"` therefore produce `None` even when a valid `itemsubtotal` is available. The condition should be `if line_total is None and raw.get(\\\"price\\\") is None`, or the fallback should run whenever `price` is absent or unparseable.\",\"file\":\"backend/src/fieldwise/documents/cord_import.py\",\"line\":122,\"severity\":\"medium\",\"suggestion\":\"Fall back when `price` is absent or fails parsing, while preserving the intended behavior for an explicit numeric zero.\",\"title\":\"Invalid price suppresses a valid item-subtotal fallback\"}],\"summary\":\"The change adds raw CORD annotations and a remapping command, adjusts money and line-item parsing, and introduces a v2 OCR-aware prompt with evaluation artifacts. The main risks are an incomplete remap predicate, contradictory amount-separator semantics, and a fallback that mishandles invalid prices.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 15540,
+      "output_tokens": 661
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "single-flight-auth-pr6-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 12096,
+    "request_id": "gen-1789812318-XLoEuMhFetTwvBXrQ8XQ",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"data\",\"confidence\":99,\"end_line\":208,\"explanation\":\"`dispose()` closes the channel while refresh operations and unawaited channel handlers may still be running. `adopt`, `forget`, and `loseSession` can subsequently call `storage.set/clear`, `emit`, and `channel.post` after the client has been disposed, and the lock callback can still invoke `options.refresh`. Thus disposal neither cancels in-flight work nor prevents post-disposal storage/notification side effects.\",\"file\":\"src/client.ts\",\"line\":203,\"severity\":\"high\",\"suggestion\":\"Track in-flight operations and make `dispose()` await their completion before closing the channel and clearing listeners; guard channel handlers and storage callbacks against the disposed state. If cancellation is not supported, document the async lifecycle and expose an async `dispose()`.\",\"title\":\"Dispose does not stop or await in-flight authentication work\"},{\"category\":\"correctness\",\"confidence\":94,\"end_line\":176,\"explanation\":\"The 401 retry always calls `refreshTokens('unauthorized', tokens)` even when `attachToken` returns `null` and leaves the original request unauthenticated. A stale token then produces a second 401 and the library performs an unnecessary refresh instead of obtaining a token for the first request. The same issue applies to custom `attachToken` implementations that intentionally omit the header.\",\"file\":\"src/client.ts\",\"line\":168,\"severity\":\"medium\",\"suggestion\":\"Only perform the 401 token refresh when the initial request actually included the bearer token. If the custom hook omitted it, return the first response or make the contract require token attachment.\",\"title\":\"401 retry refreshes even when no bearer token was sent\"},{\"category\":\"correctness\",\"confidence\":99,\"end_line\":126,\"explanation\":\"The refresh callback is invoked before `isTokenSet(tokens)` validates its return value. A custom `refresh` implementation can therefore issue a network request or perform other side effects with invalid `previous` data supplied by a rogue `tokens` channel message, even though the result is discarded.\",\"file\":\"src/client.ts\",\"line\":120,\"severity\":\"medium\",\"suggestion\":\"Validate the refresh result before invoking the callback, or validate channel messages before allowing them to influence refresh input.\",\"title\":\"Refresh side effects occur before validating the refresh result\"}],\"summary\":\"Adds a cross-tab-aware authentication client with token storage, refresh single-flight, fetch retry, and channel messaging. The main risks are unsafe asynchronous disposal, an incorrect 401 retry path for requests that were not actually authenticated, and unvalidated channel data reaching the refresh callback.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 12604,
+      "output_tokens": 554
+    }
+  }
+}

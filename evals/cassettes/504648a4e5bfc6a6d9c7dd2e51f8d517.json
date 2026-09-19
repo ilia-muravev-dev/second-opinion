@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr10-m3",
+    "chunk": "2/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 9626,
+    "request_id": "gen-1789811920-tZnlnBnQQQ1LI8ohUlEk",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":0.96,\"end_line\":169,\"explanation\":\"`parseDraft` does not convert boolean inputs to booleans. For example, `parseDraft('false', 'boolean')` returns the non-empty string `'false'`, and later `Boolean('false')` is `true`; any text other than `true`, `yes`, or `1` is likewise accepted as truthy. Saving such a draft can therefore mark a boolean field as true when the reviewer entered false.\",\"file\":\"web/src/lib/fields.ts\",\"line\":168,\"severity\":\"high\",\"suggestion\":\"Return an actual boolean for the boolean matcher, including `false`/`no`/`0`, and return `null` for unrecognized values.\",\"title\":\"Boolean drafts are parsed as truthy strings\"},{\"category\":\"correctness\",\"confidence\":0.92,\"end_line\":166,\"explanation\":\"The integer parser permits non-integral input: `parseDraft('2.5', 'integer')` becomes `2` because `parseInt` truncates it. A reviewer intending 2.5 would save an incorrect value, and malformed numeric text can also be accepted when it begins with a valid integer.\",\"file\":\"web/src/lib/fields.ts\",\"line\":165,\"severity\":\"medium\",\"suggestion\":\"Reject values that are not valid integers instead of truncating them with `parseInt`.\",\"title\":\"Integer draft parsing truncates decimal input\"},{\"category\":\"correctness\",\"confidence\":0.96,\"end_line\":123,\"explanation\":\"`setAtPath` can leave `cursor` as `null` after creating a nested container. For `setAtPath({ line_items: null }, 'line_items[0].name', 'B')`, it creates `line_items: []` but then tries to assign through null, throwing `TypeError` instead of updating the missing list.\",\"file\":\"web/src/lib/fields.ts\",\"line\":121,\"severity\":\"medium\",\"suggestion\":\"After creating a container, update `cursor` to that new array or object before processing the next token.\",\"title\":\"Path updates fail when a parent is null\"}],\"summary\":\"Adds the document/review web UI, typed API and React Query hooks, shared components, and field formatting/editing helpers. The main risks are incorrect draft parsing and path updates that can save wrong values or throw while editing extraction results.\"}",
+    "usage": {
+      "cache_read_tokens": 28352,
+      "cache_write_tokens": 0,
+      "input_tokens": 15,
+      "output_tokens": 509
+    }
+  }
+}

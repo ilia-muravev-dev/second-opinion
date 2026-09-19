@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr15-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 20549,
+    "request_id": "gen-1789812007-9thig5kzxnEDZ2edbbjo",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"data\",\"confidence\":99,\"end_line\":0,\"explanation\":\"The repair in `provider.complete` may return an `LLMError` object instead of raising, and `_execute` currently passes every item to `finish_extraction`. An `LLMError` has no `text` or `usage`, so `finish_extraction` can fail with an attribute error before repairs are detected. The failed repair then leaves the first extraction succeeded despite the repair never running, so `_execute` should classify `LLMError` outcomes or `finish_extraction` must handle them explicitly.\",\"file\":\"backend/src/fieldwise/evals/runner.py\",\"line\":262,\"severity\":\"high\",\"suggestion\":\"Classify LLMError responses before calling finish_extraction, or make finish_extraction handle LLMError as a failed round.\" ,\"title\":\"LLMError responses crash eval repair processing\"}]\n \n   ,\"summary\":\"The change adds v4 receipt extraction with evidence output, arithmetic consistency checking, and one repair round; usage is accumulated and successful repairs replace the first result. The main risks are the new schema contract and repair/failure behavior.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 9963,
+      "output_tokens": 245
+    }
+  }
+}

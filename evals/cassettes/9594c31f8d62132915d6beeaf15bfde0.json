@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr10-clean",
+    "chunk": "1/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 29142,
+    "request_id": "gen-1789811788-XP1g43RkikRsLrwrxKlm",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":0.96,\"end_line\":10,\"explanation\":\"`startEditing` initializes drafts only from scalar leaves, but `saveCorrection` iterates over those same scalar leaves and applies each update to `structuredClone(run.data?.result ?? golden ?? {})`. A correction therefore drops every array-valued field, and any scalar field omitted from the edited view, from the saved golden label.\",\"file\":\"web/src/app/documents/[id]/review.tsx\",\"line\":71,\"severity\":\"high\",\"suggestion\":\"Build the saved value from the complete source tree and apply edits by schema path without relying on the scalar-only draft keys, or explicitly preserve all untouched array-valued paths.\",\"title\":\"Saving a scalar correction removes list-valued fields\"},{\"category\":\"correctness\",\"confidence\":0.95,\"end_line\":52,\"explanation\":\"The upload filter maps `upload` to `split: undefined`, so the API returns every split and the client filters only the current page. If the first 25 documents contain few uploads, the upload tab can show fewer than 25 results and omit later uploads; its total and pagination also describe the unfiltered response.\",\"file\":\"web/src/app/documents/page.tsx\",\"line\":34,\"severity\":\"high\",\"suggestion\":\"Pass a server-supported upload split/source filter, or paginate the source-filtered results after the API query.\",\"title\":\"Upload tab paginates before filtering\"},{\"category\":\"correctness\",\"confidence\":0.9,\"end_line\":52,\"explanation\":\"`Math.max(1, Number(...))` silently converts malformed or empty page parameters to page 1. For example, `?page=2x` requests offset 25 rather than the first page, producing empty rows and incorrect pagination while the URL still says page 1.\",\"file\":\"web/src/app/documents/page.tsx\",\"line\":31,\"severity\":\"medium\",\"suggestion\":\"Accept only a finite positive integer; otherwise normalize to 1 or report the invalid parameter.\",\"title\":\"Malformed page parameters request arbitrary offsets\"}],\"summary\":\"Adds a Next.js review and evaluation UI, typed API-client generation, local/container tooling, and CI checks. The main risks are incorrect golden-label persistence, inaccurate upload pagination, and malformed pagination input.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 29467,
+      "output_tokens": 479
+    }
+  }
+}

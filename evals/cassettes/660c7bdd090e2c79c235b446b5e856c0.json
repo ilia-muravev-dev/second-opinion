@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr6-m3",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 6632,
+    "request_id": "gen-1789812200-0tzRXYcQYidDQrOlOf1p",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":0.99,\"end_line\":36,\"explanation\":\"FastEmbedder.embed returns immediately for every non-empty batch because `if texts` is the wrong condition. CLI embedding and on-demand few-shot retrieval therefore store/use no embeddings; retrieval falls back to empty examples unless an embedder is supplied, and `embed --force` still counts documents as embedded.\",\"file\":\"backend/src/fieldwise/retrieval/embeddings.py\",\"line\":36,\"severity\":\"high\",\"suggestion\":\"Embed when `texts` is non-empty, e.g. `if not texts: return []`.\",\"title\":\"FastEmbedder skips every non-empty batch\"}],\"summary\":\"Adds OCR-text few-shot retrieval and prompt v3, but the embedding implementation currently prevents the feature from functioning.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 7876,
+      "output_tokens": 171
+    }
+  }
+}

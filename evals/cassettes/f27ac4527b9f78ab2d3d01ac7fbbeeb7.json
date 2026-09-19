@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "single-flight-auth-pr1-m1",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 21008,
+    "request_id": "gen-1789812272-IeYy98EtDqvDprXUnKmY",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 19,\n      \"explanation\": \"The unsubscribe function returned by noopChannel.subscribe is inert: it creates an arrow function but never returns it. Consequently, an unsubscribe call cannot remove a listener from any channel resolved from `false`.\",\n      \"file\": \"src/broadcast.ts\",\n      \"line\": 18,\n      \"severity\": \"medium\"\n    ,\n      \"suggestion\": \"Return the no-op function directly: `subscribe() { return () => {}; }`.\"\n    ,\n      \"title\": \"No-op channel unsubscribe never unregisters\"\n    }\n  ,\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 110,\n      \"explanation\": \"After acquiring the lease, the code sleeps but never verifies that `config.leaseTtlMs` is positive. A non-positive TTL expires immediately, allowing another waiter to overwrite the lease before `fn()` runs; both callers can then execute concurrently. It also causes `waitForRelease` to use a zero timeout and spin continuously.\",\n      \"file\": \"src/cross-tab-lock.ts\",\n      \"line\": 105,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Reject non-finite or non-positive TTLs when constructing the lock, or clamp them to a safe minimum before scheduling the lease expiry.\"\n    ,\n      \"title\": \"Non-positive lease TTL permits concurrent critical sections\"\n    }\n  ,\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.97,\n      \"end_line\": 107,\n      \"explanation\": \"The five-to-fifteen millisecond ownership check does not establish that the lease remains valid for the entire critical section. If `fn()` lasts longer than `leaseTtlMs`, another waiter can acquire and overwrite the lease while the first caller is still running; both then execute concurrently. This is especially unsafe for network refreshes whose latency is not bounded by the configured TTL.\",\n      \"file\": \"src/cross-tab-lock.ts\",\n      \"line\": 107,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Renew the lease while `fn()` is active, or choose and enforce a TTL longer than the maximum critical-section duration. Renewal still needs fencing if storage is shared with untrusted writers.\"\n    ,\n      \"title\": \"Lease can expire while the protected operation is still running\"\n    }\n  ,\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.96,\n      \"end_line\": 115,\n      \"explanation\": \"`release` only checks that the current lease has the local owner before deleting it. If another waiter acquired the same owner ID and overwrote the lease, a delayed release from the first waiter can delete that newer lease. The randomized fallback can generate the same ID in separate tabs, and a stale tab can also own the same ID after restoring a prior storage state.\",\n      \"file\": \"src/cross-tab-lock.ts\",\n      \"line\": 115,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Use unique, non-replayable ownership across tabs and a compare-and-swap-capable primitive for release. The current localStorage protocol cannot safely prevent this class of overwrite.\"\n    ,\n      \"title\": \"A stale owner can delete a newer lease with the same ID\"\n    }\n  ]\n,\n  \"summary\": \"The change adds token storage adapters, BroadcastChannel synchronization, single-flight execution, and cross-tab refresh locking, then exports them publicly. The main risk is that the cooperative localStorage lease can still allow overlapping refreshes when its TTL is invalid, the operation outlives the lease, or ownership is replayed.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 12378,
+      "output_tokens": 882
+    }
+  }
+}

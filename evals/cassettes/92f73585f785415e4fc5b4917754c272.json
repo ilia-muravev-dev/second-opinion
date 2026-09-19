@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr4-clean",
+    "chunk": "2/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 30051,
+    "request_id": "gen-1789812113-dYwms53KzaPLeqiTorEh",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":0.92,\"end_line\":120,\"explanation\":\"`render_comparison([run, run])` uses the same run object and name twice. The test only verifies that duplicate headers are rendered; it does not exercise comparison or delta calculations between different runs, so regressions in the core comparison behavior could pass.\",\"file\":\"backend/tests/unit/test_matchers.py\",\"line\":119,\"severity\":\"medium\",\"suggestion\":\"Render at least two runs with different outcomes and assert the expected per-run metrics or deltas.\",\"title\":\"Comparison test does not compare distinct runs\"}],\"summary\":\"The change adds receipt extraction evaluation, grading metrics, reporting, integration tests, and a baseline result. The primary risk is insufficient coverage of report comparison logic: the only comparison test supplies the identical run twice.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 11863,
+      "output_tokens": 176
+    }
+  }
+}

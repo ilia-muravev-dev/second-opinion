@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr2-m2",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 12573,
+    "request_id": "gen-1789812060-cSaZeVkPqpjSJTRySnzF",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 136,\n      \"explanation\": \"The first lookup predicate uses `!=` rather than `==`. For any row whose `external_id` is not an exact match, the predicate is true and that row is returned regardless of its name; the UUID fallback is therefore skipped and `ocr show` can display the wrong document. It also returns arbitrary rows for a nonexistent external id instead of reaching the id lookup.\",\n      \"file\": \"backend/src/fieldwise/cli.py\",\n      \"line\": 136,\n      \"severity\": \"high\",\n      \"suggestion\": \"Use `Document.external_id == document` in the name/external-id lookup, and avoid `session.get()` for malformed UUIDs or query the UUID column directly.\"\n    ,\n      \"title\": \"`ocr show` looks up almost every document as an external-id match\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.96,\n      \"end_line\": 84,\n      \"explanation\": \"`word_results` is not indexed by line index. RapidOCR returns a flat word-result list whose entries are not guaranteed to align with `output.boxes` when a line has no word boxes or when several lines share one result group. This can attach the wrong words to a span or omit the correct words, corrupting the stored highlight boxes.\",\n      \"file\": \"backend/src/fieldwise/documents/ocr.py\",\n      \"line\": 84,\n      \"severity\": \"medium\",\n      \"suggestion\": \"Group `output.word_results` by its actual line index, or validate the provider's grouping contract before assigning words.\"\n    ,\n      \"title\": \"Flat word results can be attached to the wrong OCR span\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.92,\n      \"end_line\": 117,\n      \"explanation\": \"The grouping algorithm compares each span only with the running center of the previous line. A sequence of spans whose centers drift by less than the tolerance at each step can accumulate enough drift to put text from different physical lines together. The resulting `ocr_text` and prompt content can therefore have incorrect reading order.\",\n      \"file\": \"backend/src/fieldwise/documents/ocr.py\",\n      \"line\": 117,\n      \"severity\": \"medium\",\n      \"suggestion\": \"Group by a stable vertical reference or merge lines using overlap/tolerance against the actual line geometry rather than only the running mean.\"\n    ,\n      \"title\": \"Reading-order grouping can merge distinct lines after vertical drift\"\n    }\n  ],\n  \"summary\": \"The change adds a RapidOCR-based OCR pipeline, CLI commands for running and inspecting OCR, persistence of OCR text and word boxes, and related tests. The main risks are incorrect document lookup in `ocr show` and unreliable association/order of OCR words and lines.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 7942,
+      "output_tokens": 685
+    }
+  }
+}

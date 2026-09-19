@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr10-m1",
+    "chunk": "2/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 5563,
+    "request_id": "gen-1789811875-OHAk6viHN8PNQuKfoEqx",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.98,\n      \"end_line\": 121,\n      \"explanation\": \"The `money` and `number` branches in `parseDraft` remove every character except digits, dots, and hyphens before calling `Number`. A negative currency value such as `-$10.00` therefore becomes `--10.00`, which `Number` rejects and the function converts to `null`. Reviewers cannot save valid negative monetary or numeric values.\",\n      \"file\": \"web/src/lib/fields.ts\",\n      \"line\": 161,\n      \"severity\": \"medium\"\n    ,\n      \"suggestion\": \"Parse the numeric value without discarding the currency sign, or strip a leading currency symbol before retaining the optional minus sign.\"\n    ,\n    \"title\": \"Negative monetary values cannot be saved\"\n    }\n  ],\n  \"summary\": \"The change adds the Fieldwise web UI, API hooks, shared formatting and field-editing helpers, Base UI components, and focused tests. The main risk is data loss while correcting extracted values, particularly valid negative monetary values.\"\n}",
+    "usage": {
+      "cache_read_tokens": 28352,
+      "cache_write_tokens": 0,
+      "input_tokens": 15,
+      "output_tokens": 271
+    }
+  }
+}

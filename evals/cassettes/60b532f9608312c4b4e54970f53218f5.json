@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "single-flight-auth-pr6-m1",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 10590,
+    "request_id": "gen-1789812330-r04JXqUjCI0Cb2iFRovB",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":98,\"end_line\":200,\"explanation\":\"`subscribe()` adds the listener but only creates an arrow function at line 198 without returning it. Callers therefore cannot unsubscribe, so removed listeners remain in the `Set` and continue receiving token updates, causing stale callbacks and unbounded retention.\",\"file\":\"src/client.ts\",\"line\":198,\"severity\":\"high\",\"suggestion\":\"Return the unsubscribe closure, e.g. `return () => listeners.delete(listener);`.\",\"title\":\"Subscriptions cannot be unsubscribed\"},{\"category\":\"correctness\",\"confidence\":97,\"end_line\":147,\"explanation\":\"`fetch()` does not call `assertUsable()` before its first `await currentTokens()` at line 171. A client disposed while that call is pending can subsequently send a request with a token obtained before disposal, so `dispose()` does not reliably stop in-flight authentication activity.\",\"file\":\"src/client.ts\",\"line\":171,\"severity\":\"medium\",\"suggestion\":\"Call `assertUsable()` immediately before sending and, where supported, abort the request when disposed.\",\"title\":\"Disposal does not stop an in-flight fetch\"}],\"summary\":\"The change adds a cross-tab-aware auth client with token storage, refresh single-flight behavior, fetch retry, broadcasts, and tests. Its main risks are lifecycle handling and cross-tab concurrency.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 12603,
+      "output_tokens": 301
+    }
+  }
+}

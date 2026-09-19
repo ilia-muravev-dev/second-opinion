@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr15-m2",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 7234,
+    "request_id": "gen-1789812028-DAqCVcTupw0C9K5KaaTC",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 263,\n      \"explanation\": \"The first extraction is finished with `batch_pricing=config.mode != \\\"batch\\\"`, while the repair uses `config.mode == \\\"batch\\\"`; these conditions are exact opposites. Thus each mode assigns the wrong pricing treatment, so the calculated cost is inverted for both initial and repair calls.\",\n      \"file\": \"backend/src/fieldwise/evals/runner.py\",\n      \"line\": 262,\n      \"severity\": \"medium\"\n    ,\n      \"suggestion\": \"Use `config.mode == \\\"batch\\\"` for both calls, as the repair already does.\"\n    ,\n      \"title\": \"Batch-pricing flag is inverted for eval extractions\"\n    }\n  ],\n  \"summary\": \"The change adds a v4 receipt-extraction path that requests field-level evidence, checks line-item arithmetic, and performs one repair round when needed. Its main risk is incorrect evaluation pricing because the batch-pricing flag is inverted.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 9963,
+      "output_tokens": 254
+    }
+  }
+}

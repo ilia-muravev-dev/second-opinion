@@ -23,6 +23,6 @@ jobs:
       - uses: ./
         with:
           provider: openai
-          model: ${{ vars.SO_MODEL || 'deepseek/deepseek-v4-flash-0731:free' }}
+          model: ${{ vars.SO_MODEL || 'nex-agi/nex-n2.5-pro:free' }}
           openai-api-key: ${{ secrets.OPENROUTER_API_KEY }}
           prompt: ${{ vars.SO_PROMPT_VERSION || 'v1' }}

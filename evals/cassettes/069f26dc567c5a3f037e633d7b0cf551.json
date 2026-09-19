@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr2-m1",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 7832,
+    "request_id": "gen-1789812059-3nlQq0B8AleMQSiM2vNA",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.98,\n      \"end_line\": 44,\n      \"explanation\": \"`force=True` inverts the intended semantics: the query at line 44 excludes documents already marked done, so `ocr run --force` cannot re-run OCR on completed documents and instead targets pending or failed documents. This directly contradicts the option's documented behavior.\",\n      \"file\": \"backend/src/fieldwise/documents/ocr_service.py\",\n      \"line\": 44,\n      \"severity\": \"medium\"\n    ,\n      \"suggestion\": \"When force is true, do not filter by ocr_status; otherwise filter for `ocr_status != \\\"done\\\"`.\"\n    ,\n      \"title\": \"`--force` skips completed documents\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.97,\n      \"end_line\": 33,\n      \"explanation\": \"The exception handler at line 29 assigns only `ocr_status = \\\"failed\\\"` before re-raising. In `ocr_run`, that exception occurs before the commit at line 120, so the failed status is not persisted and the command exits without the promised final failure report. The integration test only inspects the in-memory ORM object and therefore misses this.\",\n      \"file\": \"backend/src/fieldwise/documents/ocr_service.py\",\n      \"line\": 29,\n      \"severity\": \"medium\",\n      \"suggestion\": \"Do not re-raise after marking the row failed, or persist and report the failed status in the CLI's exception path.\"\n    ,\n      \"title\": \"OCR failures are not persisted\"\n    }\n  ],\n  \"summary\": \"Adds a RapidOCR-backed document OCR pipeline, CLI commands, persistence of OCR text and word spans, and related tests. The main risks are incorrect force-query semantics and failed OCR status not being committed.\"\n}",
+    "usage": {
+      "cache_read_tokens": 4096,
+      "cache_write_tokens": 0,
+      "input_tokens": 3845,
+      "output_tokens": 445
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr4-m2",
+    "chunk": "2/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 31960,
+    "request_id": "gen-1789812151-OSscvNkwNdYcSY1xXXdG",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":0.94,\"end_line\":57,\"explanation\":\"The `batch` branch explicitly records no per-request latency, so `run.p50_ms` is always `None` even though the report still renders a latency row. This makes the batch report's latency output misleading rather than indicating that latency was not measured.\",\"file\":\"backend/tests/integration/test_eval_runner.py\",\"line\":57,\"severity\":\"medium\",\"suggestion\":\"Either collect request latency in batch mode or mark the latency row as unavailable instead of reporting `None` as a latency result.\",\"title\":\"Batch reports discard measurable request latency\"},{\"category\":\"correctness\",\"confidence\":0.93,\"end_line\":17,\"explanation\":\"The `card_paid` field uses the `money` matcher, but its reported values are booleans (`true`/`false`). The documented money normalization is not a defined boolean comparison, so the grader can classify valid boolean predictions as wrong or raise during comparison. The oracle test does not cover this field; it only asserts that the `total` leaf is correct.\",\"file\":\"docs/evals/2026-09-18-v1-nex-agi-nex-n2.5-pro-free-37d35c46.json\",\"line\":17,\"severity\":\"medium\",\"suggestion\":\"Assign `card_paid` a boolean matcher or explicitly define and test its normalization and comparison semantics.\",\"title\":\"Boolean field is graded with the money matcher\"}],\"summary\":\"The change adds an extraction evaluation runner, graders, tests, an ADR, and a baseline report. The main risks are misleading batch latency reporting and a likely type/matcher mismatch for the boolean `card_paid` field.\"}",
+    "usage": {
+      "cache_read_tokens": 11840,
+      "cache_write_tokens": 0,
+      "input_tokens": 23,
+      "output_tokens": 368
+    }
+  }
+}

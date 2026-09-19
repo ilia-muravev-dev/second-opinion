@@ -203,3 +203,30 @@ def test_cassette_records_and_replays(tmp_path: Path) -> None:
                 model="m", system="s", user="u", output_schema={}, cache_key={"case": "other"}
             )
         )
+
+
+def test_percent_confidences_and_loose_labels_are_normalised() -> None:
+    output = parse_output(
+        json.dumps(
+            {
+                "findings": [
+                    finding(confidence=98, severity="High", category="Error handling"),
+                    finding(confidence=0.4, category="bug"),
+                ],
+                "summary": "",
+            }
+        )
+    )
+    assert [f.confidence for f in output.findings] == [0.98, 0.4]
+    assert output.findings[0].severity == "high"
+    assert output.findings[0].category == "error_handling"
+    assert output.findings[1].category == "correctness"
+
+
+def test_truncated_json_keeps_the_complete_findings() -> None:
+    complete = json.dumps({"findings": [finding(title="one"), finding(title="two")]})
+    cut = complete[: complete.rfind('"title": "two"') + 10]  # mid second object
+    output = parse_output(cut)
+    assert [f.title for f in output.findings] == ["one"]
+    with pytest.raises(ValueError, match="did not return JSON"):
+        parse_output("nothing here")

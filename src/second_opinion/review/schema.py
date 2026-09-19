@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from second_opinion.findings import Category, Severity
 
@@ -34,6 +34,29 @@ class ModelFinding(BaseModel):
     explanation: str
     suggestion: str | None = None
     confidence: float = Field(ge=0, le=1)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def percent_to_fraction(cls, value: object) -> object:
+        """Models write 98 for 0.98 often enough to accept it."""
+        if isinstance(value, int | float) and 1 < value <= 100:
+            return value / 100
+        return value
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def lowercase_severity(cls, value: object) -> object:
+        return value.lower() if isinstance(value, str) else value
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def normalise_category(cls, value: object) -> object:
+        if isinstance(value, str):
+            lowered = value.lower().replace("-", "_").replace(" ", "_")
+            return {"bug": "correctness", "logic": "correctness", "error": "error_handling"}.get(
+                lowered, lowered
+            )
+        return value
 
 
 class ReviewOutput(BaseModel):

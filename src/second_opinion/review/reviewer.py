@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -58,12 +59,37 @@ def build_user_message(chunk: Chunk, context: ReviewContext, prompt_version: str
     return "\n\n".join(parts)
 
 
+def salvage_findings(text: str) -> list[Any] | None:
+    """When the JSON is cut off mid-way, keep the finding objects that are complete."""
+    start = text.find("[")
+    if start < 0:
+        return None
+    decoder = json.JSONDecoder()
+    position = start + 1
+    found: list[Any] = []
+    while True:
+        while position < len(text) and text[position] in " \n\r\t,":
+            position += 1
+        if position >= len(text) or text[position] != "{":
+            break
+        try:
+            item, end = decoder.raw_decode(text, position)
+        except json.JSONDecodeError:
+            break
+        found.append(item)
+        position = end
+    return found or None
+
+
 def parse_output(text: str) -> ReviewOutput:
     try:
         data = json.loads(text)
     except json.JSONDecodeError as error:
-        msg = f"the model did not return JSON: {error}"
-        raise ValueError(msg) from error
+        salvaged = salvage_findings(text)
+        if salvaged is None:
+            msg = f"the model did not return JSON: {error}"
+            raise ValueError(msg) from error
+        data = {"findings": salvaged, "summary": ""}
     if isinstance(data, list):  # some models answer with the findings array alone
         data = {"findings": data, "summary": ""}
     try:

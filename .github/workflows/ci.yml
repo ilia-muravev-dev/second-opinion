@@ -26,3 +26,6 @@ jobs:
       - run: uv run pytest --cov --cov-report=term-missing
       - name: The committed eval index matches a fresh build
         run: uv run second-opinion eval build --check
+      - name: Eval gate — the baseline run re-scored from recorded responses
+        run: |
+          if [ -f evals/baseline.json ]; then uv run second-opinion gate check; else echo "no baseline yet"; fi

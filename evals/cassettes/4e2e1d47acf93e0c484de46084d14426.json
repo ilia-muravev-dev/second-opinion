@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr2-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 4559,
+    "request_id": "gen-1789812054-8IVIotdoZi09KUw3rG4U",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 16,\n      \"explanation\": \"The document is marked done before the database transaction commits. If commit raises, the in-session row remains `ocr_status == \\\"done\\\"`, so the next `pending_documents()` query excludes it and `ocr_run()` reports success despite persisting no OCR result.\",\n      \"file\": \"backend/src/fieldwise/documents/ocr_service.py\",\n      \"line\": 16,\n      \"severity\": \"high\",\n      \"suggestion\": \"Commit before assigning the terminal done status, or roll back/reset the in-memory row when commit fails.\"\n    ,\n      \"title\": \"Failed commits can strand documents as done\"\n    }\n  ],\n  \"summary\": \"The change adds a RapidOCR-backed document OCR command, persistence of OCR text and word boxes, and related tests. Its main risk is terminal state being applied before the database commit succeeds.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 7942,
+      "output_tokens": 234
+    }
+  }
+}

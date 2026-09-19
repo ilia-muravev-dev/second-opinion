@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr1-m1",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 334019,
+    "request_id": "gen-1789811683-XIqJfNz7rQNSk4QdAAjM",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "error",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":92,\"end_line\":65,\"explanation\":\"`_parse_money_text` treats any single separator followed by exactly three digits as a grouping separator. Thus `0.123` becomes `123` and `1.234` becomes `1234`, even though the documented decimal-separator cases imply `0.123` and `1.234`. The importer converts these incorrect values to floats, so affected golden totals and line prices are permanently corrupted.\",\"file\":\"backend/src/fieldwise/values.py\",\"line\":51,\"severity\":\"high\",\"suggestion\":\"Disambiguate single three-digit groups using the raw amount or locale; otherwise treat them as decimals rather than thousands.\" ,\"title\":\"Single three-digit amounts are parsed as thousands\"},{\"category\":\"correctness\",\"confidence\":95,\"end_line\":35,\"explanation\":\"`create_document` returns as soon as a row with the same SHA-256 exists, without checking that its storage_key still points to an existing object. If the original blob was deleted while the database row remained, every retry is skipped and no replacement is uploaded, leaving an unrecoverable document record.\",\"file\":\"backend/src/fieldwise/documents/service.py\",\"line\":32,\"severity\":\"high\",\"suggestion\":\"Verify `storage.exists(existing.storage_key)` before reusing a deduplicated row, and repair or re-upload when it is missing.\" ,\"title\":\"Deduplication can preserve a dangling document record\"},{\"category\":\"security\",\"confidence\":97,\"end_line\":61,\"explanation\":\"The S3 client is created without credentials, region, or an explicit trust boundary. If runtime credentials are absent, boto3 can resolve the default credential chain and contact the local ECS/EC2 metadata service. This is especially risky for CLI commands such as `schemas show` and `db upgrade`, which do not use storage but still import and instantiate `get_storage()` at module import.\",\"file\":\"backend/src/fieldwise/storage.py\",\"line\":61,\"severity\":\"high\",\"suggestion\":\"Fail closed when S3 credentials are unavailable and avoid constructing the client for commands that do not need storage; otherwise configure credentials and region explicitly.\" ,\"title\":\"S3 initialization can expose the default credential chain\"},{\"category\":\"correctness\",\"confidence\":88,\"end_line\":72,\"explanation\":\"`LocalStorage._path` rejects a key that resolves exactly to the storage root because it only checks `root not in path.parents`. A caller can therefore address the root directory itself; `put` then writes the temporary file and atomically replaces the entire storage directory with a file, destroying all stored documents.\",\"file\":\"backend/src/fieldwise/storage.py\",\"line\":34,\"severity\":\"high\",\"suggestion\":\"Require the resolved path to be strictly below the root, not merely a descendant or the root itself.\" ,\"title\":\"The storage root can be overwritten as a file\"},{\"category\":\"correctness\",\"confidence\":96,\"end_line\":24,\"explanation\":\"`sniff_mime` accepts any image format Pillow can decode, but `render_pages` only accepts JPEG, PNG, WebP, and TIFF. A valid BMP or GIF therefore passes sniffing and then raises `UnsupportedDocumentError` with the misleading message `unsupported document type`; the two functions do not implement the same supported-format contract.\",\"file\":\"backend/src/fieldwise/documents/render.py\",\"line\":36,\"severity\":\"medium\",\"suggestion\":\"Either restrict `sniff_mime` to the supported formats or add the corresponding MIME values to `IMAGE_MIMES`.\" ,\"title\":\"MIME sniffing accepts formats that rendering rejects\"},{\"category\":\"correctness\",\"confidence\":89,\"end_line\":125,\"explanation\":\"The array compiler records only the immediate child names as `line_items[].name`, `line_items[].quantity`, and so on. For a nested object item such as `{\\\"address\\\":{\\\"city\\\":\\\"...\\\"}}`, the metadata omits the addressable leaf `line_items[].address.city`, so UI and matcher code consuming `field_meta` cannot address all schema fields.\",\"file\":\"backend/src/fieldwise/schemas/compiler.py\",\"line\":114,\"severity\":\"medium\",\"suggestion\":\"Populate array-item children recursively, including nested object leaves.\" ,\"title\":\"Nested array-object fields are omitted from metadata\"}],\"summary\":\"This change adds synchronous Postgres/pgvector persistence, Alembic migrations, built-in",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 21397,
+      "output_tokens": 1060
+    }
+  }
+}

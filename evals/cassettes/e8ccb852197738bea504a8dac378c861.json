@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr5-m1",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 10204,
+    "request_id": "gen-1789812181-F6j7Q6BerB5UDJpRHneR",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 121,\n      \"explanation\": \"The command declares a missing-schema branch at line 120 but has no statement between it and line 121. After `get_schema` returns `None`, execution passes that branch and calls `remap_labels(session, schema_row)`, where `schema.id` raises `AttributeError` instead of reporting the missing schema cleanly.\",\n      \"file\": \"backend/src/fieldwise/cli.py\",\n      \"line\": 121,\n      \"severity\": \"medium\"\n    ,\n      \"suggestion\": \"Return, raise a user-facing error, or otherwise handle the `None` case before calling `remap_labels`.\"\n    ,\n      \"title\": \"Missing schema handling falls through into an invalid call\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 231,\n      \"explanation\": \"`remap_labels` loads all matching labels into memory at lines 218-222 and then mutates every row before one `flush` at line 231. A large schema can therefore consume substantial memory and create a long-lived transaction that holds locks and stalls the commit; the function also offers no batching or chunking.\",\n      \"file\": \"backend/src/fieldwise/documents/cord_import.py\",\n      \"line\": 231,\n      \"severity\": \"medium\"\n    ,\n      \"suggestion\": \"Process rows in bounded batches and flush/commit incrementally, or use a database-side update path.\"\n    ,\n      \"title\": \"Full remap is unbounded and transaction-heavy\"\n    }\n  ],\n  \"summary\": \"The change adds raw golden annotations plus a label-remapping command, improves receipt amount parsing, and introduces a v2 OCR-aware prompt with evaluation artifacts. The main risks are the CLI's missing-schema crash and the potentially expensive whole-dataset remap.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 15514,
+      "output_tokens": 471
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr17-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 8047,
+    "request_id": "gen-1789812045-tyem3tFky199KX22suOG",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"performance\",\"confidence\":98,\"end_line\":13,\"explanation\":\"The wait targets the first element whose exact text is `succeeded`, but this diff shows no wait for OCR or extraction completion. The script can therefore capture the document page while OCR/extraction is still pending, making the generated README screenshot nondeterministic and potentially unrelated to the requested document.\",\"file\":\"web/scripts/readme-shots.mjs\",\"line\":13,\"severity\":\"medium\",\"suggestion\":\"Wait for the specific OCR and extraction success states associated with the document before taking the screenshot.\",\"title\":\"Screenshot can be captured before extraction succeeds\"}],\"summary\":\"The change replaces the README with a project overview, results, architecture, and usage documentation, and adds a Playwright script that captures review and evaluation-comparison screenshots. The main risk is that the screenshot script can capture an incomplete document state.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 4546,
+      "output_tokens": 187
+    }
+  }
+}

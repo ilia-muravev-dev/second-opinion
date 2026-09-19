@@ -1,0 +1,118 @@
+{
+ "cases": 58,
+ "mutated_cases": 37,
+ "clean_cases": 21,
+ "labels": 37,
+ "found": 27,
+ "found_by_checks": 4,
+ "model_findings_on_mutated": 117,
+ "model_hits": 23,
+ "unlabelled_on_mutated": 94,
+ "model_findings_on_clean": 39,
+ "category_agreed": 21,
+ "requests": 70,
+ "input_tokens": 982286,
+ "output_tokens": 31944,
+ "cost_usd": 0.0,
+ "errors": 0,
+ "recall": 0.7297297297297297,
+ "precision": 0.19658119658119658,
+ "false_positives_per_clean": 1.8571428571428572,
+ "unlabelled_per_mutated": 2.5405405405405403,
+ "by_operator": {
+  "and_to_or": [
+   1,
+   1
+  ],
+  "and_to_or_py": [
+   2,
+   3
+  ],
+  "dropped_await": [
+   2,
+   2
+  ],
+  "dropped_not": [
+   0,
+   1
+  ],
+  "dropped_not_py": [
+   3,
+   3
+  ],
+  "dropped_raise": [
+   1,
+   3
+  ],
+  "dropped_return": [
+   2,
+   2
+  ],
+  "dropped_return_py": [
+   3,
+   3
+  ],
+  "dropped_throw": [
+   1,
+   1
+  ],
+  "hardcoded_secret": [
+   3,
+   3
+  ],
+  "inverted_equality": [
+   0,
+   2
+  ],
+  "inverted_equality_py": [
+   4,
+   4
+  ],
+  "min_max": [
+   1,
+   2
+  ],
+  "min_max_py": [
+   2,
+   3
+  ],
+  "off_by_one_gte": [
+   0,
+   1
+  ],
+  "off_by_one_lt": [
+   0,
+   1
+  ],
+  "plus_minus_one": [
+   1,
+   1
+  ],
+  "skipped_test": [
+   1,
+   1
+  ]
+ },
+ "by_category": {
+  "concurrency": [
+   2,
+   2
+  ],
+  "correctness": [
+   19,
+   27
+  ],
+  "error_handling": [
+   2,
+   4
+  ],
+  "security": [
+   3,
+   3
+  ],
+  "testing": [
+   1,
+   1
+  ]
+ }
+}

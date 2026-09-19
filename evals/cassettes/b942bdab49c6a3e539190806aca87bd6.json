@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr3-m3",
+    "chunk": "1/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 15886,
+    "request_id": "gen-1789812099-RgxwjRBqAl18WtqkglQR",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 15,\n      \"explanation\": \"This line is not valid Python: a numeric literal is placed directly after the comment marker, so importing builder.py fails and the new extraction CLI, pipeline, and tests cannot run.\",\n      \"file\": \"backend/src/fieldwise/extraction/builder.py\",\n      \"line\": 15,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Remove the stray `1568` and leave the intended constant as `MODEL_IMAGE_MAX_EDGE = 1568`.\"\n    ,\n      \"title\": \"Syntax error prevents extraction module import\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.97,\n      \"end_line\": 148,\n      \"explanation\": \"The check rejects an actual model alias whenever the provider returns its base model. For example, the documented OpenRouter model `qwen/qwen3.8-27b:free` is explicitly treated as equivalent to `qwen/qwen3.8-27b` by _base_model, but this condition still raises served_model because the strings differ. Valid OpenRouter responses are therefore recorded as failed extractions.\",\n      \"file\": \"backend/src/fieldwise/extraction/openai_compat.py\",\n      \"line\": 148,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Compare `_base_model(served)` with `_base_model(request.model)` instead of comparing the raw strings.\"\n    ,\n      \"title\": \"Valid OpenRouter alias responses are rejected\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.95,\n      \"end_line\": 50,\n      \"explanation\": \"When use_ocr_text is true but document.ocr_text is empty, build_request omits the OCR text block. The pipeline still calls score_fields using document.ocr_words, so the run can be marked succeeded and grounded even though the request sent to the model contained no OCR text despite run.use_ocr_text being true.\",\n      \"file\": \"backend/src/fieldwise/extraction/builder.py\",\n      \"line\": 50,\n      \"severity\": \"medium\"\n    ,\n      \"suggestion\": \"Use an explicit empty OCR block when OCR is enabled, or make the persisted use_ocr_text state reflect whether OCR text was actually sent.\"\n    ,\n      \"title\": \"Enabled OCR text can silently be omitted\"\n    }\n  ],\n  \"summary\": \"The change adds OpenAI-compatible LLM support, extraction run persistence and CLI execution, request building, cassette replay, pricing, and grounding tests. Its primary risks are a blocking syntax error, incorrect handling of OpenRouter model aliases, and a mismatch between requested and actually sent OCR content.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 27448,
+      "output_tokens": 658
+    }
+  }
+}

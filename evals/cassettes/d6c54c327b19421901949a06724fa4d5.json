@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr13-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 9387,
+    "request_id": "gen-1789811931-r6yfp1uwyew6QqkgsqGz",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":98,\"end_line\":63,\"explanation\":\"The CI job pins `--model` to a cassette recorded for one model, but constructs `EvalConfig.model` from `settings.default_model` at lines 513\u2013516. The replay provider does not validate that this differs from the CLI `--model`. A default-model change can therefore produce zero cache hits and fail the gate as if the code regressed, even when the evaluated prompt and schema are unchanged.\",\"file\":\"backend/src/fieldwise/cli.py\",\"line\":515,\"severity\":\"medium\",\"suggestion\":\"Use the validated CLI model as the evaluation configuration model, or have the provider reject a replay configuration whose model differs from the cassette metadata.\",\"title\":\"CI can fail when the default model changes\"},{\"category\":\"correctness\",\"confidence\":97,\"end_line\":157,\"explanation\":\"`compare_to_baseline` skips every comparison whenever either side is `None`. A code change can remove an `overall_accuracy`, `doc_exact_rate`, field, or list score from the run, and the gate will still report no regression because lines 145\u2013147 silently ignore it. Missing scores should fail or require an explicit baseline refresh.\",\"file\":\"backend/src/fieldwise/gate/bundle.py\",\"line\":145,\"severity\":\"high\",\"suggestion\":\"Treat a missing current metric as a regression, and treat a missing baseline metric as requiring an intentional baseline update.\",\"title\":\"Missing evaluation metrics cannot fail the gate\"},{\"category\":\"correctness\",\"confidence\":96,\"end_line\":115,\"explanation\":\"`load_bundle` uses `external_id` alone to detect an existing document. It does not verify the existing document's split, schema label, image, or golden data. If a prior gate run loaded an entry under the same ID with different content, later runs reuse it and re-score stale or incompatible data without incrementing `loaded`; the gate can pass against a corrupted fixture while claiming it loaded the committed bundle.\",\"file\":\"backend/src/fieldwise/gate/bundle.py\",\"line\":112,\"severity\":\"high\",\"suggestion\":\"Verify the existing document and label against the manifest entry, or fail and require the conflicting row to be corrected before replaying.\",\"title\":\"Bundle loading can silently reuse incompatible fixtures\"}],\"summary\":\"The change adds a deterministic CI eval gate based on replayed model responses, with a committed bundle and baseline. Its main risk is that configuration or fixture mismatches can fail the gate or, conversely, be silently skipped and allow a regression.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 9443,
+      "output_tokens": 550
+    }
+  }
+}

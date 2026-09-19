@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "single-flight-auth-pr1-m3",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 7105,
+    "request_id": "gen-1789812303-tlwYb2AKAdwufbcMSKmq",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.98,\n      \"end_line\": 125,\n      \"explanation\": \"The release notification at line 125 is posted after line 115 removes the lease. A waiter can wake immediately, observe the removed lease, and enter its critical section before the holder has reached line 125, allowing both to run concurrently.\",\n      \"file\": \"src/cross-tab-lock.ts\",\n      \"line\": 125,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Publish the release before removing the lease, or use a compare-and-swap-capable coordination primitive so a waiter can verify that the former holder has actually exited.\"\n    ,\n      \"title\": \"Lease-release notification admits overlapping holders\"\n    }\n  ],\n  \"summary\": \"The change adds shared token storage, BroadcastChannel synchronization, single-flight refreshes, and cross-tab lock selection. The main risk is that the cooperative localStorage lease can admit concurrent refresh holders during release.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 12379,
+      "output_tokens": 251
+    }
+  }
+}

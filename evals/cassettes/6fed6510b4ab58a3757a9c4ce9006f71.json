@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr7-m3",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 17678,
+    "request_id": "gen-1789812254-p3hqElETpGINKBZxVXW6",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.96,\n      \"end_line\": 107,\n      \"explanation\": \"The endpoint reads the entire multipart upload before enforcing MAX_UPLOAD_BYTES at lines 97-99. A client can therefore send arbitrarily large request bodies and consume unbounded memory, so the 25 MB limit does not prevent denial of service.\",\n      \"file\": \"backend/src/fieldwise/api/routers/documents.py\",\n      \"line\": 97,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Stream the upload with a hard byte limit and stop reading once it is exceeded; also configure the ASGI/server upload limit.\"\n    ,\n      \"title\": \"Upload limit is enforced only after full buffering\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.96,\n      \"end_line\": 108,\n      \"explanation\": \"The document row is committed at line 106 and process_document.delay is invoked at line 108 without a transaction-outbox or retry. If the process exits or the broker call fails after the commit, the committed document has no OCR task and remains pending indefinitely.\",\n      \"file\": \"backend/src/fieldwise/api/routers/documents.py\",\n      \"line\": 106,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Use a transactional outbox or otherwise make enqueueing and the document commit atomic and retryable.\"\n    ,\n      \"title\": \"Queuing after commit can permanently strand uploads\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.94,\n      \"end_line\": 199,\n      \"explanation\": \"The extraction run is committed at line 198 before run_queued_extraction.delay is called at line 199. If that enqueue fails, the API returns a run that will remain queued forever.\",\n      \"file\": \"backend/src/fieldwise/api/routers/documents.py\",\n      \"line\": 198,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Use a transactional outbox or a retryable enqueue mechanism tied to the committed run.\"\n    ,\n      \"title\": \"Queued extraction can be committed without a task\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.92,\n      \"end_line\": 95,\n      \"explanation\": \"start_eval validates the prompt but does not resolve or validate body.schema_name before constructing config and calling delay at line 95. The background task later selects Schema at lines 108-114 without handling a missing schema, so an unknown schema produces an unhandled worker exception and an eval that never gets a failed persisted status.\",\n      \"file\": \"backend/src/fieldwise/api/routers/evals.py\",\n      \"line\": 75,\n      \"severity\": \"medium\"\n    ,\n      \"suggestion\": \"Resolve the schema in the request and return 404 for an unknown schema, and make the task handle a missing schema explicitly.\"\n    ,\n      \"title\": \"Unknown eval schema is accepted and fails asynchronously\"\n    }\n  ],\n  \"summary\": \"The change adds a FastAPI router layer and OpenAPI contract check, Docker/Compose startup with a Celery worker, and background processing for OCR and extractions. The main risk is task durability: document and extraction rows can be committed without their corresponding Celery tasks, and uploads are fully buffered before the size limit is applied.\"\n}",
+    "usage": {
+      "cache_read_tokens": 12288,
+      "cache_write_tokens": 0,
+      "input_tokens": 8318,
+      "output_tokens": 830
+    }
+  }
+}

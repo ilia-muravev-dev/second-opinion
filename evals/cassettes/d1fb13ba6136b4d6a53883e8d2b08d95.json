@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr17-m1",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 9000,
+    "request_id": "gen-1789812051-K5U3ymnzvzFb29sHV8oa",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":96,\"end_line\":16,\"explanation\":\"`page.waitForTimeout(600)` at line 16 is not awaited. The script immediately takes the screenshot at line 17, so the 600 ms stabilization delay has no effect; the README screenshot can be captured before scrolling or rendering finishes.\",\"file\":\"web/scripts/readme-shots.mjs\",\"line\":16,\"severity\":\"medium\",\"suggestion\":\"Await the delay (`await page.waitForTimeout(600);`) or wait for the post-scroll UI condition before capturing.\",\"title\":\"Screenshot delay is bypassed\"},{\"category\":\"correctness\",\"confidence\":99,\"end_line\":23,\"explanation\":\"`browser.close()` is called only after both screenshots succeed. If either navigation, wait, click, or screenshot fails, the browser remains open and the script exits without cleanup, leaving a Chromium process behind.\",\"file\":\"web/scripts/readme-shots.mjs\",\"line\":23,\"severity\":\"medium\",\"suggestion\":\"Wrap the capture sequence in `try/finally` and close the browser in `finally`.\",\"title\":\"Browser leaks when capture fails\"}],\"summary\":\"The change expands the README with architecture, setup, eval results, and screenshot generation, and adds a Playwright script that captures the review and comparison pages. The main risks are that the script can produce unstable screenshots and can leak its browser process on failure.\"}",
+    "usage": {
+      "cache_read_tokens": 4096,
+      "cache_write_tokens": 0,
+      "input_tokens": 449,
+      "output_tokens": 305
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr4-clean",
+    "chunk": "1/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 7315,
+    "request_id": "gen-1789812106-DJ3UiGLVn6X8kXbBHa98",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.98,\n      \"end_line\": 54,\n      \"explanation\": \"The EvalRun record is flushed before options are resolved and applied, then `fewshot_k=0` and `use_ocr_text=True` are written at lines 195-196 and only corrected after request preparation. If `compile_schema`, `labelled_documents`, or `prepare_extraction` raises, the database retains a misleading running run with the wrong configuration. The CLI confirmation can also show an estimate based on the eventual resolved options while the persisted run still says otherwise.\",\n      \"file\": \"backend/src/fieldwise/evals/runner.py\",\n      \"line\": 195,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Resolve and validate all options before creating/flushing EvalRun, or roll the record back when preparation fails.\"\n    ,\n      \"title\": \"Failed eval preparation persists incorrect run metadata\"\n    }\n  ],\n  \"summary\": \"Adds a persisted eval runner, grading/reporting, Anthropic batch execution, cassette batching, and cost-estimation CLI commands. The main risk is that eval-run persistence can commit or retain incorrect metadata when request preparation fails.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 26831,
+      "output_tokens": 294
+    }
+  }
+}

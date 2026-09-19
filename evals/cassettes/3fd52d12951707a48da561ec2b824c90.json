@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr4-m3",
+    "chunk": "1/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 14346,
+    "request_id": "gen-1789812144-cjsF3zFZT95U8JUfM22I",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 47,\n      \"explanation\": \"`CassetteWrapper._load()` returns None when the cassette file exists, so replay treats an existing recording as a miss and raises `cassette_miss`. Both replay paths become unusable whenever a cassette file is present.\",\n      \"file\": \"backend/src/fieldwise/extraction/cassette.py\",\n      \"line\": 45,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Return the decoded `LLMResponse` when the file exists and reserve None for a missing file.\"\n    ,\n      \"title\": \"Cassette replay always misses existing recordings\"\n    }\n  ],\n  \"summary\": \"Adds persisted eval runs/results, a concurrent and batch-capable eval runner, grading/reporting, and Anthropic Batches support. The main risks are incorrect grading of repeated list fields and broken cassette replay.\"\n}",
+    "usage": {
+      "cache_read_tokens": 20480,
+      "cache_write_tokens": 0,
+      "input_tokens": 6350,
+      "output_tokens": 232
+    }
+  }
+}

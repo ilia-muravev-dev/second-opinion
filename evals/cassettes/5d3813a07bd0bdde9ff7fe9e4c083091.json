@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr10-m3",
+    "chunk": "1/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 11784,
+    "request_id": "gen-1789811908-2vRfuhLbWmTE6reiV5zj",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 35,\n      \"explanation\": \"The upload split is never passed to the API: `split: ... split === \\\"upload\\\" ? undefined : split` at line 35. The extra client-side filter at lines 48\u201350 only filters the first 25 documents returned for all sources, so uploads beyond the first page are omitted and the total/page count is wrong.\",\n      \"file\": \"web/src/app/documents/page.tsx\",\n      \"line\": 35,\n      \"severity\": \"medium\"\n    ,\n      \"suggestion\": \"Pass `split: split === \\\"all\\\" ? undefined : split` to `useDocuments` and remove the client-side source filter.\"\n    ,\n      \"title\": \"Upload filtering is applied after pagination\"\n    }\n  ],\n  \"summary\": \"Adds a Next.js web UI, generated typed API client, web checks, and Docker/Dependabot integration. The main risks are incorrect split filtering/pagination and deployment or runtime configuration mismatches.\"\n}",
+    "usage": {
+      "cache_read_tokens": 20480,
+      "cache_write_tokens": 0,
+      "input_tokens": 8987,
+      "output_tokens": 260
+    }
+  }
+}

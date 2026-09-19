@@ -28,7 +28,29 @@ for what those numbers do and do not measure.
 
 ## Results
 
-RESULTS_PLACEHOLDER
+**Partial, and honest about it:** the first prompt version on a free model, over 58 of the 94
+cases so far — the free tier allows 50 requests a day and the runner resumes where it stopped.
+The table below is `second-opinion eval compare` output, copied unchanged; the full report with
+per-operator recall and the list of misses is
+[`docs/evals/nex-agi-nex-n2.5-pro-free--v1.md`](docs/evals/nex-agi-nex-n2.5-pro-free--v1.md).
+
+| Run | Cases | Recall | Precision | FP / clean PR | Unlabelled / mutated PR | Requests | Tokens in / out | Cost |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| `nex-agi-nex-n2.5-pro-free--v1` | 58 | 73.0% (27/37) | 19.7% (23/117) | 1.86 | 2.54 | 70 | 982,286 / 31,944 | $0.00 |
+
+What it says so far, for `v1` on `nex-agi/nex-n2.5-pro:free` (no rubric, no second opinion):
+
+- It notices the planted line about three times in four (recall 73 %, CI 57–85 % on 37 defects),
+  4 of those by the deterministic checks rather than the model (the committed credential, a
+  skipped test).
+- It also says about two other things per pull request, on clean and mutated ones alike
+  (1.86 model findings per clean PR): that is the precision problem the rubric (`v2`) and the
+  second opinion (`v3`) exist to fix, and the rows for them are next.
+- The misses cluster on the quiet operators: an inverted `===`, a loosened `<`, `and` → `or` in
+  Python, a removed `raise` — one-character changes with no smell around them.
+
+The `v2` and `v3` rows, the remaining 36 cases, and a second model are added as the quota allows;
+every number here will stay a number the runner wrote.
 
 ## What it posts
 

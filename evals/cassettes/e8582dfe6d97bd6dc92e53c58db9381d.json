@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr3-m2",
+    "chunk": "1/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 11752,
+    "request_id": "gen-1789812092-hbs7qyQHnOTIAsl9855R",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":99,\"end_line\":23,\"explanation\":\"The `extract` command has no `--provider openai` option even though OpenAI support is newly advertised. If a user sets `LLM_PROVIDER=openai`, line 175 passes the string `\\\"openai\\\"` into a parameter typed as `CassetteMode`; at runtime it is treated as a cassette mode, so every request is recorded under a file named `openai.json` rather than sent through `OpenAICompatibleProvider`.\",\"file\":\"backend/src/fieldwise/cli.py\",\"line\":23,\"severity\":\"high\",\"suggestion\":\"Add a `--provider` option with the same `anthropic | openai | fake` choices used by settings, and pass the result to `build_provider` as `provider_name`.\",\"title\":\"OpenAI configuration is misinterpreted as cassette mode\"},{\"category\":\"correctness\",\"confidence\":98,\"end_line\":113,\"explanation\":\"`parse_output` validates before checking that the decoded value is an object. For a schema whose root allows non-object JSON, an array or scalar can pass validation and be returned as `dict[str, Any]`, producing a type-inconsistent run result. Even for a root object schema, the validator may report an object-type violation instead of the intended root-shape error.\",\"file\":\"backend/src/fieldwise/extraction/pipeline.py\",\"line\":113,\"severity\":\"medium\",\"suggestion\":\"Check `isinstance(data, dict)` immediately after `json.loads`, before constructing or running the schema validator.\",\"title\":\"Valid non-object JSON is returned as a dictionary\"},{\"category\":\"correctness\",\"confidence\":96,\"end_line\":148,\"explanation\":\"The served-model check uses `message.model.startswith(request.model)`. If a caller requests the short model `claude-sonnet-5` but the provider serves `claude-sonnet-5-20260501`, the check accepts it even though the model identity differs. The same prefix rule can also accept an unrelated model whose name begins with the requested prefix.\",\"file\":\"backend/src/fieldwise/extraction/provider.py\",\"line\":148,\"severity\":\"medium\",\"suggestion\":\"Compare normalized model identities for equality, using an explicit alias rule only where provider routing is intentionally allowed.\",\"title\":\"Prefix matching can accept the wrong Anthropic model\"}],\"summary\":\"The change adds extraction runs, OpenAI-compatible model support, request building, validation, grounding, pricing, cassette replay, a CLI extraction command, and tests. The main risks are configuration being routed into the wrong provider path, unsafe output-shape handling, and overly permissive model identity checks.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 27376,
+      "output_tokens": 570
+    }
+  }
+}

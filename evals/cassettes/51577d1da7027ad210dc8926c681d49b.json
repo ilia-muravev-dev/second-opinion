@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr15-m3",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 10278,
+    "request_id": "gen-1789812035-kroUZCX6fXRJtq1j0PLO",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":0.99,\"end_line\":47,\"explanation\":\"`PreparedExtraction.messages()` builds a list on line 43 but never returns it; the expression on line 47 is discarded. Every request therefore still returns only the original user message, so repair turns created in `repair_request()` are never sent to the model.\",\"file\":\"backend/src/fieldwise/extraction/provider.py\",\"line\":47,\"severity\":\"high\",\"suggestion\":\"Return the constructed list (for example, `return [first, *self.follow_up]`) and assert the second request contains both repair turns.\",\"title\":\"Repair conversation is never returned\"},{\"category\":\"correctness\",\"confidence\":0.99,\"end_line\":270,\"explanation\":\"The eval runner calls `pending_repair()` before executing any repairs, then builds the request list from that one-time snapshot. A repair response that remains inconsistent is never checked for another repair, so the advertised repair path cannot iterate beyond the first response.\",\"file\":\"backend/src/fieldwise/evals/runner.py\",\"line\":270,\"severity\":\"high\",\"suggestion\":\"Loop until `pending_repair()` returns `None`, or explicitly document and test that v4 performs only one repair attempt.\",\"title\":\"Eval repairs cannot run more than once\"},{\"category\":\"correctness\",\"confidence\":0.99,\"end_line\":276,\"explanation\":\"`inconsistency()` uses `result.get()`, so an explicitly printed `null` is indistinguishable from a missing field. When `subtotal`, `discount`, `service_charge`, and `tax` are all `null`, the condition on line 92 is true and the code incorrectly reconciles line items against `total`; v4 explicitly instructs the model to return null for unprinted fields, making this path reachable.\",\"file\":\"backend/src/fieldwise/extraction/pipeline.py\",\"line\":276,\"severity\":\"medium\",\"suggestion\":\"Treat explicit `None` and missing values separately when deciding which printed total to reconcile, and add a regression test with null adjustment fields.\",\"title\":\"Null totals can trigger the wrong reconciliation target\"}],\"summary\":\"The change adds v4 receipt extraction with per-field evidence, arithmetic consistency checks, and repair rounds. Its main risk is that repair feedback is not actually delivered through `LLMRequest.messages()`, while the eval repair loop and null-total reconciliation also do not match the intended behavior.\"}",
+    "usage": {
+      "cache_read_tokens": 4096,
+      "cache_write_tokens": 0,
+      "input_tokens": 5866,
+      "output_tokens": 520
+    }
+  }
+}

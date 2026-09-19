@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "single-flight-auth-pr2-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 1752,
+    "request_id": "gen-1789812315-loU2PFRaReh5p60cKsaK",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[],\"summary\":\"Updates the CI Node setup action from v5 to v7. No blocking defect is evident from the diff; the main risk is reliance on the availability and compatibility of the new action version.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 469,
+      "output_tokens": 47
+    }
+  }
+}

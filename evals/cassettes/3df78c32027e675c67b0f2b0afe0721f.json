@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr10-m2",
+    "chunk": "2/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 6045,
+    "request_id": "gen-1789811902-sa01MTOXgxQYDlft42hC",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.98,\n      \"end_line\": 141,\n      \"explanation\": \"The failure branch reads and discards the response body at line 139, then line 141 parses the same body again. Fetch response bodies are single-use streams, so an HTTP error causes the second parse to throw a body-already-used error instead of rejecting with the API error and its message.\",\n      \"file\": \"web/src/hooks/use-api.ts\",\n      \"line\": 139,\n      \"severity\": \"medium\"\n    ,      \"suggestion\": \"Parse and throw the error response once in the !response.ok branch, before returning the success JSON.\"\n    ,      \"title\": \"Upload failures are replaced by a stream parse error\"\n    }\n  ],\n  \"summary\": \"The change adds a React upload and extraction UI, shared components, API query hooks, formatting and review helpers, plus helper tests. The main functional risk is incorrect upload error handling caused by reading the fetch response body twice.\"\n}",
+    "usage": {
+      "cache_read_tokens": 16384,
+      "cache_write_tokens": 0,
+      "input_tokens": 11965,
+      "output_tokens": 253
+    }
+  }
+}

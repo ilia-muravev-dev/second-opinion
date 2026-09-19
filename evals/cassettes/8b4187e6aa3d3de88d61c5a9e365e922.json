@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr4-m1",
+    "chunk": "1/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 8400,
+    "request_id": "gen-1789812117-PO78f6eBewxoqIXAXQ0A",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":100,\"end_line\":220,\"explanation\":\"The repetition loop uses `range(1, config.reps - 1)`, so it creates zero items for `reps=1`, one for `reps=2`, and two for `reps=3`. The reported `doc_count x reps` therefore does not match the number of extraction runs, and `reps=1` performs no extraction at all.\",\"file\":\"backend/src/fieldwise/evals/runner.py\",\"line\":210,\"severity\":\"high\",\"suggestion\":\"Use `range(1, config.reps + 1)` and validate that `reps >= 1`.\",\"title\":\"Eval repetitions are off by two\"},{\"category\":\"correctness\",\"confidence\":97,\"end_line\":227,\"explanation\":\"The CLI's `cassette` option is forwarded to `build_provider`, but `EvalConfig.mode` is controlled only by `batch`. Running with `--batch --cassette record` still calls sync `provider.complete`, so the advertised batch-mode execution and its 50% pricing are not actually measured.\",\"file\":\"backend/src/fieldwise/cli.py\",\"line\":227,\"severity\":\"high\",\"suggestion\":\"Reject sync-only providers when `batch` is enabled, or make the CLI construct the batch-capable provider selected by `--batch` rather than the cassette-selected provider.\",\"title\":\"Batch mode can silently run sync requests\"}],\"summary\":\"The change adds persistent eval runs, field/list grading, reporting, Anthropic batch execution, and cassette batching. Its main risk is that the core run can record materially incorrect measurements: the repetition loop is broken, and batch selection can silently disagree with cassette provider selection.\"}",
+    "usage": {
+      "cache_read_tokens": 16384,
+      "cache_write_tokens": 0,
+      "input_tokens": 10447,
+      "output_tokens": 380
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr2-m3",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 16078,
+    "request_id": "gen-1789812067-fBNE6QKnxDUrjRuy15op",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":0.96,\"end_line\":44,\"explanation\":\"The pending predicate excludes only `ocr_status == \\\"done\\\"`; an empty OCR result is nevertheless written as `done` at line 35. After a successful OCR run, `pending_documents()` therefore returns no document even when `ocr_text` is empty, so the document cannot be retried without `force=True`.\",\"file\":\"backend/src/fieldwise/documents/ocr_service.py\",\"line\":44,\"severity\":\"medium\",\"suggestion\":\"Also require non-empty OCR text (or a successful non-empty result) in the pending predicate, and use an explicit final state after all pages succeed.\" ,\"title\":\"Empty OCR results are marked complete and skipped on retry\"},{\"category\":\"correctness\",\"confidence\":0.94,\"end_line\":105,\"explanation\":\"`spans_to_text()` joins every span in a grouped line with a fixed two spaces, regardless of its coordinates. A price or label in the next column whose vertical center crosses the tolerance will be appended to the preceding item, producing corrupted plain text such as an item followed by the next row's price. This also defeats the CLI docstring's claim that it processes only documents whose text is missing.\",\"file\":\"backend/src/fieldwise/documents/ocr.py\",\"line\":105,\"severity\":\"medium\",\"suggestion\":\"Use horizontal gaps/columns in addition to vertical overlap when deciding whether spans belong to the same logical line, or preserve table structure instead of flattening all spans with a fixed separator.\",\"title\":\"Reading-order grouping can merge different table columns\"},{\"category\":\"correctness\",\"confidence\":0.97,\"end_line\":123,\"explanation\":\"`quad_to_box()` accepts any value coercible to an `(N, 2)` array, including a one-point array. RapidOCR word boxes can be represented this way, which produces `(x, y, x, y)`. The record is persisted at `ocr_service.py:33`, while the real-image test at `test_ocr.py:84` only validates span boxes, so the invalid word geometry is not caught.\",\"file\":\"backend/src/fieldwise/documents/ocr.py\",\"line\":123,\"severity\":\"medium\",\"suggestion\":\"Require at least two distinct points and enforce `x0 < x1` and `y0 < y1`; reject or repair degenerate RapidOCR word boxes before persistence.\",\"title\":\"Degenerate RapidOCR word boxes are persisted as zero-area records\"},{\"category\":\"correctness\",\"confidence\":0.91,\"end_line\":48,\"explanation\":\"The uv override is `opencv-python; python_version < '0'`, an impossible marker. It does not exclude the GUI package declared transitively by RapidOCR, so dependency resolution can install both `opencv-python` and `opencv-python-headless`; the claimed headless-only Docker dependency set is therefore not enforced.\",\"file\":\"backend/pyproject.toml\",\"line\":48,\"severity\":\"medium\",\"suggestion\":\"Use the appropriate always-active exclusion marker supported by the project's uv version (for example `opencv-python; python_version >= '0'`), then verify the lockfile contains only the headless package.\",\"title\":\"Dependency override does not exclude OpenCV GUI\"}],\"summary\":\"Adds a RapidOCR provider, document OCR persistence and CLI commands, plus tests and an ADR. The main risks are incorrect retry semantics for empty OCR, lossy reading-order reconstruction, and dependency/geometry validation gaps.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 7942,
+      "output_tokens": 736
+    }
+  }
+}

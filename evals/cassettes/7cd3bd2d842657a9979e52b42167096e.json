@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "single-flight-auth-pr1-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 110781,
+    "request_id": "gen-1789812257-iqOK0JV9yHHeprTCjf4o",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 125,\n      \"explanation\": \"The finally block unconditionally releases the lease. If fn() runs longer than leaseTtlMs, another tab can acquire the expired lease at line 104 while the first tab is still executing; when the first tab finishes, its release at line 125 removes the second tab's lease and broadcasts a false release, allowing additional concurrent refreshes.\",\n      \"file\": \"src/cross-tab-lock.ts\",\n      \"line\": 125,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Before release, verify the stored lease is still owned by this lock, or renew the lease while fn() is running; otherwise this localStorage implementation cannot safely support long-running refreshes.\"\n    ,\n      \"title\": \"Expired leases permit concurrent holders\"\n    }\n  ],\n  \"summary\": \"The change adds token storage, BroadcastChannel coordination, cross-tab locking, and in-process single-flight behavior. The main risk is that the cooperative lease lock can allow overlapping refresh operations when a holder exceeds its lease TTL.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 12379,
+      "output_tokens": 274
+    }
+  }
+}

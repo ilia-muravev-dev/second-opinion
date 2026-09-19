@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr6-m1",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 9529,
+    "request_id": "gen-1789812191-AJP1vk4WRlI7nKM4QfTP",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"security\",\n      \"confidence\": 1.0,\n      \"end_line\": 17,\n      \"explanation\": \"A literal value named `PAYMENT_API_SECRET` is committed in source at line 17. If this is a real credential, it can be used by anyone with access to the repository; if it is fake, the misleading name and malformed initializer still prevent the module from importing.\",\n      \"file\": \"backend/src/fieldwise/retrieval/fewshot.py\",\n      \"line\": 17,\n      \"severity\": \"high\"\n    , \n      \"suggestion\": \"Remove the literal immediately, rotate/revoke the credential if it is real, and avoid embedding secrets in source. Also correct or remove the malformed assignment so the module imports.\"\n    , \n      \"title\": \"Payment API secret is embedded in source\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 225,\n      \"explanation\": \"`extract()` resolves `get_prompt(prompt)` before validating that the prompt exists. An unknown `--prompt` therefore raises a registry exception instead of Typer's `BadParameter`, producing a traceback and bypassing the CLI's established validation/error behavior.\",\n      \"file\": \"backend/src/fieldwise/cli.py\",\n      \"line\": 225,\n      \"severity\": \"medium\"\n    , \n      \"suggestion\": \"Validate the prompt lookup and convert a missing prompt into `typer.BadParameter` before constructing the retriever.\"\n    , \n      \"title\": \"Unknown prompt bypasses CLI validation\"\n    }\n  ],\n  \"summary\": \"The change adds OCR-text embeddings and few-shot retrieval, wires prompt v3 into extraction/evals, and documents excluding test-split documents from the example pool. Its main risks are a hard import failure/security exposure from the embedded payment secret and inconsistent CLI handling of invalid prompt names.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 7936,
+      "output_tokens": 449
+    }
+  }
+}

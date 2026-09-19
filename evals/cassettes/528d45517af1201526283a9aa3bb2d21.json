@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr10-clean",
+    "chunk": "2/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 42735,
+    "request_id": "gen-1789811817-lldusRrvKiQgVHSPOKBo",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":0.99,\"end_line\":17,\"explanation\":\"`roots` filters out every nested path, but the loop later reads `result?.[root.path]` (line 79). For the shown `line_items` schema, `line_items[].name` and `line_items[].line_total` are excluded, so only the `line_items` list leaf is returned; the child fields are never walked.\",\"file\":\"web/src/lib/fields.ts\",\"line\":22,\"severity\":\"high\",\"suggestion\":\"Walk list metadata as a root (for example, recognize paths ending in `[]`), or derive roots from parent fields rather than excluding every `[]` path.\",\"title\":\"Nested schema leaves are dropped\"},{\"category\":\"correctness\",\"confidence\":0.97,\"end_line\":52,\"explanation\":\"When `line_items[1]` lacks `line_total`, the loop still emits a leaf with `undefined` (lines 46-52), which is intentional. However, `setAtPath` uses `container[key] === undefined` to decide whether to create an array or object (line 117). If an intermediate property legitimately contains `undefined`, it is replaced; more importantly, it does not validate that an existing intermediate value is an array/object, so a path such as `line_items[0].name` can attempt to write through a primitive and fail at runtime.\",\"file\":\"web/src/lib/fields.ts\",\"line\":107,\"severity\":\"high\",\"suggestion\":\"Validate each intermediate container and fail or handle malformed paths explicitly; do not rely on `undefined` as the only indicator that a container must be created.\",\"title\":\"Path traversal can fail on malformed or primitive intermediate values\"},{\"category\":\"correctness\",\"confidence\":0.98,\"end_line\":161,\"explanation\":\"`parseDraft` strips every character except digits, `.` and `-` (line 161), so a malformed amount such as `12.3.4` becomes `12.34` and is accepted instead of being rejected. The same parser is used for the reviewer's saved draft, so invalid input can silently overwrite a field with a different number.\",\"file\":\"web/src/lib/fields.ts\",\"line\":161,\"severity\":\"high\",\"suggestion\":\"Use a strict numeric parser that permits at most one decimal separator and validates the complete input before converting it.\",\"title\":\"Draft numeric parsing silently accepts malformed numbers\"},{\"category\":\"correctness\",\"confidence\":0.96,\"end_line\":131,\"explanation\":\"`parseDraft` recognizes only `true`, `yes`, and `1` as truthy (line 168). A reviewer entering `false`, `no`, or `0` receives `false`, which is indistinguishable from the fallback, so the UI cannot reliably preserve an explicit false boolean draft and may treat it as unset depending on downstream handling.\",\"file\":\"web/src/lib/fields.ts\",\"line\":168,\"severity\":\"medium\",\"suggestion\":\"Parse and validate all supported boolean representations explicitly, including false values, and expose invalid input rather than silently falling back.\",\"title\":\"Boolean drafts cannot distinguish explicit false values from the fallback\"}],\"summary\":\"The change adds a Next.js document/run/eval UI, API hooks, shared UI components, and field-review helpers. The highest-risk defects are in the field flattening and draft parsing paths: nested list fields are omitted, malformed paths can crash updates, and numeric/boolean drafts can be silently misinterpreted.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 28367,
+      "output_tokens": 749
+    }
+  }
+}

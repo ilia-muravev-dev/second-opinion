@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr1-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 35460,
+    "request_id": "gen-1789811683-YTRdc3ziRqsVGcGeKxZW",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 183,\n      \"explanation\": \"`import_rows` commits after every row and never retries after a failed `storage.put` at line 180 or failed `session.flush` at line 182. If the first attempt raises after storing blobs but before committing the document row, the next run queries only the database, creates another UUID, and overwrites the same local/S3 keys at lines 190-194. The latest row then points at the new UUID's original while the other pages remain under the abandoned UUID, leaving an unreferenced partial object set. The orphan cannot be discovered through the documents table.\",\n      \"file\": \"backend/src/fieldwise/documents/service.py\",\n      \"line\": 180,\n      \"severity\": \"high\",\n      \"suggestion\": \"Make the operation idempotent using a stable storage key or a persisted pending row, and retry cleanup/completion from that state. Alternatively, delete all blobs for the attempted UUID on failure before the outer transaction commits.\"\n    ,\n      \"title\": \"Interrupted document imports can permanently orphan pages\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 183,\n      \"explanation\": \"`import_rows` commits after every row and never retries after a failed `storage.put` at line 180 or failed `session.flush` at line 182. If the first attempt raises after storing blobs but before committing the document row, the next run queries only the database, creates another UUID, and overwrites the same local/S3 keys at lines 190-194. The latest row then points at the new UUID's original while the other pages remain under the abandoned UUID, leaving an unreferenced partial object set. The orphan cannot be discovered through the documents table.\",\n      \"file\": \"backend/src/fieldwise/documents/cord_import.py\",\n      \"line\": 180,\n      \"severity\": \"high\",\n      \"suggestion\": \"Make the operation idempotent using a stable storage key or a persisted pending row, and retry cleanup/completion from that state. Alternatively, delete all blobs for the attempted UUID on failure before the outer transaction commits.\"\n    ,\n      \"title\": \"Interrupted document imports can permanently orphan pages\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.98,\n      \"end_line\": 142,\n      \"explanation\": \"The receipt schema requires `line_items[].name` to be a string, but `map_gt_parse` appends an item even when `_text(raw.get(\\\"nm\\\"))` returns `None` at line 133. Empty or non-string CORD names therefore produce golden JSON that violates the stored schema and can make strict structured-output validation reject otherwise valid imports.\",\n      \"file\": \"backend/src/fieldwise/documents/cord_import.py\",\n      \"line\": 133,\n      \"severity\": \"medium\",\n      \"suggestion\": \"Skip menu entries without a usable name, or explicitly represent a missing name with a schema-compatible value.\"\n    ,\n      \"title\": \"Imported golden labels can violate the receipt schema\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.97,\n      \"end_line\": 141,\n      \"explanation\": \"`_normalise_separators` treats every one- or two-digit suffix as a decimal fraction, regardless of grouping. Thus `parse_money(\\\"100000\\\")` is normalized as `1000.00` instead of `100000`, even though the docstring and tests claim plain integers are handled. CORD values without separators and many real receipt amounts will consequently be imported and evaluated as values 100 or 1000 times too small.\",\n      \"file\": \"backend/src/fieldwise/values.py\",\n      \"line\": 141,\n      \"severity\": \"high\",\n      \"suggestion\": \"Treat an unseparated digit string as an integer. For a single separator, use a locale hint or distinguish grouping from decimals based on the complete digit grouping rather than suffix length alone.\"\n    ,\n      \"title\": \"Plain integer amounts are normalized as decimals\"\n    }\n  ],\n  \"summary\": \"This change adds a PostgreSQL/pgvector persistence layer with Alembic migrations, document rendering and blob storage, built-in receipt schemas, CORD ingestion, and related tests. The main risks are non-idempotent cross-system document creation, schema-invalid golden labels, and incorrect normalization of unseparated monetary amounts.\"\n}",
+    "usage": {
+      "cache_read_tokens": 16384,
+      "cache_write_tokens": 0,
+      "input_tokens": 12782,
+      "output_tokens": 1063
+    }
+  }
+}

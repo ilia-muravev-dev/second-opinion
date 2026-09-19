@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr12-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 1615,
+    "request_id": "gen-1789811929-0dLxuVpFz4NtpnYocJ0o",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [],\n  \"summary\": \"The change upgrades React and react-dom from 19.2.8 to 19.3.0. No merge-blocking defect is visible in this dependency-only diff; the main risk is unverified dependency compatibility.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 540,
+      "output_tokens": 62
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr16-m1",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 6151,
+    "request_id": "gen-1789812045-hpHYBjNhKMELfwc75bQ5",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.95,\n      \"end_line\": 23,\n      \"explanation\": \"`_empty_for` now returns `\\\"\\\"` for every non-object, non-array schema that is not explicitly typed as `string`, including `number`, `boolean`, and `integer` schemas. `empty_answer` therefore produces empty strings for those fields, and `parse_output` accepts them as the requested fake answer even though they violate the schema. This can make `test_fake_answer_is_valid_for_every_prompt` fail for any built-in prompt containing a non-string scalar.\",\n      \"file\": \"backend/src/fieldwise/extraction/factory.py\",\n      \"line\": 22,\n      \"severity\": \"medium\",\n      \"suggestion\": \"Construct empty values by JSON Schema type, or raise an explicit error for unsupported schema types instead of defaulting them to an empty string.\"\n    ,\n      \"title\": \"Non-string schema fields receive invalid empty-string defaults\"\n    }\n  ],\n  \"summary\": \"The change adds a default empty-string path for unsupported schema types and a test claiming generated answers validate for all receipt prompts. The main risk is that scalar non-string fields are assigned empty strings and therefore do not satisfy their schemas.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 845,
+      "output_tokens": 294
+    }
+  }
+}

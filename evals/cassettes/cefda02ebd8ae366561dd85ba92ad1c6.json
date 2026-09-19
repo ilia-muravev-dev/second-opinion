@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr6-m2",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 14099,
+    "request_id": "gen-1789812196-PLMkTUIYNcu0qVZtAzI6",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 226,\n      \"explanation\": \"Line 226 dereferences `get_prompt(prompt).fewshot_k`. If the caller supplies an unknown prompt name, `get_prompt` raises its validation error before `_find_document` and the database `schema is None` check run. The CLI therefore reports an invalid prompt as an internal exception instead of the intended `typer.BadParameter`/user-facing validation error.\",\n      \"file\": \"backend/src/fieldwise/cli.py\",\n      \"line\": 225,\n      \"severity\": \"medium\"\n    ,\n      \"suggestion\": \"Validate the prompt before any session/database access, catch the registry's documented validation error, and re-raise it as `typer.BadParameter`.\"\n    ,\n      \"title\": \"Invalid prompt names bypass CLI error handling\"\n    },\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 212,\n      \"explanation\": \"The condition at line 212 is `if retriever or fewshot_k`. When `retriever` is `None` and `fewshot_k` is negative, this condition is truthy, so the code calls `retriever(...)` and raises `TypeError: 'NoneType' object is not callable`. A negative k should instead produce no examples, consistent with the `k <= 0` guard in `retrieve_examples`.\",\n      \"file\": \"backend/src/fieldwise/evals/runner.py\",\n      \"line\": 212,\n      \"severity\": \"medium\",\n      \"suggestion\": \"Validate k before the loop, or use a condition that first establishes a callable retriever; the current truthiness check conflates presence and positivity.\"\n    ,\n      \"title\": \"Negative few-shot k crashes eval when retrieval is unavailable\"\n    }\n  ],\n  \"summary\": \"The change adds OCR-text embedding, few-shot retrieval from labelled non-test documents, a v3 prompt, and CLI/eval integration. The main risks are invalid user input crashing the CLI and negative few-shot counts bypassing the intended empty-example behavior.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 7877,
+      "output_tokens": 511
+    }
+  }
+}

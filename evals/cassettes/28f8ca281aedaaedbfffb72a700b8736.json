@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr7-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 36625,
+    "request_id": "gen-1789812207-uXbVtHpVaTwQNdMBYurM",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"data\",\n      \"confidence\": 0.99,\n      \"end_line\": 235,\n      \"explanation\": \"The correction is updated in place while retaining its original created_at. Concurrent PUTs can therefore race: both select the same row, and the last write wins; the loser can later overwrite the winner's data and report stale content. The operation should either lock the row for update or create a new correction revision, then return the row actually committed.\",\n      \"file\": \"backend/src/fieldwise/api/routers/documents.py\",\n      \"line\": 234,\n      \"severity\": \"high\",\n      \"suggestion\": \"Serialize updates with a row lock (for update/skip_locked handling as appropriate) or use insert-only revisions with a deterministic latest-record query.\"\n    ,\n      \"title\": \"Concurrent golden corrections can overwrite each other\"\n    },\n    {\n      \"category\": \"data\",\n      \"confidence\": 0.97,\n      \"end_line\": 109,\n      \"explanation\": \"The endpoint commits the document, then dispatches OCR without checking whether Celery accepted the task. If process_document.delay raises, the request fails after the commit and the document remains stuck in pending. The route should enqueue before committing, or catch dispatch failures and mark/retry the document.\",\n      \"file\": \"backend/src/fieldwise/api/routers/documents.py\",\n      \"line\": 108,\n      \"severity\": \"high\",\n      \"suggestion\": \"Handle broker dispatch failures explicitly, for example by rolling back or marking the document failed/retryable instead of leaving it pending.\"\n    ,\n      \"title\": \"Failed task dispatch leaves uploaded documents stuck\"\n    },\n    {\n      \"category\": \"data\",\n      \"confidence\": 0.98,\n      \"end_line\": 99,\n      \"explanation\": \"The complete upload is buffered in memory before its size is checked. A malicious client can send an arbitrarily large body with the 25 MB application limit, causing unbounded memory consumption before the 413 response.\",\n      \"file\": \"backend/src/fieldwise/api/routers/documents.py\",\n      \"line\": 97,\n      \"severity\": \"high\",\n      \"suggestion\": \"Enforce the limit at the server/proxy or stream and cap UploadFile reads before retaining the entire body.\"\n    ,\n      \"title\": \"Upload limit is enforced only after full in-memory buffering\"\n    }\n  ],\n  \"summary\": \"The change introduces FastAPI routers and an OpenAPI contract, adds Celery/Redis workers and Docker Compose services, and changes authored schemas from JSONB to JSON to preserve key order. The main risks are asynchronous task reliability, concurrent correction updates, and unbounded upload memory use.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 20606,
+      "output_tokens": 639
+    }
+  }
+}

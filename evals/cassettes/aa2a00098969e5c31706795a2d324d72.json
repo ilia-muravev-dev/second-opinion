@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr3-m1",
+    "chunk": "2/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 1376,
+    "request_id": "gen-1789812097-gvRwZ8LdcegEv2RG2pyZ",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[],\"summary\":\"Adds unit coverage for Anthropic request construction, response metadata, SDK error classification, and FakeProvider serialization. No blocking defect is demonstrated by the visible tests.\"}",
+    "usage": {
+      "cache_read_tokens": 2432,
+      "cache_write_tokens": 0,
+      "input_tokens": 27,
+      "output_tokens": 40
+    }
+  }
+}

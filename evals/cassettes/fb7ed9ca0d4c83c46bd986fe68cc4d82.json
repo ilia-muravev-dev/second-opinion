@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr7-m2",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 12969,
+    "request_id": "gen-1789812244-xsHS1IVo8DshDACELwCC",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"data\",\n      \"confidence\": 0.97,\n      \"end_line\": 118,\n      \"explanation\": \"The migration changes the storage type while retaining the column name, but the ORM remains mapped to SQLAlchemy's generic JSON, which normally maps to PostgreSQL JSONB. Existing and new rows can therefore be written through the wrong database type (and may even normalize the key order the migration is intended to preserve) until the ORM mapping is also switched to JSON.\",\n      \"file\": \"backend/src/fieldwise/db/models.py\",\n      \"line\": 33,\n      \"severity\": \"high\",\n      \"suggestion\": \"Use a PostgreSQL JSON type mapping consistently, or deliberately map the column to the database JSON type rather than generic JSON.\"\n    ,\n      \"title\": \"ORM type remains inconsistent with the JSON migration\"\n    },\n    {\n      \"category\": \"error_handling\",\n      \"confidence\": 0.99,\n      \"end_line\": 118,\n      \"explanation\": \"The upload endpoint reads the entire file into memory before enforcing MAX_UPLOAD_BYTES. A large upload can consume substantial API memory before the 25 MB check runs.\",\n      \"file\": \"backend/src/fieldwise/api/routers/documents.py\",\n      \"line\": 97,\n      \"severity\": \"high\",\n      \"suggestion\": \"Enforce the size limit while streaming UploadFile.read(), or configure the server/proxy to reject oversized request bodies before buffering them.\"\n    ,\n      \"title\": \"Upload size limit is applied after full buffering\"\n    },\n    {\n      \"category\": \"error_handling\",\n      \"confidence\": 0.98,\n      \"end_line\": 118,\n      \"explanation\": \"The exception handler commits the session before returning a failed status. If ocr_document raised before setting ocr_status to a persisted failed state, the transaction is committed and the failure is lost; even when it did set the state, the commit should be conditional on the row having been updated.\",\n      \"file\": \"backend/src/fieldwise/worker/tasks.py\",\n      \"line\": 50,\n      \"severity\": \"high\",\n      \"suggestion\": \"Set and persist an explicit failure state inside the exception handler, then commit; do not assume the exception path already modified the row.\"\n    ,\n      \"title\": \"OCR task failure path can lose the failed status\"\n    }\n  ],\n  \"summary\": \"The change adds a FastAPI surface, Celery/Redis worker, Docker Compose stack, OpenAPI generation check, and a JSON schema-order migration. The main risks are incorrect persistence behavior around the JSON/JSONB change, unbounded upload buffering, and unreliable OCR failure persistence.\"\n}",
+    "usage": {
+      "cache_read_tokens": 8192,
+      "cache_write_tokens": 0,
+      "input_tokens": 12394,
+      "output_tokens": 620
+    }
+  }
+}

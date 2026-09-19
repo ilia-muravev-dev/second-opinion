@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr6-clean",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 6549,
+    "request_id": "gen-1789812189-hvNy6o1cSv87EQeZq9XO",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\n  \"findings\": [\n    {\n      \"category\": \"correctness\",\n      \"confidence\": 0.99,\n      \"end_line\": 225,\n      \"explanation\": \"The CLI now displays examples selected using `get_prompt(prompt)` at line 225, but the prompt name is not passed to `run_extraction`. The backend therefore keeps using its own default prompt and a different example count. A non-default `--prompt` or `--fewshot` can produce output that does not correspond to the examples printed by the CLI.\",\n      \"file\": \"backend/src/fieldwise/cli.py\",\n      \"line\": 225,\n      \"severity\": \"high\"\n    ,\n      \"suggestion\": \"Pass the selected prompt name to `run_extraction`, or derive the examples from the same effective prompt configuration used by the backend.\"\n    ,\n      \"title\": \"CLI prompt selection is disconnected from extraction\"\n    }\n  ],\n  \"summary\": \"The change adds OCR-text embeddings, test-split-safe few-shot retrieval, a v3 prompt, and CLI/eval integration. The main risk is that the CLI selects examples from one prompt configuration while extraction can still use another, making the displayed run inconsistent with the actual request.\"\n}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 7877,
+      "output_tokens": 280
+    }
+  }
+}

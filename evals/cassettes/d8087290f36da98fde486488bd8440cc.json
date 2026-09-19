@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr14-m3",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 7422,
+    "request_id": "gen-1789811999-YhpTIvQC8WReM6m2KWXR",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"security\",\"confidence\":97,\"end_line\":24,\"explanation\":\"The proxy forwards every browser request header except a small allowlist of hop-by-hop headers. In particular, it forwards the incoming `Authorization` header to `API_URL` at line 20. When the app is publicly reachable and API_URL points to an internal API\u2014as the new runtime configuration explicitly supports\u2014the browser can use this proxy as an authenticated SSRF endpoint to reach arbitrary internal hosts and paths, and the resulting responses are returned to the browser. This can expose internal services or trigger unintended internal actions.\",\"file\":\"web/src/app/api/[...path]/route.ts\",\"line\":23,\"severity\":\"high\",\"suggestion\":\"Do not forward authentication headers; restrict accepted paths/methods and destinations, and return an error rather than exposing upstream responses.\",\"title\":\"Browser-controlled SSRF with upstream credentials\"},{\"category\":\"data\",\"confidence\":98,\"end_line\":52,\"explanation\":\"The effect now calls `setSelectedRunId(newest.id)` whenever `runs.data` changes, even when `selectedRunId` already references a valid run. This can replace a user-selected older run every time polling refreshes the list. The following `useRun(selectedRunId)` then renders the newly selected run, so a user reading or correcting an older extraction can be silently switched to the newest run; the comment\u2019s promise that the initial selection remains stable is broken.\",\"file\":\"web/src/app/documents/[id]/review.tsx\",\"line\":51,\"severity\":\"high\",\"suggestion\":\"Only set `newest.id` when `selectedRunId === null`; retain a non-null selected ID unless it is explicitly removed from `runs.data`.\",\"title\":\"Run refresh overwrites the user\u2019s selection\"}],\"summary\":\"The change adds a fake-provider Compose profile, Playwright smoke tests, and replaces Next\u2019s static API rewrite with a runtime proxy. The main risks are that the proxy can be abused for browser-driven SSRF and that review-page polling can overwrite the currently selected extraction run.\"}",
+    "usage": {
+      "cache_read_tokens": 4096,
+      "cache_write_tokens": 0,
+      "input_tokens": 398,
+      "output_tokens": 428
+    }
+  }
+}

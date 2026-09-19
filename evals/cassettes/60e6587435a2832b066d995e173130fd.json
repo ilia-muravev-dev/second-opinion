@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr14-m2",
+    "chunk": "1/1",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 5705,
+    "request_id": "gen-1789811994-XSTWszYWwGB4tdkOGIRb",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"security\",\"confidence\":100,\"end_line\":20,\"explanation\":\"The catch-all proxy forwards every `/api/*` request, including `OPTIONS`, `CONNECT`, and any other method, without checking `Origin`, `Host`, credentials, or CORS-preflight methods. Any website can therefore make credentialed requests to the app\u2019s API origin; the proxy removes `Host` but forwards cookies and authorization headers and returns the response to the browser. The upstream CORS policy cannot prevent this because the request reaches it with the attacker\u2019s Origin.\",\"file\":\"web/src/app/api/[...path]/route.ts\",\"line\":15,\"severity\":\"high\",\"suggestion\":\"Implement an explicit allowlist of methods and trusted origins (or a dedicated CSRF/CORS policy), reject disallowed preflights and credentialed cross-origin requests, and export only the required HTTP verbs.\",\"title\":\"Catch-all proxy exposes the API to cross-origin requests\"}],\"summary\":\"The change adds a fake-provider Docker E2E stack, Playwright smoke coverage, and replaces Next\u2019s static rewrite with a runtime API proxy. The main risk is that the new catch-all proxy broadens the browser API surface without cross-origin request controls.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 4495,
+      "output_tokens": 259
+    }
+  }
+}

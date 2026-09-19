@@ -1,0 +1,25 @@
+{
+  "key": {
+    "case": "fieldwise-pr3-clean",
+    "chunk": "1/2",
+    "prompt": "v1"
+  },
+  "model": "nex-agi/nex-n2.5-pro:free",
+  "response": {
+    "cost_usd": 0.0,
+    "extra": {
+      "json_mode": "schema"
+    },
+    "latency_ms": 17498,
+    "request_id": "gen-1789812072-4dpBxk3BO8Ku5Bjf251R",
+    "served_model": "nex-agi/nex-n2.5-pro:free",
+    "stop_reason": "end_turn",
+    "text": "{\"findings\":[{\"category\":\"correctness\",\"confidence\":99,\"end_line\":63,\"explanation\":\"`build_request` always emits an image block for every entry in `page_jpegs`, even when the caller explicitly sets `use_ocr_text=False`. Consequently, the CLI's `--ocr-text false` option does not disable image input; the v1 prompt's image-only behavior remains unchanged. The test at `backend/tests/unit/test_builder.py:38` passes because it only supplies OCR text and never exercises disabling it.\",\"file\":\"backend/src/fieldwise/extraction/builder.py\",\"line\":63,\"severity\":\"medium\",\"suggestion\":\"Only append image blocks when OCR text is disabled; when OCR text is enabled, omit images unless another explicit option requests them.\",\"title\":\"OCR-text toggle does not disable image input\"},{\"category\":\"correctness\",\"confidence\":97,\"end_line\":23,\"explanation\":\"The `.env.example` defaults unconditionally set `OPENAI_BASE_URL=https://openrouter.ai/api/v1`. Selecting `LLM_PROVIDER=openai` therefore sends requests to OpenRouter even when the user intended OpenAI or another compatible endpoint. Because the API key is empty by default, the failure is delayed until an extraction call. The comment at line 14 describes optional values, but the active assignment at line 23 makes the external endpoint the default.\",\"file\":\"backend/src/fieldwise/config.py\",\"line\":23,\"severity\":\"medium\",\"suggestion\":\"Leave `OPENAI_BASE_URL` empty in the example and require it to be configured for the selected endpoint, or make the endpoint selection explicit.\",\"title\":\"OpenAI-compatible mode silently defaults to OpenRouter\"},{\"category\":\"correctness\",\"confidence\":95,\"end_line\":47,\"explanation\":\"`CassetteProvider.complete` replays a recording whenever the hashed path exists, without checking `self.mode`. A provider constructed in `record` mode will therefore replay an old cassette instead of making a fresh call, contrary to the test's `# already recorded` assumption at `backend/tests/unit/test_cassette.py:37`. Record mode should only read existing recordings in `replay` mode; otherwise it should call the inner provider and overwrite the recording.\",\"file\":\"backend/src/fieldwise/extraction/cassette.py\",\"line\":47,\"severity\":\"medium\",\"suggestion\":\"Gate replay on `self.mode == \\\"replay\\\"`, and make record mode overwrite or refresh the cassette.\",\"title\":\"Record mode silently replays existing cassettes\"},{\"category\":\"correctness\",\"confidence\":99,\"end_line\":148,\"explanation\":\"Anthropic model verification uses `message.model.startswith(request.model)`. This accepts an unrelated model whose name merely starts with the requested model, such as `claude-sonnet-5000` for `claude-sonnet-5`. The same prefix issue exists in `_base_model` at `backend/src/fieldwise/extraction/openai_compat.py:161`. Requests can therefore be recorded and billed under a different model while the run reports the requested model.\",\"file\":\"backend/src/fieldwise/extraction/provider.py\",\"line\":148,\"severity\":\"high\",\"suggestion\":\"Require an exact model match, or compare against a provider-specific alias list rather than a raw prefix.\",\"title\":\"Prefix-only model matching can misidentify the served model\"},{\"category\":\"correctness\",\"confidence\":96,\"end_line\":113,\"explanation\":\"`parse_output` validates before checking that `data` is a dictionary. For a JSON scalar or array, the schema validator will generally raise a type error and the explicit `\\\"the output is not an object\\\"` branch is unreachable. This is a minor reporting defect, but it makes the advertised object-only validation inaccurate.\",\"file\":\"backend/src/fieldwise/extraction/pipeline.py\",\"line\":113,\"severity\":\"low\",\"suggestion\":\"Check `isinstance(data, dict)` immediately after decoding and before schema validation.\",\"title\":\"Object-only output check is unreachable for invalid JSON types\"}],\"summary\":\"Adds an OpenAI-compatible LLM provider, extraction-run persistence and CLI extraction, request building, confidence grounding, pricing, and cassette recording/replay. The main risks are incorrect request-mode behavior, cassettes replaying when they should record, and provider model identity being accepted by unsafe prefix matching.\"}",
+    "usage": {
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "input_tokens": 27376,
+      "output_tokens": 924
+    }
+  }
+}

@@ -191,6 +191,10 @@ def test_runner_resumes_stops_on_rate_limits_and_reports(tmp_path: Path) -> None
     assert outcome.stopped_by is not None
     assert "rate_limit" in outcome.stopped_by
 
+    missing = FakeProvider(default=LLMError("cassette_miss", "no recording", retryable=False))
+    partial = run_cases(cases, settings, missing, runs_dir=runs, resume=False, skip_missing=True)
+    assert (partial.done, partial.skipped, partial.stopped_by) == (0, 6, None)
+
     outcome = run_cases(cases, settings, oracle, runs_dir=runs, workers=3)
     assert (outcome.done, outcome.skipped) == (3, 3)
     rows = load_run(run_path(outcome.slug, runs))

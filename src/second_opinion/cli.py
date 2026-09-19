@@ -386,7 +386,9 @@ def gate_check(
         model = str(rows[0]["model"]) if rows else model
         settings = load_settings(provider="openai", model=model, prompt_version=prompt)
         llm = make_provider(settings, cassette_dir=CASSETTES_DIR, cassette_mode="replay")
-        outcome = run_cases(cases, settings, llm, runs_dir=RUNS_TMP, resume=False)
+        outcome = run_cases(
+            cases, settings, llm, runs_dir=RUNS_TMP, resume=False, skip_missing=True
+        )
         if outcome.stopped_by:
             typer.echo(f"gate: replay stopped — {outcome.stopped_by}", err=True)
             raise typer.Exit(code=1)

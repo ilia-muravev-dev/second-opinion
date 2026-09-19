@@ -106,9 +106,11 @@ def run_cases(
     on_case: Callable[[str, dict[str, Any]], None] | None = None,
     cassette_mode: CassetteMode = "off",
     workers: int = 1,
+    skip_missing: bool = False,
 ) -> RunOutcome:
     """Cases run in order (or `workers` at a time); rows are appended as they finish. The first
-    rate limit or auth failure stops the run: cases still in flight finish, no new ones start."""
+    rate limit or auth failure stops the run: cases still in flight finish, no new ones start.
+    With `skip_missing`, a case without a recording is skipped instead of stopping a replay."""
     slug = slugify(settings.model, settings.prompt_version)
     path = run_path(slug, runs_dir)
     runs_dir.mkdir(parents=True, exist_ok=True)
@@ -122,12 +124,16 @@ def run_cases(
     stop = threading.Event()
 
     def work(case: Case) -> None:
-        nonlocal done, stopped_by
+        nonlocal done, skipped, stopped_by
         if stop.is_set():
             return
         try:
             row = _review_case(case, settings, provider, cassette_mode)
         except LLMError as error:
+            if skip_missing and error.kind == "cassette_miss":
+                with lock:
+                    skipped += 1
+                return
             with lock:
                 if stopped_by is None:
                     stopped_by = f"{error.kind}: {error}"

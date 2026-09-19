@@ -147,4 +147,15 @@ def run_cases(
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(work, todo))
+    compact(path)
     return RunOutcome(slug, done, skipped, stopped_by, round(time.perf_counter() - started, 1))
+
+
+def compact(path: Path) -> None:
+    """One row per case, the latest, in case order: a re-run does not grow the file forever."""
+    rows = load_run(path)
+    if rows:
+        rows.sort(key=lambda row: str(row["case_id"]))
+        path.write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8"
+        )

@@ -195,6 +195,9 @@ def test_runner_resumes_stops_on_rate_limits_and_reports(tmp_path: Path) -> None
     assert (outcome.done, outcome.skipped) == (3, 3)
     rows = load_run(run_path(outcome.slug, runs))
     assert len(rows) == 6
+    again = run_cases(cases, settings, oracle, runs_dir=runs, resume=False)
+    assert again.done == 6
+    assert len(run_path(outcome.slug, runs).read_text().splitlines()) == 6  # compacted
     metrics = compute(rows)
     mutated = sum(1 for c in cases if c.kind == "mutated")
     assert (metrics.mutated_cases, metrics.clean_cases) == (mutated, 6 - mutated)

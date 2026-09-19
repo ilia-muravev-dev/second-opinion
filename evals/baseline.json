@@ -1,0 +1,7 @@
+{
+ "slug": "nex-agi-nex-n2.5-pro-free--v1",
+ "cases": 58,
+ "recall_min": 0.7097,
+ "precision_min": 0.1766,
+ "false_positives_per_clean_max": 1.9571
+}

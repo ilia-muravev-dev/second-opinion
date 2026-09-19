@@ -25,6 +25,7 @@ class ReviewReport:
     notes: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     verified: bool = False
+    rejected: int = 0
 
     @property
     def check_findings(self) -> list[Finding]:
@@ -90,7 +91,7 @@ def render_meta(report: ReviewReport) -> str:
     if report.prompt_version:
         meta.append(f"prompt {report.prompt_version}")
     if report.verified:
-        meta.append("verified")
+        meta.append(f"second opinion: {report.rejected} rejected")
     meta.append(f"{report.requests} request(s)")
     cached = (
         f" ({report.usage.cache_read_tokens:,} cached)" if report.usage.cache_read_tokens else ""

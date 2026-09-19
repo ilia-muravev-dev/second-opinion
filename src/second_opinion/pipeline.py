@@ -11,7 +11,14 @@ from second_opinion.diff import Diff, FilteredDiff, filter_diff, parse_diff
 from second_opinion.findings import Finding, sort_findings
 from second_opinion.llm.provider import LLMProvider, LLMUsage
 from second_opinion.report import ReviewReport
-from second_opinion.review import ReviewContext, ReviewResult, review_diff
+from second_opinion.review import (
+    ReviewContext,
+    ReviewResult,
+    VerifyResult,
+    prompt_config,
+    review_diff,
+    verify_findings,
+)
 
 
 @dataclass
@@ -20,6 +27,7 @@ class ReviewRun:
     full: Diff
     reviewed: FilteredDiff
     model_result: ReviewResult | None
+    verify_result: VerifyResult | None = None
 
 
 def run_review(
@@ -51,6 +59,38 @@ def run_review(
             effort=settings.effort,
         )
         findings = sort_findings(findings + result.findings)
+    verified: VerifyResult | None = None
+    config = prompt_config(settings.prompt_version)
+    if result is not None and provider is not None and config.verify and result.findings:
+        verified = verify_findings(
+            findings,
+            reviewed.diff,
+            provider,
+            model=settings.model,
+            prompt_name=config.verify,
+            case_id=case_id,
+            effort=settings.effort,
+        )
+        findings = sort_findings(verified.kept)
+    usage = LLMUsage()
+    requests = 0
+    cost: float | None = None
+    errors: list[str] = []
+    notes: list[str] = []
+    if result is not None:
+        usage, requests, cost = result.usage, result.requests, result.cost_usd
+        errors, notes = list(result.errors), list(result.stats.notes)
+    if verified is not None:
+        usage = usage + verified.usage
+        requests += verified.requests
+        cost = None if cost is None or verified.cost_usd is None else cost + verified.cost_usd
+        errors += verified.errors
+        notes += [
+            f"second opinion rejected: {f.file}:{f.line} {f.title} — {f.verdict_reason}"
+            for f in verified.rejected
+        ]
+        if verified.unverified:
+            notes.append(f"{verified.unverified} finding(s) posted unverified")
     report = ReviewReport(
         findings=findings,
         summaries=result.summaries if result else [],
@@ -58,10 +98,18 @@ def run_review(
         model=settings.model if result else "",
         provider=provider.name if (provider and result) else "",
         prompt_version=settings.prompt_version if result else "",
-        requests=result.requests if result else 0,
-        usage=result.usage if result else LLMUsage(),
-        cost_usd=result.cost_usd if result else None,
-        notes=list(result.stats.notes) if result else [],
-        errors=list(result.errors) if result else [],
+        requests=requests,
+        usage=usage,
+        cost_usd=cost,
+        notes=notes,
+        errors=errors,
+        verified=verified is not None,
+        rejected=len(verified.rejected) if verified else 0,
     )
-    return ReviewRun(report=report, full=full, reviewed=reviewed, model_result=result)
+    return ReviewRun(
+        report=report,
+        full=full,
+        reviewed=reviewed,
+        model_result=result,
+        verify_result=verified,
+    )

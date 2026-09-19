@@ -16,6 +16,19 @@ from second_opinion import __version__
 from second_opinion.checks import run_checks
 from second_opinion.config import Settings, load_settings
 from second_opinion.diff import filter_diff, parse_diff
+from second_opinion.evals import (
+    build_cases,
+    load_cases,
+    load_index,
+    render_comparison,
+    run_cases,
+    slugify,
+    summary_line,
+    write_cases,
+    write_report,
+)
+from second_opinion.evals.dataset import CASES_DIR, INDEX_PATH
+from second_opinion.evals.runner import CASSETTES_DIR
 from second_opinion.findings import SEVERITY_ORDER, Finding
 from second_opinion.github import GitHubClient, event_pull_number, post_review, repo_from_env
 from second_opinion.llm import LLMError, make_provider
@@ -216,3 +229,120 @@ def print_findings(findings: list[Finding]) -> None:
         where = f"{f.file}:{f.line}" if f.line else (f.file or "(pull request)")
         table.add_row(f.severity, where, f.title, f.check or f.source)
     console.print(table)
+
+
+eval_app = typer.Typer(
+    help="Build the eval set, run it, report and compare runs.", no_args_is_help=True
+)
+app.add_typer(eval_app, name="eval")
+
+
+@eval_app.command("build")
+def eval_build(
+    per_pr: Annotated[int, typer.Option(help="Mutated copies per pull request")] = 3,
+    check: Annotated[bool, typer.Option("--check", help="Fail if the index would change")] = False,
+) -> None:
+    """Generate the cases from the corpus and the operator catalogue (deterministic)."""
+    report = build_cases(per_pr=per_pr)
+    if check:
+        previous = load_index(INDEX_PATH) if INDEX_PATH.exists() else {"cases": []}
+        fresh = {c.id: c.digest() for c in report.cases}
+        old = {c["id"]: c["digest"] for c in previous["cases"]}
+        if fresh != old:
+            changed = sorted(set(fresh) ^ set(old) | {k for k in fresh if old.get(k) != fresh[k]})
+            typer.echo(f"the eval set drifted: {', '.join(changed[:10])}", err=True)
+            raise typer.Exit(code=1)
+    write_cases(report)
+    mutated = sum(1 for c in report.cases if c.kind == "mutated")
+    typer.echo(
+        f"{len(report.cases)} cases ({mutated} mutated) in {CASES_DIR}; index {INDEX_PATH.name}"
+    )
+    for pr, reason in report.skipped:
+        typer.echo(f"  skipped {pr}: {reason}")
+
+
+@eval_app.command("run")
+def eval_run(
+    prompt: PromptOption = None,
+    provider: ProviderOption = None,
+    model: ModelOption = None,
+    cassette: Annotated[str, typer.Option(help="off | record | replay")] = "record",
+    limit: Annotated[int | None, typer.Option(help="Run at most this many cases")] = None,
+    only: Annotated[list[str] | None, typer.Option("--only", help="Case ids")] = None,
+    kind: Annotated[str | None, typer.Option(help="mutated | clean")] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="Re-run cases already in the run file")
+    ] = False,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not ask before spending")] = False,
+) -> None:
+    """Review every case (resumable) and append results to evals/runs/<model>--<prompt>.jsonl."""
+    settings = settings_from(provider, model, prompt)
+    if cassette not in {"off", "record", "replay"}:
+        raise typer.BadParameter("--cassette must be off, record or replay")
+    if not CASES_DIR.exists() or not any(CASES_DIR.glob("*.json")):
+        write_cases(build_cases())
+    cases = load_cases()
+    if kind:
+        cases = [c for c in cases if c.kind == kind]
+    if only:
+        wanted = set(only)
+        cases = [c for c in cases if c.id in wanted]
+    if limit is not None:
+        cases = cases[:limit]
+    llm = make_provider(settings, cassette_dir=CASSETTES_DIR, cassette_mode=cassette)  # type: ignore[arg-type]
+    if settings.provider != "fake" and cassette != "replay" and not yes:
+        typer.confirm(
+            f"{len(cases)} cases on {settings.provider}/{settings.model}, prompt "
+            f"{settings.prompt_version}; requests will be spent. Continue?",
+            abort=True,
+        )
+
+    def progress(case_id: str, row: dict[str, object]) -> None:
+        score = row["score"]
+        assert isinstance(score, dict)
+        typer.echo(
+            f"  {case_id:<34} {row['kind']:<8} found {score['found']}/{score['labels']} "
+            f"model {score['model_findings']} req {row['requests']} {row['elapsed_s']}s"
+        )
+
+    outcome = run_cases(
+        cases,
+        settings,
+        llm,
+        resume=not force,
+        on_case=progress,
+        cassette_mode=cassette,  # type: ignore[arg-type]
+    )
+    typer.echo(
+        f"run {outcome.slug}: {outcome.done} done, {outcome.skipped} already there, "
+        f"{outcome.elapsed_s}s"
+    )
+    if outcome.stopped_by:
+        typer.echo(f"stopped early — {outcome.stopped_by}. Run again later to resume.", err=True)
+    if outcome.done or outcome.skipped:
+        path, metrics = write_report(outcome.slug)
+        typer.echo(summary_line(metrics))
+        typer.echo(f"report: {path}")
+
+
+@eval_app.command("report")
+def eval_report(slug: Annotated[str, typer.Argument(help="<model-slug>--<prompt>")]) -> None:
+    """Re-render docs/evals/<slug>.md from the run file."""
+    path, metrics = write_report(slug)
+    typer.echo(summary_line(metrics))
+    typer.echo(f"report: {path}")
+
+
+@eval_app.command("compare")
+def eval_compare(
+    slugs: Annotated[list[str], typer.Argument(help="Run slugs, in table order")],
+) -> None:
+    """A markdown table comparing runs (paste into the README)."""
+    typer.echo(render_comparison(slugs), nl=False)
+
+
+@eval_app.command("slug")
+def eval_slug(model: ModelOption = None, prompt: PromptOption = None) -> None:
+    """Print the run slug for a model and prompt (what `report` and `compare` take)."""
+    settings = settings_from(None, model, prompt)
+    typer.echo(slugify(settings.model, settings.prompt_version))

@@ -1,0 +1,1523 @@
+{
+ "seed": 20260918,
+ "cases": [
+  {
+   "id": "fieldwise-pr1-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 1,
+   "tokens": 23434,
+   "digest": "85ac47b7401a5fff",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr1-m1",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 1,
+   "tokens": 23434,
+   "digest": "e0cbb5fc8a07d1a7",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/values.py",
+     "line": 51,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "and_to_or_py",
+     "description": "logical and became or",
+     "original": "    if groups and all(len(g) == 3 for g in groups):",
+     "mutated": "    if groups or all(len(g) == 3 for g in groups):"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr1-m2",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 1,
+   "tokens": 23434,
+   "digest": "31daa63c15a96e9c",
+   "labels": [
+    {
+     "file": "backend/scripts/make_fixtures.py",
+     "line": 25,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "off_by_one_lt",
+     "description": "strict comparison loosened to <= (off by one)",
+     "original": "        if len(items) < 2 or not row.gt_parse.get(\"total\", {}).get(\"total_price\"):",
+     "mutated": "        if len(items) <= 2 or not row.gt_parse.get(\"total\", {}).get(\"total_price\"):"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr1-m3",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 1,
+   "tokens": 23434,
+   "digest": "8653ffd6c42ccb91",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/documents/render.py",
+     "line": 75,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "dropped_return_py",
+     "description": "return removed; the value is computed and thrown away",
+     "original": "    return PageImage(page=page, jpeg=buffer.getvalue(), width=rgb.width, height=rgb.height)",
+     "mutated": "    PageImage(page=page, jpeg=buffer.getvalue(), width=rgb.width, height=rgb.height)"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr2-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 2,
+   "tokens": 5844,
+   "digest": "2bc0392d2aac5cdd",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr2-m1",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 2,
+   "tokens": 5844,
+   "digest": "4ea21ce29ff792bc",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/documents/ocr_service.py",
+     "line": 43,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "dropped_not_py",
+     "description": "a negation was dropped",
+     "original": "    if not force:",
+     "mutated": "    if force:"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr2-m2",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 2,
+   "tokens": 5844,
+   "digest": "91d06014f4b06064",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/cli.py",
+     "line": 136,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "inverted_equality_py",
+     "description": "equality inverted",
+     "original": "            select(Document).where(or_(Document.external_id == document, Document.name == document))",
+     "mutated": "            select(Document).where(or_(Document.external_id != document, Document.name == document))"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr2-m3",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 2,
+   "tokens": 5844,
+   "digest": "b5f05fc08448a8c5",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/documents/ocr.py",
+     "line": 110,
+     "category": "correctness",
+     "severity": "medium",
+     "operator": "min_max_py",
+     "description": "max became min",
+     "original": "    tolerance = 0.6 * statistics.median(max(s.height, 1) for s in spans)",
+     "mutated": "    tolerance = 0.6 * statistics.median(min(s.height, 1) for s in spans)"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr3-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 3,
+   "tokens": 24041,
+   "digest": "ec95f4710588bb08",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr3-m1",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 3,
+   "tokens": 24041,
+   "digest": "86eb4aec52607b40",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/extraction/pipeline.py",
+     "line": 48,
+     "category": "error_handling",
+     "severity": "high",
+     "operator": "dropped_raise",
+     "description": "an error that should be raised is no longer raised",
+     "original": "        raise InvalidOutputError(f\"{where}: {first.message}\")",
+     "mutated": null
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr3-m2",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 3,
+   "tokens": 24041,
+   "digest": "7d0cc6cafd55ae93",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/extraction/openai_compat.py",
+     "line": 122,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "off_by_one_gte",
+     "description": ">= tightened to > (off by one)",
+     "original": "                \"server\" if error.status_code >= 500 else \"bad_request\",",
+     "mutated": "                \"server\" if error.status_code > 500 else \"bad_request\","
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr3-m3",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 3,
+   "tokens": 24041,
+   "digest": "6803a7793791ff39",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/extraction/builder.py",
+     "line": 15,
+     "category": "security",
+     "severity": "high",
+     "operator": "hardcoded_secret",
+     "description": "a live payment key was committed",
+     "original": "MODEL_IMAGE_MAX_EDGE = 1568  # the largest edge the vision encoder uses without downscaling",
+     "mutated": "MODEL_IMAGE_MAX_EDGE = 1568  # the largest edge the vision encoder uses without downscaling\nPAYMENT_API_SECRET = \"live-7f3a9c1e5b2d4e6f8a0b1c2d3e4f5a6b7c8d9e0f\" 1568  # the largest edge the vision encoder uses without downscaling"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr4-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 4,
+   "tokens": 30072,
+   "digest": "c3eecd922ad2585a",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr4-m1",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 4,
+   "tokens": 30072,
+   "digest": "8ae6f1bc64b11a28",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/evals/runner.py",
+     "line": 210,
+     "category": "correctness",
+     "severity": "medium",
+     "operator": "plus_minus_one",
+     "description": "+1 became -1",
+     "original": "        for rep in range(1, config.reps + 1):",
+     "mutated": "        for rep in range(1, config.reps - 1):"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr4-m2",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 4,
+   "tokens": 30072,
+   "digest": "662fef357fa7cfe9",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/evals/stats.py",
+     "line": 17,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "inverted_equality_py",
+     "description": "equality inverted",
+     "original": "        if self.total == 0:",
+     "mutated": "        if self.total != 0:"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr4-m3",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 4,
+   "tokens": 30072,
+   "digest": "d0e890f06e45e071",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/extraction/cassette.py",
+     "line": 44,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "dropped_not_py",
+     "description": "a negation was dropped",
+     "original": "        if not path.exists():",
+     "mutated": "        if path.exists():"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr5-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 5,
+   "tokens": 9201,
+   "digest": "2245c114ec5ee654",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr5-m1",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 5,
+   "tokens": 9201,
+   "digest": "ed240d5720ac388e",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/cli.py",
+     "line": 120,
+     "category": "error_handling",
+     "severity": "high",
+     "operator": "dropped_raise",
+     "description": "an error that should be raised is no longer raised",
+     "original": "            raise typer.BadParameter(f\"schema {schema!r} is not in the database\")",
+     "mutated": null
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr5-m2",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 5,
+   "tokens": 9201,
+   "digest": "28b7423f7ccbcb8e",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/documents/cord_import.py",
+     "line": 232,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "dropped_return_py",
+     "description": "return removed; the value is computed and thrown away",
+     "original": "    return changed",
+     "mutated": "    changed"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr6-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 6,
+   "tokens": 6374,
+   "digest": "9968d95fcd1964d0",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr6-m1",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 6,
+   "tokens": 6374,
+   "digest": "68fa1ce027b9af7b",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/retrieval/fewshot.py",
+     "line": 17,
+     "category": "security",
+     "severity": "high",
+     "operator": "hardcoded_secret",
+     "description": "a live payment key was committed",
+     "original": "HELD_OUT_SPLITS = (\"test\",)",
+     "mutated": "HELD_OUT_SPLITS = (\"test\",)\nPAYMENT_API_SECRET = \"live-7f3a9c1e5b2d4e6f8a0b1c2d3e4f5a6b7c8d9e0f\" (\"test\",)"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr6-m2",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 6,
+   "tokens": 6374,
+   "digest": "a5a13fc7d5f96b31",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/evals/runner.py",
+     "line": 212,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "and_to_or_py",
+     "description": "logical and became or",
+     "original": "        examples = retriever(document, fewshot_k) if retriever and fewshot_k else []",
+     "mutated": "        examples = retriever(document, fewshot_k) if retriever or fewshot_k else []"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr6-m3",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 6,
+   "tokens": 6374,
+   "digest": "3342f0fbe63a175d",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/retrieval/embeddings.py",
+     "line": 35,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "dropped_not_py",
+     "description": "a negation was dropped",
+     "original": "        if not texts:",
+     "mutated": "        if texts:"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr7-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 7,
+   "tokens": 16295,
+   "digest": "a9dafe4380f42685",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr7-m1",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 7,
+   "tokens": 16295,
+   "digest": "4a860cf7ca429744",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/api/routers/documents.py",
+     "line": 97,
+     "category": "concurrency",
+     "severity": "high",
+     "operator": "dropped_await",
+     "description": "await removed; the promise/coroutine is never waited for",
+     "original": "    data = await file.read()",
+     "mutated": "    data = file.read()"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr7-m2",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 7,
+   "tokens": 16295,
+   "digest": "44b944526ff2ac8e",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/api/routers/runs.py",
+     "line": 15,
+     "category": "error_handling",
+     "severity": "high",
+     "operator": "dropped_raise",
+     "description": "an error that should be raised is no longer raised",
+     "original": "        raise HTTPException(404, \"run not found\")",
+     "mutated": null
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr7-m3",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 7,
+   "tokens": 16295,
+   "digest": "5033ff5ff94f8625",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/worker/app.py",
+     "line": 21,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "and_to_or_py",
+     "description": "logical and became or",
+     "original": "    worker_prefetch_multiplier=1,  # OCR and model calls are long; do not hoard tasks",
+     "mutated": "    worker_prefetch_multiplier=1,  # OCR or model calls are long; do not hoard tasks"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr10-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 10,
+   "tokens": 45299,
+   "digest": "02d150b1ad3abd59",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr10-m1",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 10,
+   "tokens": 45299,
+   "digest": "6eb960b4e979e977",
+   "labels": [
+    {
+     "file": "web/src/app/documents/[id]/review.tsx",
+     "line": 88,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "inverted_equality",
+     "description": "equality inverted",
+     "original": "      if (raw === undefined) continue;",
+     "mutated": "      if (raw !== undefined) continue;"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr10-m2",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 10,
+   "tokens": 45299,
+   "digest": "d1a57c3634fe84c6",
+   "labels": [
+    {
+     "file": "web/src/hooks/use-api.ts",
+     "line": 139,
+     "category": "error_handling",
+     "severity": "high",
+     "operator": "dropped_throw",
+     "description": "an error that should be thrown is no longer thrown",
+     "original": "        throw new Error(String(detail.detail ?? response.statusText));",
+     "mutated": null
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr10-m3",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 10,
+   "tokens": 45299,
+   "digest": "1a96971bb9b03130",
+   "labels": [
+    {
+     "file": "web/src/components/accuracy-bar.tsx",
+     "line": 11,
+     "category": "correctness",
+     "severity": "medium",
+     "operator": "min_max",
+     "description": "max became min",
+     "original": "  const width = value === null || value === undefined ? 0 : Math.max(0, Math.min(1, value)) * 100;",
+     "mutated": "  const width = value === null || value === undefined ? 0 : Math.min(0, Math.min(1, value)) * 100;"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr12-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 12,
+   "tokens": 110,
+   "digest": "2d18d880fd0b9a3f",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr13-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 13,
+   "tokens": 7524,
+   "digest": "28f1e74fb2a22f8a",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr13-m1",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 13,
+   "tokens": 7524,
+   "digest": "c500678fd21ded9d",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/gate/bundle.py",
+     "line": 77,
+     "category": "correctness",
+     "severity": "medium",
+     "operator": "min_max_py",
+     "description": "max became min",
+     "original": "        scale = BUNDLE_MAX_EDGE / max(int(page[\"width\"]), int(page[\"height\"]))",
+     "mutated": "        scale = BUNDLE_MAX_EDGE / min(int(page[\"width\"]), int(page[\"height\"]))"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr13-m2",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 13,
+   "tokens": 7524,
+   "digest": "cf55672f6f13156b",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/cli.py",
+     "line": 470,
+     "category": "security",
+     "severity": "high",
+     "operator": "hardcoded_secret",
+     "description": "a live payment key was committed",
+     "original": "BASELINE_PATH = Path(__file__).resolve().parents[2] / \"evals\" / \"baseline.json\"",
+     "mutated": "BASELINE_PATH = Path(__file__).resolve().parents[2] / \"evals\" / \"baseline.json\"\nPAYMENT_API_SECRET = \"live-7f3a9c1e5b2d4e6f8a0b1c2d3e4f5a6b7c8d9e0f\" Path(__file__).resolve().parents[2] / \"evals\" / \"baseline.json\""
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr14-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 14,
+   "tokens": 3362,
+   "digest": "c47b0c13ca235732",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr14-m1",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 14,
+   "tokens": 3362,
+   "digest": "e98d57cfe800585e",
+   "labels": [
+    {
+     "file": "web/src/app/api/[...path]/route.ts",
+     "line": 24,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "dropped_not",
+     "description": "a negation was dropped",
+     "original": "    if (!HOP_BY_HOP.has(key.toLowerCase())) headers.set(key, value);",
+     "mutated": "    if (HOP_BY_HOP.has(key.toLowerCase())) headers.set(key, value);"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr14-m2",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 14,
+   "tokens": 3362,
+   "digest": "e99f71a28bb8871d",
+   "labels": [
+    {
+     "file": "web/e2e/smoke.spec.ts",
+     "line": 45,
+     "category": "testing",
+     "severity": "medium",
+     "operator": "skipped_test",
+     "description": "a test was switched off",
+     "original": "test(\"eval pages render\", async ({ page }) => {",
+     "mutated": "test.skip(\"eval pages render\", async ({ page }) => {"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr14-m3",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 14,
+   "tokens": 3362,
+   "digest": "75cb6c50921afd8f",
+   "labels": [
+    {
+     "file": "web/src/app/documents/[id]/review.tsx",
+     "line": 51,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "and_to_or",
+     "description": "logical AND became OR",
+     "original": "    if (newest && selectedRunId === null) setSelectedRunId(newest.id);",
+     "mutated": "    if (newest || selectedRunId === null) setSelectedRunId(newest.id);"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr15-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 15,
+   "tokens": 8259,
+   "digest": "3ac861da9cdb5741",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr15-m1",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 15,
+   "tokens": 8259,
+   "digest": "1536ca7db4ee4f87",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/extraction/pipeline.py",
+     "line": 96,
+     "category": "correctness",
+     "severity": "medium",
+     "operator": "min_max_py",
+     "description": "max became min",
+     "original": "    tolerance = max(abs(target) * Decimal(\"0.01\"), Decimal(1))",
+     "mutated": "    tolerance = min(abs(target) * Decimal(\"0.01\"), Decimal(1))"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr15-m2",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 15,
+   "tokens": 8259,
+   "digest": "94f5401d5b4354e7",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/evals/runner.py",
+     "line": 262,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "inverted_equality_py",
+     "description": "equality inverted",
+     "original": "        finish_extraction(item, outcome, batch_pricing=config.mode == \"batch\")",
+     "mutated": "        finish_extraction(item, outcome, batch_pricing=config.mode != \"batch\")"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr15-m3",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 15,
+   "tokens": 8259,
+   "digest": "091d7e3c4ec12488",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/extraction/provider.py",
+     "line": 47,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "dropped_return_py",
+     "description": "return removed; the value is computed and thrown away",
+     "original": "        return [first, *cast(list[MessageParam], self.follow_up)]",
+     "mutated": "        [first, *cast(list[MessageParam], self.follow_up)]"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr16-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 16,
+   "tokens": 484,
+   "digest": "549fac6460f5a6c2",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr16-m1",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 16,
+   "tokens": 484,
+   "digest": "b383a21b0d3835f5",
+   "labels": [
+    {
+     "file": "backend/src/fieldwise/extraction/factory.py",
+     "line": 22,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "inverted_equality_py",
+     "description": "equality inverted",
+     "original": "    if schema.get(\"type\") == \"string\":",
+     "mutated": "    if schema.get(\"type\") != \"string\":"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr17-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 17,
+   "tokens": 3634,
+   "digest": "b0cd55662414bb26",
+   "labels": []
+  },
+  {
+   "id": "fieldwise-pr17-m1",
+   "kind": "mutated",
+   "repo": "fieldwise",
+   "pr": 17,
+   "tokens": 3634,
+   "digest": "60d6c5eec09da8e8",
+   "labels": [
+    {
+     "file": "web/scripts/readme-shots.mjs",
+     "line": 16,
+     "category": "concurrency",
+     "severity": "high",
+     "operator": "dropped_await",
+     "description": "await removed; the promise/coroutine is never waited for",
+     "original": "await page.waitForTimeout(600);",
+     "mutated": "page.waitForTimeout(600);"
+    }
+   ]
+  },
+  {
+   "id": "fieldwise-pr18-clean",
+   "kind": "clean",
+   "repo": "fieldwise",
+   "pr": 18,
+   "tokens": 264,
+   "digest": "3aaf5cf85d48a1d5",
+   "labels": []
+  },
+  {
+   "id": "single-flight-auth-pr1-clean",
+   "kind": "clean",
+   "repo": "single-flight-auth",
+   "pr": 1,
+   "tokens": 9638,
+   "digest": "896fda9e83e00d78",
+   "labels": []
+  },
+  {
+   "id": "single-flight-auth-pr1-m1",
+   "kind": "mutated",
+   "repo": "single-flight-auth",
+   "pr": 1,
+   "tokens": 9638,
+   "digest": "263cf31ae5c4888c",
+   "labels": [
+    {
+     "file": "src/broadcast.ts",
+     "line": 18,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "dropped_return",
+     "description": "return removed; the value is computed and thrown away",
+     "original": "    return () => {};",
+     "mutated": "    () => {};"
+    }
+   ]
+  },
+  {
+   "id": "single-flight-auth-pr1-m2",
+   "kind": "mutated",
+   "repo": "single-flight-auth",
+   "pr": 1,
+   "tokens": 9638,
+   "digest": "ee56a628914bc8fa",
+   "labels": [
+    {
+     "file": "src/cross-tab-lock.ts",
+     "line": 109,
+     "category": "correctness",
+     "severity": "medium",
+     "operator": "min_max",
+     "description": "max became min",
+     "original": "      const remaining = current ? Math.max(0, current.expiresAt - config.now()) : 0;",
+     "mutated": "      const remaining = current ? Math.min(0, current.expiresAt - config.now()) : 0;"
+    }
+   ]
+  },
+  {
+   "id": "single-flight-auth-pr1-m3",
+   "kind": "mutated",
+   "repo": "single-flight-auth",
+   "pr": 1,
+   "tokens": 9638,
+   "digest": "007d3cf5044c37ef",
+   "labels": [
+    {
+     "file": "src/storage.ts",
+     "line": 4,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "inverted_equality",
+     "description": "equality inverted",
+     "original": "  if (typeof value !== 'object' || value === null) return false;",
+     "mutated": "  if (typeof value !== 'object' || value !== null) return false;"
+    }
+   ]
+  },
+  {
+   "id": "single-flight-auth-pr2-clean",
+   "kind": "clean",
+   "repo": "single-flight-auth",
+   "pr": 2,
+   "tokens": 100,
+   "digest": "ea7c6c102d6c23e0",
+   "labels": []
+  },
+  {
+   "id": "single-flight-auth-pr4-clean",
+   "kind": "clean",
+   "repo": "single-flight-auth",
+   "pr": 4,
+   "tokens": 92,
+   "digest": "e4bf75896158717b",
+   "labels": []
+  },
+  {
+   "id": "single-flight-auth-pr6-clean",
+   "kind": "clean",
+   "repo": "single-flight-auth",
+   "pr": 6,
+   "tokens": 9580,
+   "digest": "23ac71a791465e96",
+   "labels": []
+  },
+  {
+   "id": "single-flight-auth-pr6-m1",
+   "kind": "mutated",
+   "repo": "single-flight-auth",
+   "pr": 6,
+   "tokens": 9580,
+   "digest": "47ab961c91917259",
+   "labels": [
+    {
+     "file": "src/client.ts",
+     "line": 198,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "dropped_return",
+     "description": "return removed; the value is computed and thrown away",
+     "original": "      return () => {",
+     "mutated": "      () => {"
+    }
+   ]
+  },
+  {
+   "id": "single-flight-auth-pr6-m2",
+   "kind": "mutated",
+   "repo": "single-flight-auth",
+   "pr": 6,
+   "tokens": 9580,
+   "digest": "0bb0960704dd8128",
+   "labels": [
+    {
+     "file": "test/unit/client.test.ts",
+     "line": 331,
+     "category": "testing",
+     "severity": "medium",
+     "operator": "skipped_test",
+     "description": "a test was switched off",
+     "original": "  it('keeps working when a subscriber throws', async () => {",
+     "mutated": "  it.skip('keeps working when a subscriber throws', async () => {"
+    }
+   ]
+  },
+  {
+   "id": "single-flight-auth-pr7-clean",
+   "kind": "clean",
+   "repo": "single-flight-auth",
+   "pr": 7,
+   "tokens": 5426,
+   "digest": "cea909e4fa3d74ed",
+   "labels": []
+  },
+  {
+   "id": "single-flight-auth-pr7-m1",
+   "kind": "mutated",
+   "repo": "single-flight-auth",
+   "pr": 7,
+   "tokens": 5426,
+   "digest": "9f2bba10a95589ad",
+   "labels": [
+    {
+     "file": "test/e2e/race.spec.ts",
+     "line": 85,
+     "category": "testing",
+     "severity": "medium",
+     "operator": "skipped_test",
+     "description": "a test was switched off",
+     "original": "  test('without the lock, four of five tabs are logged out (the bug)', async ({",
+     "mutated": "  test.skip('without the lock, four of five tabs are logged out (the bug)', async ({"
+    }
+   ]
+  },
+  {
+   "id": "single-flight-auth-pr8-clean",
+   "kind": "clean",
+   "repo": "single-flight-auth",
+   "pr": 8,
+   "tokens": 6063,
+   "digest": "8a2cba30b727e303",
+   "labels": []
+  },
+  {
+   "id": "single-flight-auth-pr9-clean",
+   "kind": "clean",
+   "repo": "single-flight-auth",
+   "pr": 9,
+   "tokens": 118,
+   "digest": "331f7f65e0fb47f2",
+   "labels": []
+  },
+  {
+   "id": "single-flight-auth-pr10-clean",
+   "kind": "clean",
+   "repo": "single-flight-auth",
+   "pr": 10,
+   "tokens": 491,
+   "digest": "69079faffa779260",
+   "labels": []
+  },
+  {
+   "id": "single-flight-auth-pr11-clean",
+   "kind": "clean",
+   "repo": "single-flight-auth",
+   "pr": 11,
+   "tokens": 268,
+   "digest": "272c21d3b3812043",
+   "labels": []
+  },
+  {
+   "id": "slotlock-pr1-clean",
+   "kind": "clean",
+   "repo": "slotlock",
+   "pr": 1,
+   "tokens": 8119,
+   "digest": "f49e63cd327d85b9",
+   "labels": []
+  },
+  {
+   "id": "slotlock-pr1-m1",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 1,
+   "tokens": 8119,
+   "digest": "036b4d0ab601a7c4",
+   "labels": [
+    {
+     "file": "src/resources/resources.service.ts",
+     "line": 5,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "narrowed_status_filter",
+     "description": "active-status filter narrowed; confirmed rows are ignored",
+     "original": "export const ACTIVE_STATUSES = ['HELD', 'CONFIRMED'] as const;",
+     "mutated": "export const ACTIVE_STATUSES = ['HELD'] as const;"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr1-m2",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 1,
+   "tokens": 8119,
+   "digest": "0591d3432829ce04",
+   "labels": [
+    {
+     "file": "prisma/seed.ts",
+     "line": 24,
+     "category": "concurrency",
+     "severity": "high",
+     "operator": "dropped_await",
+     "description": "await removed; the promise/coroutine is never waited for",
+     "original": "    await prisma.resource.upsert({",
+     "mutated": "    prisma.resource.upsert({"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr1-m3",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 1,
+   "tokens": 8119,
+   "digest": "e1d6160a5be1bd18",
+   "labels": [
+    {
+     "file": "src/resources/resources.controller.ts",
+     "line": 21,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "dropped_return",
+     "description": "return removed; the value is computed and thrown away",
+     "original": "    return this.resources.list();",
+     "mutated": "    this.resources.list();"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr2-clean",
+   "kind": "clean",
+   "repo": "slotlock",
+   "pr": 2,
+   "tokens": 19417,
+   "digest": "8d9627e5b9e4d07b",
+   "labels": []
+  },
+  {
+   "id": "slotlock-pr2-m1",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 2,
+   "tokens": 19417,
+   "digest": "763f0eee07ac8525",
+   "labels": [
+    {
+     "file": "src/bookings/strategies/for-update.strategy.ts",
+     "line": 20,
+     "category": "concurrency",
+     "severity": "high",
+     "operator": "dropped_lock",
+     "description": "the lock that serialised concurrent callers was removed",
+     "original": "      await tx.$queryRaw`SELECT id FROM resources WHERE id = ${input.resource.id} FOR UPDATE`;",
+     "mutated": null
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr2-m2",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 2,
+   "tokens": 19417,
+   "digest": "f880c029feba144b",
+   "labels": [
+    {
+     "file": "src/bookings/bookings.dto.ts",
+     "line": 28,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "enum_status_swap",
+     "description": "a status literal was swapped",
+     "original": "  status: 'HELD' | 'CONFIRMED' | 'CANCELLED' | 'EXPIRED';",
+     "mutated": "  status: 'CONFIRMED' | 'CONFIRMED' | 'CANCELLED' | 'EXPIRED';"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr2-m3",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 2,
+   "tokens": 19417,
+   "digest": "29f3d09e79aa209b",
+   "labels": [
+    {
+     "file": "src/bookings/strategies/optimistic.strategy.ts",
+     "line": 39,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "off_by_one_gte",
+     "description": ">= tightened to > (off by one)",
+     "original": "          if ((await countOverlapping(tx, input)) >= input.resource.capacity) {",
+     "mutated": "          if ((await countOverlapping(tx, input)) > input.resource.capacity) {"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr3-clean",
+   "kind": "clean",
+   "repo": "slotlock",
+   "pr": 3,
+   "tokens": 18154,
+   "digest": "7650e9c4d1bcc61a",
+   "labels": []
+  },
+  {
+   "id": "slotlock-pr3-m1",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 3,
+   "tokens": 18154,
+   "digest": "b01f804baf8b273b",
+   "labels": [
+    {
+     "file": "src/bookings/bookings.service.ts",
+     "line": 66,
+     "category": "error_handling",
+     "severity": "high",
+     "operator": "dropped_throw",
+     "description": "an error that should be thrown is no longer thrown",
+     "original": "      throw new PaymentProviderError(error);",
+     "mutated": null
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr3-m2",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 3,
+   "tokens": 18154,
+   "digest": "3e7deaaeeb5220e0",
+   "labels": [
+    {
+     "file": "src/payments/payment-events.service.ts",
+     "line": 67,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "off_by_one_lt",
+     "description": "strict comparison loosened to <= (off by one)",
+     "original": "    if (booking.paymentLastEventAt && event.createdAt < booking.paymentLastEventAt) {",
+     "mutated": "    if (booking.paymentLastEventAt && event.createdAt <= booking.paymentLastEventAt) {"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr3-m3",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 3,
+   "tokens": 18154,
+   "digest": "b57167dc83d13564",
+   "labels": [
+    {
+     "file": "src/bookings/strategies/exclusion.strategy.ts",
+     "line": 47,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "enum_status_swap",
+     "description": "a status literal was swapped",
+     "original": "             ${input.endsAt}, true, 'HELD'::\"BookingStatus\", ${input.holdExpiresAt}, now(), now())",
+     "mutated": "             ${input.endsAt}, true, 'CONFIRMED'::\"BookingStatus\", ${input.holdExpiresAt}, now(), now())"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr4-clean",
+   "kind": "clean",
+   "repo": "slotlock",
+   "pr": 4,
+   "tokens": 14400,
+   "digest": "29c44fbb2e32d135",
+   "labels": []
+  },
+  {
+   "id": "slotlock-pr4-m1",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 4,
+   "tokens": 14400,
+   "digest": "0d005ca5075e00e4",
+   "labels": [
+    {
+     "file": "src/bookings/bookings.service.ts",
+     "line": 117,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "and_to_or",
+     "description": "logical AND became OR",
+     "original": "    if (before.status === 'HELD' && before.paymentId) {",
+     "mutated": "    if (before.status === 'HELD' || before.paymentId) {"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr4-m2",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 4,
+   "tokens": 14400,
+   "digest": "9136f31a62d6b090",
+   "labels": [
+    {
+     "file": "src/bookings/holds/hold-expiry.service.ts",
+     "line": 44,
+     "category": "concurrency",
+     "severity": "high",
+     "operator": "dropped_lock",
+     "description": "the lock that serialised concurrent callers was removed",
+     "original": "            ORDER BY \"holdExpiresAt\" LIMIT ${batch} FOR UPDATE SKIP LOCKED)",
+     "mutated": null
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr4-m3",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 4,
+   "tokens": 14400,
+   "digest": "efadd0be7e82fede",
+   "labels": [
+    {
+     "file": "src/payments/fake.provider.ts",
+     "line": 93,
+     "category": "correctness",
+     "severity": "medium",
+     "operator": "plus_minus_one",
+     "description": "+1 became -1",
+     "original": "      this.sign(paymentId, 'payment_intent.processing', t + 1, undefined, meta),",
+     "mutated": "      this.sign(paymentId, 'payment_intent.processing', t - 1, undefined, meta),"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr5-clean",
+   "kind": "clean",
+   "repo": "slotlock",
+   "pr": 5,
+   "tokens": 10489,
+   "digest": "caebf676a1471cb3",
+   "labels": []
+  },
+  {
+   "id": "slotlock-pr5-m1",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 5,
+   "tokens": 10489,
+   "digest": "c74dcc9fa1919dbd",
+   "labels": [
+    {
+     "file": "src/bookings/holds/hold-expiry.service.ts",
+     "line": 33,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "enum_status_swap",
+     "description": "a status literal was swapped",
+     "original": "          WHERE id = ${bookingId} AND status = 'HELD' AND \"holdExpiresAt\" <= now()",
+     "mutated": "          WHERE id = ${bookingId} AND status = 'CONFIRMED' AND \"holdExpiresAt\" <= now()"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr5-m2",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 5,
+   "tokens": 10489,
+   "digest": "6858fae7afdf5e9b",
+   "labels": [
+    {
+     "file": "src/outbox/outbox.relay.ts",
+     "line": 15,
+     "category": "concurrency",
+     "severity": "high",
+     "operator": "dropped_lock",
+     "description": "the lock that serialised concurrent callers was removed",
+     "original": " * with SKIP LOCKED so several workers can relay at once. The queue job id is the event id: if the",
+     "mutated": null
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr5-m3",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 5,
+   "tokens": 10489,
+   "digest": "95d54463ab68c710",
+   "labels": [
+    {
+     "file": "src/bookings/bookings.service.ts",
+     "line": 127,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "and_to_or",
+     "description": "logical AND became OR",
+     "original": "        if (row.status === 'CONFIRMED' && row.paymentId) {",
+     "mutated": "        if (row.status === 'CONFIRMED' || row.paymentId) {"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr6-clean",
+   "kind": "clean",
+   "repo": "slotlock",
+   "pr": 6,
+   "tokens": 3232,
+   "digest": "4b61ea4ae80f3a42",
+   "labels": []
+  },
+  {
+   "id": "slotlock-pr6-m1",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 6,
+   "tokens": 3232,
+   "digest": "646d37dd3ecb2eda",
+   "labels": [
+    {
+     "file": "test/integration/booking-sequences.property.test.ts",
+     "line": 255,
+     "category": "testing",
+     "severity": "medium",
+     "operator": "skipped_test",
+     "description": "a test was switched off",
+     "original": "  it('keep every invariant after every step', { timeout: 300_000 }, async () => {",
+     "mutated": "  it.skip('keep every invariant after every step', { timeout: 300_000 }, async () => {"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr7-clean",
+   "kind": "clean",
+   "repo": "slotlock",
+   "pr": 7,
+   "tokens": 11921,
+   "digest": "cc8d93441236e69f",
+   "labels": []
+  },
+  {
+   "id": "slotlock-pr7-m1",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 7,
+   "tokens": 11921,
+   "digest": "cda1d598367319e3",
+   "labels": [
+    {
+     "file": "bench/verify.ts",
+     "line": 105,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "dropped_not",
+     "description": "a negation was dropped",
+     "original": "  if (!url) throw new Error('DATABASE_URL is required');",
+     "mutated": "  if (url) throw new Error('DATABASE_URL is required');"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr7-m2",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 7,
+   "tokens": 11921,
+   "digest": "7866821e09e471d1",
+   "labels": [
+    {
+     "file": "bench/run.ts",
+     "line": 239,
+     "category": "error_handling",
+     "severity": "high",
+     "operator": "dropped_throw",
+     "description": "an error that should be thrown is no longer thrown",
+     "original": "      throw new Error(`unknown strategy ${s}; one of ${STRATEGIES.join(', ')} or all`);",
+     "mutated": null
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr7-m3",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 7,
+   "tokens": 11921,
+   "digest": "22b638e8598499e9",
+   "labels": [
+    {
+     "file": "bench/race.js",
+     "line": 66,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "off_by_one_lt",
+     "description": "strict comparison loosened to <= (off by one)",
+     "original": "  check(res, { 'no 5xx': (r) => r.status < 500 });",
+     "mutated": "  check(res, { 'no 5xx': (r) => r.status <= 500 });"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr8-clean",
+   "kind": "clean",
+   "repo": "slotlock",
+   "pr": 8,
+   "tokens": 8292,
+   "digest": "6f17a22ad88d7101",
+   "labels": []
+  },
+  {
+   "id": "slotlock-pr8-m1",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 8,
+   "tokens": 8292,
+   "digest": "46ca2414aafa8475",
+   "labels": [
+    {
+     "file": "scripts/demo.ts",
+     "line": 114,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "inverted_equality",
+     "description": "equality inverted",
+     "original": "  if (paid.status === 404) {",
+     "mutated": "  if (paid.status !== 404) {"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr8-m2",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 8,
+   "tokens": 8292,
+   "digest": "3c75a35d6c29f404",
+   "labels": [
+    {
+     "file": "bench/race.js",
+     "line": 72,
+     "category": "security",
+     "severity": "high",
+     "operator": "hardcoded_secret",
+     "description": "a live payment key was committed",
+     "original": "  const v = (name, key) => m[name]?.values?.[key];",
+     "mutated": "  const v = (name, key) => m[name]?.values?.[key];\n  const PAYMENT_API_SECRET = \"live-7f3a9c1e5b2d4e6f8a0b1c2d3e4f5a6b7c8d9e0f\"; v = (name, key) => m[name]?.values?.[key];"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr8-m3",
+   "kind": "mutated",
+   "repo": "slotlock",
+   "pr": 8,
+   "tokens": 8292,
+   "digest": "1c6b16f78e784d24",
+   "labels": [
+    {
+     "file": "src/common/openapi.ts",
+     "line": 8,
+     "category": "correctness",
+     "severity": "high",
+     "operator": "dropped_return",
+     "description": "return removed; the value is computed and thrown away",
+     "original": "  return z.toJSONSchema(schema, {",
+     "mutated": "  z.toJSONSchema(schema, {"
+    }
+   ]
+  },
+  {
+   "id": "slotlock-pr9-clean",
+   "kind": "clean",
+   "repo": "slotlock",
+   "pr": 9,
+   "tokens": 5372,
+   "digest": "092e259e50daa333",
+   "labels": []
+  }
+ ],
+ "skipped": []
+}
